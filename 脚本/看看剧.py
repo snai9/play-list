@@ -468,7 +468,7 @@ class Spider(Spider):
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
 _TVBOX_DROP_LINES = []
-_TVBOX_LINE_ORDER = ["极速-FF"]
+_TVBOX_LINE_ORDER = ["极速-FF", "稳定-DY", "稳定-BF", "极速-QQ"]
 
 def _tvbox_filter_lines(result, drop):
     if not isinstance(result, dict):
