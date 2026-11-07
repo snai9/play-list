@@ -8,12 +8,6 @@
             "api": "./脚本/豆瓣.py"
         },
         {
-            "key": "wzxxcz_ffd8cc926e2c",
-            "name": "人人视频",
-            "type": 3,
-            "api": "./脚本/人人视频.py"
-        },
-        {
             "key": "2",
             "name": "哔哩",
             "type": 3,
