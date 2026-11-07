@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-# by @嗷呜
+# by @666
 import json
 import sys
 import time
@@ -187,7 +187,7 @@ class Spider(Spider):
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
 _TVBOX_DROP_LINES = []
-_TVBOX_LINE_ORDER = ["线路3(ff)", "线路2(lz)"]
+_TVBOX_LINE_ORDER = ["线路2(lz)", "线路3(ff)"]
 
 def _tvbox_filter_lines(result, drop):
     if not isinstance(result, dict):
