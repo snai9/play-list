@@ -651,6 +651,7 @@ _TVBOX_DROP_LINES = ["量子资源", "非凡"]
 _TVBOX_LINE_ORDER = ["360", "非凡", "电影天堂", "量子资源"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
+_TVBOX_SINK_SUB = []
 
 def _tvbox_filter_lines(result, drop):
     if not isinstance(result, dict):
@@ -706,14 +707,20 @@ def _tvbox_sort_item(item, order):
         return
     known = {f: i for i, f in enumerate(order)}
     subs = [p for p in _TVBOX_ORDER_SUB if p]
+    sinks = [p for p in _TVBOX_SINK_SUB if p]
+    unknown_base = len(order) + len(subs)
     def _tvbox_rank(f):
+        for p in sinks:
+            if p in f:
+                return unknown_base + 1000
         if f in known:
             return known[f]
         for i, pat in enumerate(subs):
             if pat in f:
                 return len(order) + i
-        return len(order) + len(subs)
-    # 已知线路按 order（画质速度最优在前），未知线路稳定保持原序后置。
+        return unknown_base
+    # 已知线路按 order（画质速度最优在前），未知线路稳定保持原序后置，
+    # sink 命中的差线（4K 等）沉到最后但不删除。
     pairs = list(zip(parts_from, parts_url))
     pairs.sort(key=lambda p: _tvbox_rank(p[0]))
     item['vod_play_from'] = '$$$'.join(f for f, _ in pairs)
