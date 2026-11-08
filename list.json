@@ -17,46 +17,16 @@
             }
         },
         {
-            "key": "wzxxcz_8e9406d3f09c",
-            "name": "熊猫秒播",
+            "key": "wzxxcz_1701585ea278",
+            "name": "河豚",
             "type": 3,
-            "api": "./脚本/熊猫秒播.py"
+            "api": "./脚本/河豚.py"
         },
         {
-            "key": "wzxxcz_f56e0b17ca7a",
-            "name": "西饭短剧",
+            "key": "wzxxcz_075e73129a50",
+            "name": "看看剧",
             "type": 3,
-            "api": "./脚本/短/西饭短剧.py"
-        },
-        {
-            "key": "wzxxcz_c4154ec010de",
-            "name": "果果短剧",
-            "type": 3,
-            "api": "./脚本/果果短剧.py"
-        },
-        {
-            "key": "wzxxcz_8d93ec888aa7",
-            "name": "看戏影视",
-            "type": 3,
-            "api": "./脚本/看戏影视.py"
-        },
-        {
-            "key": "wzxxcz_f90bb21f7693",
-            "name": "滴答影院",
-            "type": 3,
-            "api": "./脚本/滴答影院.py"
-        },
-        {
-            "key": "wzxxcz_b5503e1a86e1",
-            "name": "ZIP0影视",
-            "type": 3,
-            "api": "./脚本/ZIP0影视.py"
-        },
-        {
-            "key": "wzxxcz_ec059e0ee176",
-            "name": "FoFo影院",
-            "type": 3,
-            "api": "./脚本/FoFo影院.py"
+            "api": "./脚本/看看剧.py"
         },
         {
             "key": "wzxxcz_d68ac251a6fc",
@@ -65,16 +35,22 @@
             "api": "./脚本/影视大全.py"
         },
         {
-            "key": "wzxxcz_3f5ce72740f6",
-            "name": "大马猴影视",
+            "key": "wzxxcz_6fabb7d1442e",
+            "name": "低端影视",
             "type": 3,
-            "api": "./脚本/大马猴影视.py"
+            "api": "./脚本/低端影视.py"
         },
         {
-            "key": "wzxxcz_2a26af9d3da0",
-            "name": "厂长影视",
+            "key": "wzxxcz_4e850e9d91ee",
+            "name": "搜剧AI",
             "type": 3,
-            "api": "./脚本/厂长影视.py"
+            "api": "./脚本/搜剧AI.py"
+        },
+        {
+            "key": "wzxxcz_b3ca09b39432",
+            "name": "千千影视",
+            "type": 3,
+            "api": "./脚本/千千影视.py"
         },
         {
             "key": "wzxxcz_0e41f8766e95",
@@ -83,76 +59,52 @@
             "api": "./脚本/追剧猫.py"
         },
         {
+            "key": "wzxxcz_f98fdbedc2c8",
+            "name": "量子资源网",
+            "type": 3,
+            "api": "./脚本/量子资源网.py"
+        },
+        {
+            "key": "wzxxcz_ec059e0ee176",
+            "name": "FoFo影院",
+            "type": 3,
+            "api": "./脚本/FoFo影院.py"
+        },
+        {
             "key": "wzxxcz_113da570f776",
             "name": "热播APP",
             "type": 3,
             "api": "./脚本/热播APP.py"
         },
         {
-            "key": "wzxxcz_1701585ea278",
-            "name": "河豚",
+            "key": "wzxxcz_8e9406d3f09c",
+            "name": "熊猫秒播",
             "type": 3,
-            "api": "./脚本/河豚.py"
+            "api": "./脚本/熊猫秒播.py"
         },
         {
-            "key": "wzxxcz_c5e1234c063f",
-            "name": "麻花影视",
+            "key": "wzxxcz_2a26af9d3da0",
+            "name": "厂长影视",
             "type": 3,
-            "api": "./脚本/麻花影视.py"
+            "api": "./脚本/厂长影视.py"
         },
         {
-            "key": "wzxxcz_18e96fa6d6c0",
-            "name": "baopianku",
+            "key": "wzxxcz_8f85174e51cb",
+            "name": "豆花电影网",
             "type": 3,
-            "api": "./脚本/baopianku.py"
+            "api": "./脚本/豆花电影网.py"
         },
         {
-            "key": "wzxxcz_7807886225cc",
-            "name": "蝶卡影视",
+            "key": "wzxxcz_7b394ac21dbf",
+            "name": "分享猎手",
             "type": 3,
-            "api": "./脚本/蝶卡影视.py"
+            "api": "./脚本/分享猎手.py"
         },
         {
-            "key": "wzxxcz_4cb04cb64ffd",
-            "name": "看剧AIxcz",
+            "key": "wzxxcz_c4154ec010de",
+            "name": "果果短剧",
             "type": 3,
-            "api": "./脚本/看剧AIxcz.py"
-        },
-        {
-            "key": "wzxxcz_637d9f08e9bd",
-            "name": "猎手影视APP",
-            "type": 3,
-            "api": "./脚本/app/猎手影视APP.py"
-        },
-        {
-            "key": "wzxxcz_5bf72f5af13e",
-            "name": "电影侠",
-            "type": 3,
-            "api": "./脚本/电影侠.py"
-        },
-        {
-            "key": "wzxxcz_9155d079e07c",
-            "name": "韩国电影网",
-            "type": 3,
-            "api": "./脚本/韩国电影网.py"
-        },
-        {
-            "key": "wzxxcz_131cdc217285",
-            "name": "多瑙影院",
-            "type": 3,
-            "api": "./脚本/多瑙影院.py"
-        },
-        {
-            "key": "wzxxcz_6fabb7d1442e",
-            "name": "低端影视",
-            "type": 3,
-            "api": "./脚本/低端影视.py"
-        },
-        {
-            "key": "wzxxcz_63cc7ccfec95",
-            "name": "云朵视频(关梯)",
-            "type": 3,
-            "api": "./脚本/云朵视频(关梯).py"
+            "api": "./脚本/果果短剧.py"
         },
         {
             "key": "wzxxcz_1c6b0fd055d7",
@@ -161,22 +113,22 @@
             "api": "./脚本/可可影视.py"
         },
         {
-            "key": "wzxxcz_88aa6c4b0b48",
-            "name": "8X8X",
+            "key": "wzxxcz_f90bb21f7693",
+            "name": "滴答影院",
             "type": 3,
-            "api": "./脚本/8X8X.py"
+            "api": "./脚本/滴答影院.py"
         },
         {
-            "key": "wzxxcz_f98fdbedc2c8",
-            "name": "量子资源网",
+            "key": "wzxxcz_1987576946d5",
+            "name": "47电影天堂",
             "type": 3,
-            "api": "./脚本/量子资源网.py"
+            "api": "./脚本/综/47电影天堂.py"
         },
         {
-            "key": "wzxxcz_a6ee670ae623",
-            "name": "哔哩哔哩",
+            "key": "wzxxcz_a7e07c2876fc",
+            "name": "开端影视",
             "type": 3,
-            "api": "./脚本/哔哩哔哩.py"
+            "api": "./脚本/开端影视.py"
         },
         {
             "key": "wzxxcz_debace9449e1",
@@ -185,16 +137,34 @@
             "api": "./脚本/洛雪TV.py"
         },
         {
-            "key": "wzxxcz_12bb37d126ba",
-            "name": "飞快TV",
+            "key": "wzxxcz_7eb950e5e300",
+            "name": "vidhub",
             "type": 3,
-            "api": "./脚本/飞快TV.py"
+            "api": "./脚本/vidhub.py"
         },
         {
-            "key": "wzxxcz_50309bd7a97a",
-            "name": "美剧侠",
+            "key": "wzxxcz_63cc7ccfec95",
+            "name": "云朵视频(关梯)",
             "type": 3,
-            "api": "./脚本/美剧侠.py"
+            "api": "./脚本/云朵视频(关梯).py"
+        },
+        {
+            "key": "wzxxcz_3566ff3d72bf",
+            "name": "风月夜禁脔",
+            "type": 3,
+            "api": "./脚本/风月夜禁脔.py"
+        },
+        {
+            "key": "wzxxcz_73270bd898ec",
+            "name": "爱电影",
+            "type": 3,
+            "api": "./脚本/html/爱电影.py"
+        },
+        {
+            "key": "wzxxcz_7f8aa687b404",
+            "name": "看看鸭",
+            "type": 3,
+            "api": "./脚本/看看鸭.py"
         },
         {
             "key": "wzxxcz_ffd8cc926e2c",

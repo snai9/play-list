@@ -1181,7 +1181,7 @@ class Spider(Spider):
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
 _TVBOX_DROP_LINES = []
-_TVBOX_LINE_ORDER = ["量子高清", "天堂高清", "无尽4K", "极速高清"]
+_TVBOX_LINE_ORDER = ["天堂高清", "无尽4K"]
 
 def _tvbox_filter_lines(result, drop):
     if not isinstance(result, dict):

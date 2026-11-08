@@ -686,8 +686,8 @@ def _opt(name, values):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = []
-_TVBOX_LINE_ORDER = ["K蓝光 (Ksvideo)", "蓝光4K (zijianm3u8)", "Y蓝光 (Dong)", "Z蓝光 (bytedance)"]
+_TVBOX_DROP_LINES = ["Y蓝光 (Dong)"]
+_TVBOX_LINE_ORDER = ["K蓝光 (Ksvideo)", "Z蓝光 (bytedance)", "蓝光4K (zijianm3u8)", "Y蓝光 (Dong)"]
 
 def _tvbox_filter_lines(result, drop):
     if not isinstance(result, dict):
