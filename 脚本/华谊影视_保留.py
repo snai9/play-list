@@ -782,3 +782,89 @@ class Spider(_Base):
     def destroy(self):
         self._token = ''
         self._rsa2 = None
+
+
+
+# ---- TVBox 本地线路过滤（自动生成，勿改） ----
+_TVBOX_DROP_LINES = ["B超高清"]
+_TVBOX_LINE_ORDER = ["K蓝光"]
+_TVBOX_DROP_SUB = []
+_TVBOX_ORDER_SUB = []
+
+def _tvbox_filter_lines(result, drop):
+    if not isinstance(result, dict):
+        return result
+    items = result.get('list')
+    if isinstance(items, list):
+        for item in items:
+            _tvbox_filter_item(item, drop)
+    else:
+        _tvbox_filter_item(result, drop)
+    return result
+
+def _tvbox_filter_item(item, drop):
+    froms = item.get('vod_play_from') or ''
+    urls = item.get('vod_play_url') or ''
+    if not isinstance(froms, str) or not isinstance(urls, str):
+        return
+    if '$$$' not in froms:
+        return
+    parts_from = [f.strip() for f in froms.split('$$$')]
+    parts_url = urls.split('$$$')
+    if len(parts_from) != len(parts_url):
+        return
+    keep = [(f, u) for f, u in zip(parts_from, parts_url) if f not in drop and not any(s in f for s in _TVBOX_DROP_SUB)]
+    if not keep or len(keep) == len(parts_from):
+        return
+    item['vod_play_from'] = '$$$'.join(f for f, _ in keep)
+    item['vod_play_url'] = '$$$'.join(u for _, u in keep)
+
+def _tvbox_sort_lines(result, order):
+    if not order and not _TVBOX_ORDER_SUB:
+        return result
+    if not isinstance(result, dict):
+        return result
+    items = result.get('list')
+    if isinstance(items, list):
+        for item in items:
+            _tvbox_sort_item(item, order)
+    else:
+        _tvbox_sort_item(result, order)
+    return result
+
+def _tvbox_sort_item(item, order):
+    froms = item.get('vod_play_from') or ''
+    urls = item.get('vod_play_url') or ''
+    if not isinstance(froms, str) or not isinstance(urls, str):
+        return
+    if '$$$' not in froms:
+        return
+    parts_from = [f.strip() for f in froms.split('$$$')]
+    parts_url = urls.split('$$$')
+    if len(parts_from) != len(parts_url):
+        return
+    known = {f: i for i, f in enumerate(order)}
+    subs = [p for p in _TVBOX_ORDER_SUB if p]
+    def _tvbox_rank(f):
+        if f in known:
+            return known[f]
+        for i, pat in enumerate(subs):
+            if pat in f:
+                return len(order) + i
+        return len(order) + len(subs)
+    # 已知线路按 order（画质速度最优在前），未知线路稳定保持原序后置。
+    pairs = list(zip(parts_from, parts_url))
+    pairs.sort(key=lambda p: _tvbox_rank(p[0]))
+    item['vod_play_from'] = '$$$'.join(f for f, _ in pairs)
+    item['vod_play_url'] = '$$$'.join(u for _, u in pairs)
+
+def _tvbox_apply(cls):
+    fn = getattr(cls, 'detailContent', None)
+    if fn is None:
+        return
+    def wrapper(self, *a, _fn=fn, **k):
+        res = _tvbox_filter_lines(_fn(self, *a, **k), _TVBOX_DROP_LINES)
+        return _tvbox_sort_lines(res, _TVBOX_LINE_ORDER)
+    setattr(cls, 'detailContent', wrapper)
+
+_tvbox_apply(Spider)

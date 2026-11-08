@@ -647,8 +647,10 @@ if __name__ == _dk8('fHxOQkpNfHw='):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = []
-_TVBOX_LINE_ORDER = ["量子资源", "非凡", "360", "电影天堂"]
+_TVBOX_DROP_LINES = ["非凡"]
+_TVBOX_LINE_ORDER = ["360", "非凡", "电影天堂", "量子资源"]
+_TVBOX_DROP_SUB = []
+_TVBOX_ORDER_SUB = []
 
 def _tvbox_filter_lines(result, drop):
     if not isinstance(result, dict):
@@ -672,14 +674,16 @@ def _tvbox_filter_item(item, drop):
     parts_url = urls.split('$$$')
     if len(parts_from) != len(parts_url):
         return
-    keep = [(f, u) for f, u in zip(parts_from, parts_url) if f not in drop]
+    keep = [(f, u) for f, u in zip(parts_from, parts_url) if f not in drop and not any(s in f for s in _TVBOX_DROP_SUB)]
     if not keep or len(keep) == len(parts_from):
         return
     item['vod_play_from'] = '$$$'.join(f for f, _ in keep)
     item['vod_play_url'] = '$$$'.join(u for _, u in keep)
 
 def _tvbox_sort_lines(result, order):
-    if not order or not isinstance(result, dict):
+    if not order and not _TVBOX_ORDER_SUB:
+        return result
+    if not isinstance(result, dict):
         return result
     items = result.get('list')
     if isinstance(items, list):
@@ -701,9 +705,17 @@ def _tvbox_sort_item(item, order):
     if len(parts_from) != len(parts_url):
         return
     known = {f: i for i, f in enumerate(order)}
-    pairs = list(zip(parts_from, parts_url))
+    subs = [p for p in _TVBOX_ORDER_SUB if p]
+    def _tvbox_rank(f):
+        if f in known:
+            return known[f]
+        for i, pat in enumerate(subs):
+            if pat in f:
+                return len(order) + i
+        return len(order) + len(subs)
     # 已知线路按 order（画质速度最优在前），未知线路稳定保持原序后置。
-    pairs.sort(key=lambda p: known.get(p[0], len(order)))
+    pairs = list(zip(parts_from, parts_url))
+    pairs.sort(key=lambda p: _tvbox_rank(p[0]))
     item['vod_play_from'] = '$$$'.join(f for f, _ in pairs)
     item['vod_play_url'] = '$$$'.join(u for _, u in pairs)
 
