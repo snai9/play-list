@@ -191,12 +191,6 @@
             "api": "./脚本/飞快TV.py"
         },
         {
-            "key": "wzxxcz_32676b0d47ec",
-            "name": "看客TV",
-            "type": 3,
-            "api": "./脚本/综/看客TV.py"
-        },
-        {
             "key": "wzxxcz_50309bd7a97a",
             "name": "美剧侠",
             "type": 3,
@@ -261,6 +255,12 @@
             "name": "麒麟影视",
             "type": 3,
             "api": "./脚本/麒麟影视_保留.py"
+        },
+        {
+            "key": "wzxxcz_32676b0d47ec",
+            "name": "看客TV",
+            "type": 3,
+            "api": "./脚本/看客TV_保留.py"
         }
     ],
     "lives": [
