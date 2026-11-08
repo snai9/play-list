@@ -873,9 +873,8 @@ class Spider(_Base):
             pass
 
 
-
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["自建4K-3", "自建4K-4"]
+_TVBOX_DROP_LINES = []
 _TVBOX_LINE_ORDER = ["NN蓝光"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []

@@ -898,9 +898,8 @@ class Spider(Spider):
         self.destroy()
 
 
-
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["量子M3U8"]
+_TVBOX_DROP_LINES = []
 _TVBOX_LINE_ORDER = ["超级线路"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
