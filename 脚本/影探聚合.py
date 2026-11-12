@@ -1,227 +1,13765 @@
 # -*- coding: utf-8 -*-
 """Kishuto —— TVBox / 影视仓 多源聚合源
 
-本文件为发布产物：源码已压缩封装，运行时自解压到本模块命名空间。
-修改请改 build/Kishuto.py 后走 publish.py，请勿直接编辑本文件。
+  影探聚合(4源) · 稀饭动漫(4源) · 小鸡看看 · FoFo影院 · 小山影视 · 枫奇4K(至臻/蓝光) · 橘汁新网关4K · 四源4K专线(天堂/布布/华谊/苹果)
+  分类/搜索按 tag 前缀派发，详情页跨源按标题补线路，播放按 id 派发回原源。
+  本文件由 build_kishuto.py 自动生成。
 """
 
-CODE_VERSION = '20261111.151554'
+# ==================== 版本（必须放在最前：被聚合代码在模块级引用） ====
+CODE_VERSION = '20261110.211434'
 UPDATE_URL = 'https://gitee.com/tao060702/tvbox/raw/master/update_kishuto.json'
 
-# ---------------- 保护层（解包即还原源码，勿在此处改动） ----------------
-import base64 as _kzp_b64
-import json as _kzp_json
-import zlib as _kzp_zlib
+# ======================================================================
+# 模块：yt
+# ======================================================================
+# -*- coding: utf-8 -*-
+"""
+影探聚合 —— 四源聚合 TVBox Python 源（单文件）
+========================================================================
+首页 / 分类 / 筛选 / 搜索：影探4K（cms.lyyytv.cn）
+详情页线路顺序：影探4K → 咕噜咕噜 → 橘汁4K → 找剧AI
+
+源说明（2026-11-04 实测）
+  影探4K   CMS + fys 解析接口，线路多为联通云/移动云/爱奇艺直链，可播率高
+  咕噜咕噜  T3 私有协议（ECDH P-256 + AES-256-GCM + protobuf），线路最多
+  橘汁4K   同 host 的另一套 T3 客户端（包名/版本/详情参数不同），目录与 id 空间
+           独立，线路与咕噜有互补
+  找剧AI   zhaoju4.com，HMAC 签名的 REST，官方 4K/1080P 线路需登录态（自动游客会话）
+
+依赖：纯标准库（无 requests / pycryptodome），自带 AES-128/256-CBC、AES-256-GCM、
+     P-256 ECDH、protobuf 裸编解码实现，可直接丢进 TVBox 的 python 目录使用。
+========================================================================
+"""
+
+import base64
+import gzip
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import socket
+import ssl
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+import zlib
+
+try:
+    from base.spider import Spider as _BaseSpider
+except Exception:
+    _BaseSpider = object
+
+UA_WEB = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
+UA_ANDROID = ('Mozilla/5.0 (Linux; Android 13; SM-S9080) AppleWebKit/537.36 '
+              '(KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36')
+
+NL = '\n'
+_SEP = '\x1f'
 
 
-class Spider(object):
-    """接口占位。
+# ============================================================================
+# 基础工具
+# ============================================================================
 
-    壳在装载前会先扫文本里的类/方法名，扫不到就判「不是 python 源」。
-    这里只留签名，真正的实现在文件末尾由载荷 exec 覆盖同名类。
+def text(value):
+    return '' if value is None else str(value).strip()
+
+
+def as_list(value):
+    return value if isinstance(value, list) else []
+
+
+def as_dict(value):
+    return value if isinstance(value, dict) else {}
+
+
+def loads(value):
+    """宽松 JSON 解析：容忍前后缀、非 JSON 内容。"""
+    try:
+        if not value:
+            return {}
+        if isinstance(value, (bytes, bytearray)):
+            value = value.decode('utf-8', 'replace')
+        value = str(value).strip()
+        if value[:1] not in ('{', '['):
+            m = re.search(r'[\{\[].*[\}\]]', value, re.S)
+            if not m:
+                return {}
+            value = m.group(0)
+        return json.loads(value)
+    except Exception:
+        return {}
+
+
+def page_of(value):
+    m = re.match(r'\s*[+-]?\d+', '' if value is None else str(value))
+    n = int(m.group(0)) if m else 0
+    return max(1, n) if n else 1
+
+
+def clean_name(value):
+    """线路/标题清洗：去掉 $ # | 以及多余空白，避免破坏 TVBox 分隔符。"""
+    s = text(value)
+    for ch in ('$', '#', '$$$', '|'):
+        s = s.replace(ch, ' ')
+    return re.sub(r'\s+', ' ', s).strip()
+
+
+def norm_title(value):
+    s = text(value).lower()
+    s = re.sub(r'[\s\-_:：·,，.。!！?？"“”\'’()（）\[\]【】]+', '', s)
+    s = re.sub(r'(第[一二三四五六七八九十\d]+季|season\s*\d+|s\d{1,2})$', '', s)
+    return s
+
+
+def sim(a, b):
+    """标题相似度（0~1），够用即可：完全一致/包含/字符级 Jaccard。"""
+    x, y = norm_title(a), norm_title(b)
+    if not x or not y:
+        return 0.0
+    if x == y:
+        return 1.0
+    if x in y or y in x:
+        return 0.82
+    sx, sy = set(x), set(y)
+    inter = len(sx & sy)
+    if not inter:
+        return 0.0
+    return inter / float(len(sx | sy))
+
+
+def best_match(title, items, floor=0.62):
+    best, score = None, 0.0
+    for it in as_list(items):
+        if not isinstance(it, dict):
+            continue
+        s = sim(title, it.get('vod_name') or it.get('name') or '')
+        if s > score:
+            best, score = it, s
+    return best if score >= floor else None
+
+
+_SEASON_SIMPLE = re.compile(
+    r'(第[一二三四五六七八九十\d]+季|season\s*\d+|s\d{1,2})', re.I)
+_QUALITY_NOISE = re.compile(
+    r'(4k|8k|2160p?|1080p?|720p?|uhd|hdr\d*|蓝光|高清|超清|'
+    r'国语|粤语|中字|字幕|完整版|未删减|合集|正片|bd|hd|dvd|web|remux)', re.I)
+
+
+def strict_match(title, items):
+    """详情页跨源补线路：只认「同一部片」，禁止片名包含式扩展匹配。
+
+    旧 best_match 把「熊出没」⊂「熊出没之雪岭熊风」判成 0.82 分，
+    于是剧集《熊出没》详情里挂进了电影版线路。这里要求核心片名完全
+    一致，只允许剥掉画质/版本/年份后缀；季数标记不同一律不匹配。
     """
+    import difflib
+
+    def core(s):
+        t = norm_title(str(s or ''))
+        t = re.sub(r'[（(][^）)]*[）)]', '', t)
+        t = _QUALITY_NOISE.sub('', t)
+        t = re.sub(r'(19|20)\d{2}$', '', t)
+        t = re.sub(r'第[一二三四五六七八九十\d]+[季部篇]$', '', t)
+        return t.strip()
+
+    want = core(title)
+    if not want:
+        return None
+    wm = _SEASON_SIMPLE.search(str(title or ''))
+    wtag = wm.group(0).lower() if wm else ''
+    exact, near = [], []
+    for it in as_list(items):
+        if not isinstance(it, dict):
+            continue
+        name = str(it.get('vod_name') or it.get('name') or '')
+        cm = _SEASON_SIMPLE.search(name)
+        ctag = cm.group(0).lower() if cm else ''
+        if wtag and ctag and wtag != ctag:
+            continue
+        got = core(name)
+        if not got:
+            continue
+        if got == want:
+            exact.append(it)
+        elif (abs(len(got) - len(want)) <= 2
+              and difflib.SequenceMatcher(None, got, want).ratio() >= 0.97):
+            near.append(it)
+    return (exact or near or [None])[0]
+
+
+# ============================================================================
+# 缓存
+# ============================================================================
+
+_CACHE = {}
+_CACHE_LOCK = threading.Lock()
+_TITLE_MEMO = {}          # vod_id -> 片名：个别源详情只回数字 id，补线路要靠它
+_DETAIL_MEMO = {}         # 详情 id -> (时间, [(线路名, [(集名, 播放码)])])
+
+
+def _memo_detail(cid, lines):
+    """记住本次详情拼出的全部线路，播放失败时用它同集换源。"""
+    if not cid or not lines:
+        return
+    now = time.time()
+    if len(_DETAIL_MEMO) > 200:
+        for k in [k for k, v in list(_DETAIL_MEMO.items())
+                  if now - v[0] > 1800]:
+            _DETAIL_MEMO.pop(k, None)
+        if len(_DETAIL_MEMO) > 200:
+            _DETAIL_MEMO.clear()
+    _DETAIL_MEMO[str(cid)] = (now, lines)
+
+
+def _unpack_lines(vod):
+    """把 _pack 后的 vod_play_from/url 反解成 [(线路名, [(集名, 播放码)])]。"""
+    froms = str(vod.get('vod_play_from') or '').split('$$$')
+    urls = str(vod.get('vod_play_url') or '').split('$$$')
+    out = []
+    for i, name in enumerate(froms):
+        name = str(name or '').strip()
+        if not name:
+            continue
+        seg = urls[i] if i < len(urls) else ''
+        eps = []
+        for part in str(seg).split('#'):
+            part = part.strip()
+            if not part:
+                continue
+            nm, sep, pid = part.partition('$')
+            if not sep:
+                nm, pid = '', part
+            eps.append((nm, pid))
+        if eps:
+            out.append((name, eps))
+    return out
+
+
+def _memo_title(code, name):
+    """记下列表/搜索里看到的真实片名，供详情缺片名时兜底。"""
+    t = str(name or '').strip()
+    if not code or len(t) < 2 or t.isdigit():
+        return
+    if len(_TITLE_MEMO) > 4000:
+        _TITLE_MEMO.clear()
+    _TITLE_MEMO[str(code)] = t
+
+
+def cache_get(key):
+    with _CACHE_LOCK:
+        hit = _CACHE.get(key)
+        if not hit:
+            return None
+        if hit[0] < time.time():
+            _CACHE.pop(key, None)
+            return None
+        return hit[1]
+
+
+def cache_put(key, value, ttl):
+    with _CACHE_LOCK:
+        if len(_CACHE) > 800:
+            now = time.time()
+            dead = [k for k, v in _CACHE.items() if v[0] < now]
+            for k in dead[:300]:
+                _CACHE.pop(k, None)
+            if len(_CACHE) > 1000:
+                _CACHE.clear()
+        _CACHE[key] = (time.time() + ttl, value)
+
+
+# ============================================================================
+# HTTP（统一层：gzip、连接复用靠 keep-alive 由 urllib 自行管理、瞬时错误重试）
+# ============================================================================
+
+_CTX = [None, False]
+
+
+def ssl_ctx():
+    if _CTX[1] is False:
+        try:
+            c = ssl.create_default_context()
+            c.check_hostname = False
+            c.verify_mode = ssl.CERT_NONE
+            _CTX[0] = c
+        except Exception:
+            _CTX[0] = None
+        _CTX[1] = True
+    return _CTX[0]
+
+
+def http(url, method='GET', headers=None, data=None, timeout=8.0,
+         retries=2, backoff=0.35):
+    """返回 (status, body_bytes)。网络/瞬时错误自动重试，绝不抛异常。"""
+    url = safe_url(url)
+    hdr = {'User-Agent': UA_WEB, 'Accept': '*/*', 'Accept-Encoding': 'gzip'}
+    if headers:
+        hdr.update(headers)
+    tries = max(1, int(retries))
+    last = (0, b'')
+    for i in range(tries):
+        if i:
+            time.sleep(backoff * i)
+        try:
+            req = urllib.request.Request(url, data=data, headers=hdr, method=method)
+            kw = {'timeout': timeout}
+            ctx = ssl_ctx()
+            if ctx is not None:
+                kw['context'] = ctx
+            with urllib.request.urlopen(req, **kw) as rsp:
+                body = rsp.read()
+                enc = (rsp.headers.get('Content-Encoding') or '').lower()
+                if 'gzip' in enc:
+                    try:
+                        body = gzip.decompress(body)
+                    except Exception:
+                        pass
+                elif 'deflate' in enc:
+                    try:
+                        body = zlib.decompress(body)
+                    except Exception:
+                        try:
+                            body = zlib.decompress(body, -zlib.MAX_WBITS)
+                        except Exception:
+                            pass
+                status = rsp.getcode()
+                if status in (429, 500, 502, 503, 504) and i < tries - 1:
+                    last = (status, body)
+                    continue
+                return (status, body)
+        except urllib.error.HTTPError as exc:
+            try:
+                body = exc.read()
+            except Exception:
+                body = b''
+            last = (exc.code, body)
+            if exc.code in (429, 500, 502, 503, 504) and i < tries - 1:
+                continue
+            return last
+        except (socket.timeout, ssl.SSLError, urllib.error.URLError, OSError):
+            last = (0, b'')
+            continue
+        except Exception:
+            last = (0, b'')
+            continue
+    return last
+
+
+def http_text(url, method='GET', headers=None, data=None, timeout=8.0,
+              retries=2, charset='utf-8'):
+    st, body = http(url, method, headers, data, timeout, retries)
+    if not body:
+        return st, ''
+    try:
+        return st, body.decode(charset, 'replace')
+    except Exception:
+        return st, body.decode('utf-8', 'replace')
+
+
+def http_json(url, method='GET', headers=None, data=None, timeout=8.0, retries=2):
+    st, txt = http_text(url, method, headers, data, timeout, retries)
+    if not txt:
+        return {}
+    return loads(txt)
+
+
+def http_cached(key, ttl, fn):
+    hit = cache_get(key)
+    if hit is not None:
+        return hit
+    value = fn()
+    if value:
+        cache_put(key, value, ttl)
+    return value
+
+
+def is_url(value):
+    try:
+        p = urllib.parse.urlparse(text(value))
+        return p.scheme in ('http', 'https') and bool(p.netloc)
+    except Exception:
+        return False
+
+
+_URL_SAFE = ":/?#[]@!$&'()*+,;=%~"
+
+
+def safe_url(value):
+    """urllib 不接受 URL 里的非 ASCII（中文文件名很常见）→ 百分号编码掉。"""
+    u = text(value).strip()
+    try:
+        u.encode('ascii')
+        return u
+    except Exception:
+        try:
+            return urllib.parse.quote(u, safe=_URL_SAFE)
+        except Exception:
+            return u
+
+
+_STREAM_RE = re.compile(r'\.(?:m3u8|mpd)$', re.I)
+_MEDIA_RE = re.compile(r'\.(?:mp4|m3u8|mpd|flv|avi|mkv|ts|mov|wmv|webm|m4v)$', re.I)
+
+
+def is_stream_url(url):
+    if not is_url(url):
+        return False
+    return bool(_STREAM_RE.search(urllib.parse.urlparse(text(url)).path))
+
+
+def is_media_url(url):
+    if not is_url(url):
+        return False
+    return bool(_MEDIA_RE.search(urllib.parse.urlparse(text(url)).path))
+
+
+# ============================================================================
+# 纯 Python AES（128/256 CBC + 256 GCM）
+# ============================================================================
+
+def _xtime(a):
+    a <<= 1
+    return (a ^ 0x1B) & 0xFF if a & 0x100 else a
+
+
+def _gmul(a, b):
+    r = 0
+    while b:
+        if b & 1:
+            r ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xFF
+        if hi:
+            a ^= 0x1B
+        b >>= 1
+    return r
+
+
+_SBOX = None
+_INV_SBOX = None
+
+
+def _aes_tables():
+    global _SBOX, _INV_SBOX
+    if _SBOX is not None:
+        return
+    exp = [0] * 256
+    log = [0] * 256
+    x = 1
+    for i in range(255):
+        exp[i] = x
+        log[x] = i
+        x = _gmul(x, 0x03)
+    sb = [0] * 256
+    ib = [0] * 256
+    for i in range(256):
+        inv = 0 if i == 0 else exp[(255 - log[i]) % 255]
+        t = inv
+        s = inv
+        for _ in range(4):
+            s = ((s << 1) | (s >> 7)) & 0xFF
+            t ^= s
+        sb[i] = t ^ 0x63
+        ib[sb[i]] = i
+    _SBOX = bytes(sb)
+    _INV_SBOX = bytes(ib)
+
+
+def _expand_key(key):
+    """支持 16(128)/24(192)/32(256) 字节密钥，返回轮密钥列表。"""
+    _aes_tables()
+    nk = len(key) // 4
+    if nk not in (4, 6, 8):
+        raise ValueError('bad aes key length')
+    total = 4 * (nk + 7)
+    w = [list(key[i * 4:i * 4 + 4]) for i in range(nk)]
+    rcon = 1
+    for i in range(nk, total):
+        t = list(w[i - 1])
+        if i % nk == 0:
+            t = t[1:] + t[:1]
+            t = [_SBOX[b] for b in t]
+            t[0] ^= rcon
+            rcon = _xtime(rcon)
+        elif nk > 6 and i % nk == 4:
+            t = [_SBOX[b] for b in t]
+        w.append([w[i - nk][j] ^ t[j] for j in range(4)])
+    return [sum(w[i:i + 4], []) for i in range(0, total, 4)]
+
+
+def _shift_rows(state, encrypt):
+    out = [0] * 16
+    for r in range(4):
+        for c in range(4):
+            out[r + 4 * c] = state[r + 4 * ((c + (r if encrypt else -r)) % 4)]
+    return out
+
+
+def _mix_columns(state):
+    out = state[:]
+    for c in range(4):
+        a = out[0 + 4 * c]
+        b = out[1 + 4 * c]
+        d = out[2 + 4 * c]
+        e = out[3 + 4 * c]
+        t = a ^ b ^ d ^ e
+        out[0 + 4 * c] = a ^ t ^ _xtime(a ^ b)
+        out[1 + 4 * c] = b ^ t ^ _xtime(b ^ d)
+        out[2 + 4 * c] = d ^ t ^ _xtime(d ^ e)
+        out[3 + 4 * c] = e ^ t ^ _xtime(e ^ a)
+    return out
+
+
+def _mul9(x):
+    return _xtime(_xtime(_xtime(x))) ^ x
+
+
+def _mul11(x):
+    return _xtime(_xtime(_xtime(x))) ^ _xtime(x) ^ x
+
+
+def _mul13(x):
+    return _xtime(_xtime(_xtime(x))) ^ _xtime(_xtime(x)) ^ x
+
+
+def _mul14(x):
+    return _xtime(_xtime(_xtime(x))) ^ _xtime(_xtime(x)) ^ _xtime(x)
+
+
+def _inv_mix_columns(state):
+    out = state[:]
+    for c in range(4):
+        a = out[0 + 4 * c]
+        b = out[1 + 4 * c]
+        d = out[2 + 4 * c]
+        e = out[3 + 4 * c]
+        out[0 + 4 * c] = _mul14(a) ^ _mul11(b) ^ _mul13(d) ^ _mul9(e)
+        out[1 + 4 * c] = _mul9(a) ^ _mul14(b) ^ _mul11(d) ^ _mul13(e)
+        out[2 + 4 * c] = _mul13(a) ^ _mul9(b) ^ _mul14(d) ^ _mul11(e)
+        out[3 + 4 * c] = _mul11(a) ^ _mul13(b) ^ _mul9(d) ^ _mul14(e)
+    return out
+
+
+def _enc_block(block, rk):
+    nr = len(rk) - 1
+    st = [s ^ k for s, k in zip(block, rk[0])]
+    for r in range(1, nr):
+        st = [_SBOX[b] for b in st]
+        st = _shift_rows(st, True)
+        st = _mix_columns(st)
+        st = [s ^ k for s, k in zip(st, rk[r])]
+    st = [_SBOX[b] for b in st]
+    st = _shift_rows(st, True)
+    return bytes([s ^ k for s, k in zip(st, rk[nr])])
+
+
+def _dec_block(block, rk):
+    nr = len(rk) - 1
+    st = [s ^ k for s, k in zip(block, rk[nr])]
+    for r in range(nr - 1, 0, -1):
+        st = _shift_rows(st, False)
+        st = [_INV_SBOX[b] for b in st]
+        st = [s ^ k for s, k in zip(st, rk[r])]
+        st = _inv_mix_columns(st)
+    st = _shift_rows(st, False)
+    st = [_INV_SBOX[b] for b in st]
+    return bytes([s ^ k for s, k in zip(st, rk[0])])
+
+
+def cbc_encrypt(key, iv, data, pad=True):
+    rk = _expand_key(key)
+    if pad:
+        n = 16 - len(data) % 16
+        data = data + bytes([n]) * n
+    out = bytearray()
+    prev = iv
+    for i in range(0, len(data), 16):
+        blk = bytes(a ^ b for a, b in zip(data[i:i + 16], prev))
+        prev = _enc_block(blk, rk)
+        out += prev
+    return bytes(out)
+
+
+def cbc_decrypt(key, iv, data, unpad=False):
+    rk = _expand_key(key)
+    out = bytearray()
+    prev = iv
+    end = len(data) - len(data) % 16
+    for i in range(0, end, 16):
+        blk = data[i:i + 16]
+        out += bytes(a ^ b for a, b in zip(_dec_block(blk, rk), prev))
+        prev = blk
+    res = bytes(out)
+    if unpad and res:
+        n = res[-1]
+        if 1 <= n <= 16 and res[-n:] == bytes([n]) * n:
+            res = res[:-n]
+    return res
+
+
+_GCM_R = 0xE1000000000000000000000000000000
+
+
+def _ghash_mul(x, y):
+    z = 0
+    for i in range(128):
+        if (x >> (127 - i)) & 1:
+            z ^= y
+        if y & 1:
+            y = (y >> 1) ^ _GCM_R
+        else:
+            y >>= 1
+    return z
+
+
+def _ghash(h, aad, ciphertext):
+    y = 0
+    for i in range(0, len(aad), 16):
+        blk = int.from_bytes(aad[i:i + 16].ljust(16, b'\x00'), 'big')
+        y = _ghash_mul(y ^ blk, h)
+    for i in range(0, len(ciphertext), 16):
+        blk = int.from_bytes(ciphertext[i:i + 16].ljust(16, b'\x00'), 'big')
+        y = _ghash_mul(y ^ blk, h)
+    lens = (len(aad) * 8).to_bytes(8, 'big') + (len(ciphertext) * 8).to_bytes(8, 'big')
+    return _ghash_mul(y ^ int.from_bytes(lens, 'big'), h)
+
+
+def gcm_encrypt(key, nonce, data, aad=b''):
+    rk = _expand_key(key)
+    h = int.from_bytes(_enc_block(b'\x00' * 16, rk), 'big')
+    j0 = nonce + b'\x00\x00\x00\x01'
+    counter = int.from_bytes(j0, 'big')
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        counter += 1
+        ks = _enc_block(counter.to_bytes(16, 'big'), rk)
+        chunk = data[i:i + 16]
+        out += bytes(b ^ k for b, k in zip(chunk, ks))
+    ciphertext = bytes(out)
+    s = _ghash(h, aad, ciphertext)
+    tag = (s ^ int.from_bytes(_enc_block(j0, rk), 'big')).to_bytes(16, 'big')[:16]
+    return ciphertext, tag
+
+
+def gcm_decrypt(key, nonce, data, tag=None, aad=b''):
+    """tag 为 None 时按 data[-16:] 切分（部分客户端不校验 tag）。"""
+    rk = _expand_key(key)
+    if tag is None:
+        tag = data[-16:]
+        data = data[:-16]
+    j0 = nonce + b'\x00\x00\x00\x01'
+    counter = int.from_bytes(j0, 'big')
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        counter += 1
+        ks = _enc_block(counter.to_bytes(16, 'big'), rk)
+        chunk = data[i:i + 16]
+        out += bytes(b ^ k for b, k in zip(chunk, ks))
+    return bytes(out)
+
+
+# ============================================================================
+# P-256（secp256r1）ECDH
+# ============================================================================
+
+_P256_P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+_P256_A = _P256_P - 3
+_P256_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+_P256_G = (0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296,
+           0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5)
+
+
+def _p256_double(pt):
+    if pt is None:
+        return None
+    x, y = pt
+    if y == 0:
+        return None
+    lam = (3 * x * x + _P256_A) * pow(2 * y, _P256_P - 2, _P256_P) % _P256_P
+    x3 = (lam * lam - 2 * x) % _P256_P
+    y3 = (lam * (x - x3) - y) % _P256_P
+    return (x3, y3)
+
+
+def _p256_add(p1, p2):
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2:
+        if (y1 + y2) % _P256_P == 0:
+            return None
+        return _p256_double(p1)
+    lam = (y2 - y1) * pow((x2 - x1) % _P256_P, _P256_P - 2, _P256_P) % _P256_P
+    x3 = (lam * lam - x1 - x2) % _P256_P
+    y3 = (lam * (x1 - x3) - y1) % _P256_P
+    return (x3, y3)
+
+
+def _p256_mul(k, pt):
+    res = None
+    addend = pt
+    while k:
+        if k & 1:
+            res = _p256_add(res, addend)
+        addend = _p256_double(addend)
+        k >>= 1
+    return res
+
+
+def ecdh_keypair():
+    priv = int.from_bytes(secrets.token_bytes(32), 'big') % (_P256_N - 1) + 1
+    pub = _p256_mul(priv, _P256_G)
+    raw = b'\x04' + pub[0].to_bytes(32, 'big') + pub[1].to_bytes(32, 'big')
+    return priv, raw
+
+
+def ecdh_shared_x(priv, server_pub):
+    raw = bytes(server_pub or b'')
+    if len(raw) == 65 and raw[0] == 4:
+        pt = (int.from_bytes(raw[1:33], 'big'), int.from_bytes(raw[33:65], 'big'))
+    elif len(raw) == 64:
+        pt = (int.from_bytes(raw[:32], 'big'), int.from_bytes(raw[32:], 'big'))
+    else:
+        raise ValueError('bad server public key')
+    shared = _p256_mul(priv, pt)
+    if shared is None:
+        raise ValueError('ecdh infinity')
+    return shared[0].to_bytes(32, 'big')
+
+
+# ============================================================================
+# protobuf 裸编解码（T3 协议用）
+# ============================================================================
+
+def pb_varint(value):
+    if value < 0:
+        raise ValueError('negative varint')
+    out = bytearray()
+    while value >= 0x80:
+        out.append((value & 0x7F) | 0x80)
+        value >>= 7
+    out.append(value)
+    return bytes(out)
+
+
+def pb_bytes(field, value):
+    if isinstance(value, str):
+        value = value.encode('utf-8')
+    return pb_varint((field << 3) | 2) + pb_varint(len(value)) + value
+
+
+def pb_var(field, value):
+    return pb_varint(field << 3) + pb_varint(int(value))
+
+
+def pb_read_varint(data, pos):
+    value = 0
+    shift = 0
+    while pos < len(data) and shift < 70:
+        b = data[pos]
+        pos += 1
+        value |= (b & 0x7F) << shift
+        if b < 0x80:
+            return value, pos
+        shift += 7
+    raise ValueError('bad varint')
+
+
+def pb_decode(data):
+    out = []
+    pos = 0
+    size = len(data or b'')
+    while pos < size:
+        key, pos = pb_read_varint(data, pos)
+        field, wire = key >> 3, key & 7
+        if field == 0:
+            raise ValueError('field zero')
+        if wire == 0:
+            value, pos = pb_read_varint(data, pos)
+        elif wire == 1:
+            value = data[pos:pos + 8]
+            pos += 8
+        elif wire == 2:
+            length, pos = pb_read_varint(data, pos)
+            value = data[pos:pos + length]
+            pos += length
+        elif wire == 5:
+            value = data[pos:pos + 4]
+            pos += 4
+        else:
+            raise ValueError('wire %d' % wire)
+        if pos > size:
+            raise ValueError('truncated')
+        out.append((field, wire, value))
+    return out
+
+
+def pb_field(data, field, wire=None):
+    values = [v for f, w, v in pb_decode(data) if f == field and (wire is None or w == wire)]
+    return values[-1] if values else None
+
+
+def pb_fields(data, field, wire=None):
+    return [v for f, w, v in pb_decode(data) if f == field and (wire is None or w == wire)]
+
+
+def pb_str(data, field, default=''):
+    value = pb_field(data, field, 2)
+    if value is None:
+        return default
+    try:
+        return value.decode('utf-8')
+    except Exception:
+        return default
+
+
+def raw_deflate(data, level=6):
+    c = zlib.compressobj(level, zlib.DEFLATED, wbits=-15, memLevel=8,
+                         strategy=zlib.Z_DEFAULT_STRATEGY)
+    return c.compress(data) + c.flush()
+
+
+def raw_inflate(data):
+    return zlib.decompress(data, -15)
+
+
+def b64url_encode(raw):
+    try:
+        if isinstance(raw, str):
+            raw = raw.encode('utf-8')
+        return base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+    except Exception:
+        return ''
+
+
+def b64url_decode(txt):
+    try:
+        s = text(txt)
+        s += '=' * ((4 - len(s) % 4) % 4)
+        return base64.urlsafe_b64decode(s.encode('ascii'))
+    except Exception:
+        return b''
+# ============================================================================
+# 云端自更新（可选，默认不启用）
+#
+#   原理：脚本 init 时后台拉一份「版本清单」，远端版本比本地新就下载整份
+#   .py 覆盖自身文件；下次壳加载这个文件即是新代码（无需改配置、无需手动拷）。
+#
+#   开启方式：把 UPDATE_URL 填成清单地址（或 extend 里传 update_url）。
+#   清单支持两种最省事的形态：
+#     ① 纯文本，内容只有一行版本号，例如  20261105.1930
+#        → 新脚本地址约定为「清单同目录 + 本文件名」，放同一个目录即可。
+#     ② JSON，可指定任意下载地址与校验值：
+#        {"version":"20261105.1930",
+#         "url":"https://xx.com/tvbox/影探聚合.py",
+#         "sha256":"…", "size":91234, "note":"修了找剧 503"}
+#
+#   安全阀：只接受 2xx、只接受体积 <= UPDATE_MAX_BYTES、只接受含
+#   "class Spider" 的 Python 文本、sha256 对不上就放弃；写盘走
+#   临时文件 + os.replace 原子替换，失败时旁挂 .new 不破坏旧文件。
+# ============================================================================
+
+UPDATE_MAX_BYTES = 4 * 1024 * 1024
+SELF_NAME = 'Kishuto.py'
+
+_UPDATE_LAST = {'ok': False, 'updated': False, 'version': CODE_VERSION,
+                'msg': '', 'note': '', 'at': 0.0}
+
+
+def code_version():
+    return CODE_VERSION
+
+
+def _ver_tuple(value):
+    return tuple(int(x) for x in re.findall(r'\d+', text(value))[:4]) or (0,)
+
+
+def version_newer(far, near):
+    """far 是否比 near 新。"""
+    a, b = _ver_tuple(far), _ver_tuple(near)
+    n = max(len(a), len(b))
+    return a + (0,) * (n - len(a)) > b + (0,) * (n - len(b))
+
+
+def self_path():
+    try:
+        p = os.path.abspath(__file__)
+        if os.path.isfile(p):
+            return p
+    except Exception:
+        pass
+    return ''
+
+
+def self_name():
+    p = self_path()
+    return os.path.basename(p) if p else SELF_NAME
+
+
+def parse_manifest(body):
+    """→ {'version','url','sha256','note'}；纯文本清单只给 version。"""
+    if isinstance(body, (bytes, bytearray)):
+        try:
+            body = bytes(body).decode('utf-8', 'replace')
+        except Exception:
+            return {}
+    raw = text(body).lstrip('\ufeff').strip()
+    if not raw:
+        return {}
+    if raw[:1] == '{':
+        try:
+            obj = loads(raw)
+        except Exception:
+            obj = None
+        if isinstance(obj, dict):
+            return {
+                'version': text(obj.get('version') or obj.get('ver')),
+                'url': text(obj.get('url') or obj.get('file') or obj.get('py')),
+                'sha256': text(obj.get('sha256') or obj.get('hash')).lower(),
+                'note': text(obj.get('note') or obj.get('desc')),
+            }
+    return {'version': raw.splitlines()[0].strip(), 'url': '',
+            'sha256': '', 'note': ''}
+
+
+def _write_self(path, blob):
+    """原子替换自身文件。返回 (是否替换成功, 说明)。"""
+    folder = os.path.dirname(path) or '.'
+    tmp = os.path.join(folder, '.upd_%s.tmp' % uuid.uuid4().hex[:8])
+    try:
+        with open(tmp, 'wb') as fp:
+            fp.write(blob)
+            fp.flush()
+            try:
+                os.fsync(fp.fileno())
+            except Exception:
+                pass
+    except Exception as exc:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return False, 'write failed: %s' % exc
+    try:
+        bak = path + '.bak'
+        try:
+            with open(path, 'rb') as src, open(bak, 'wb') as dst:
+                dst.write(src.read())
+        except Exception:
+            pass
+        os.replace(tmp, path)
+        return True, 'replaced'
+    except Exception as exc:
+        alt = path + '.new'
+        try:
+            os.replace(tmp, alt)
+            return False, 'replace failed(%s), saved %s' % (exc, os.path.basename(alt))
+        except Exception:
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+            return False, 'replace failed: %s' % exc
+
+
+def _fetch_manifest(url):
+    """带时间戳采样两次取版本较大的，都失败再回退原始地址。→ (manifest, status)"""
+    sep = '&' if '?' in url else '?'
+    got, status = [], 0
+    for i in range(2):
+        hit = '%s%st=%d' % (url, sep, int(time.time() * 1000) + i * 7)
+        status, body = http(hit, timeout=8, retries=1,
+                            headers={'Cache-Control': 'no-cache',
+                                     'Pragma': 'no-cache'})
+        if status == 200 and body:
+            got.append(body)
+    if not got:
+        status, body = http(url, timeout=8, retries=1,
+                            headers={'Cache-Control': 'no-cache',
+                                     'Pragma': 'no-cache'})
+        if status == 200 and body:
+            got.append(body)
+    best = {}
+    for body in got:
+        man = parse_manifest(body)
+        ver = text(man.get('version'))
+        if ver and (not best or version_newer(ver, text(best.get('version')))):
+            best = man
+    return best, status
+
+
+def _blob_version(blob):
+    m = re.search(rb"^CODE_VERSION = ['\"]([^'\"]*)", blob, re.M)
+    return m.group(1).decode('utf-8', 'ignore') if m else ''
+
+
+def check_update(url=''):
+    """拉清单 → 需要就下载覆盖。返回结果 dict（绝不影响主流程）。"""
+    url = text(url or UPDATE_URL)
+    out = {'ok': False, 'updated': False, 'version': CODE_VERSION,
+           'msg': '', 'note': '', 'at': time.time()}
+    if not url:
+        out['msg'] = 'no update url'
+        return out
+    try:
+        dest = self_path()
+        if not dest:
+            out['msg'] = 'self path unknown'
+            return out
+
+        # 每轮都重新拉清单：CDN 边缘节点之间可能不同步（清单落后一版、
+        # 脚本已是新版），死守一份旧清单会永远 sha 对不上。
+        last = ''
+        for attempt in range(3):
+            if attempt:
+                time.sleep(1.2 * attempt)
+            man, status = _fetch_manifest(url)
+            far = text(man.get('version'))
+            if not far:
+                last = 'manifest http %s' % status
+                continue
+            out['version'] = far
+            out['note'] = man.get('note') or ''
+            if not version_newer(far, CODE_VERSION):
+                out['ok'] = True
+                out['msg'] = 'up to date (%s)' % CODE_VERSION
+                return out
+
+            target_url = text(man.get('url'))
+            cands = []
+            if target_url:
+                cands.append(target_url if is_url(target_url)
+                             else urllib.parse.urljoin(url, target_url))
+            # 清单没写地址 / 拼出来 404 时的兜底：同目录 ASCII 名、再退本地同名
+            for name in ('Kishuto.py', self_name()):
+                cands.append(urllib.parse.urljoin(url, name))
+            digest = text(man.get('sha256')).lower()
+
+            blob = b''
+            seen = set()
+            for cand in cands:
+                if cand in seen:
+                    continue
+                seen.add(cand)
+                sep = '&' if '?' in cand else '?'
+                for hit in ('%s%st=%d' % (cand, sep, int(time.time() * 1000)), cand):
+                    st2, body = http(hit, timeout=25, retries=1)
+                    if st2 == 200 and body and b'class Spider' in body:
+                        blob = body
+                        break
+            if not blob:
+                last = 'download failed'
+                continue
+            if len(blob) > UPDATE_MAX_BYTES:
+                out['msg'] = 'too large (%d)' % len(blob)
+                return out
+
+            if digest and hashlib.sha256(blob).hexdigest() != digest:
+                # 清单落后一版时的兜底：只要脚本自身的版本号确实比本地新、
+                # 且不比清单旧，就认可它（版本号是我们自己的单调时间戳）。
+                bver = _blob_version(blob)
+                if bver and version_newer(bver, CODE_VERSION) and \
+                        not version_newer(far, bver):
+                    out['version'] = bver
+                    out['note'] = (out['note'] + ' / sha 兜底').strip(' /')
+                    far = bver
+                else:
+                    last = 'sha256 mismatch'
+                    continue
+
+            done, info = _write_self(dest, blob)
+            out['ok'] = True
+            out['updated'] = done
+            out['msg'] = ('updated %s -> %s, restart to apply'
+                          % (CODE_VERSION, far)) if done else info
+            return out
+        out['msg'] = last or 'update failed'
+        return out
+    except Exception as exc:
+        out['msg'] = 'error: %s' % exc
+        return out
+
+# ============================================================================
+# 源 1：影探4K（cms.lyyytv.cn）—— 首页 / 分类 / 搜索 的数据来源
+# ============================================================================
+
+class YT4K(object):
+    """影探4K。原脚本依赖 requests + pycryptodome，这里改为纯标准库实现。"""
+
+    NAME = '影探'
+    HOST = 'http://cms.lyyytv.cn'
+    CMS_KEY = 'wP5bvxoc3yv7FoBQENFZuAF0EUYr4LTy'
+    PARSE_API = 'http://fys.lyyytv.cn/api/index?appid=10001&videoUrl='
+    PARSE_ID_WEB = 5      # 网页线路（腾讯/爱奇艺/芒果/优酷/B站…）
+    PARSE_ID_4K = 6       # 4K 直链（ym4kjx 等，站点本身 404，需换链）
+    HEADERS = {'User-Agent': 'okhttp/4.12.0'}
+    PARSE_HEADERS = {'User-Agent': 'okhttp/4.12.0', 'Accept-Encoding': 'identity'}
+
+    DEC_PREFIX = 'https://baidu.con/'
+    PAGE_LIMIT = 20
+    HOME_TTL = 6 * 3600
+    PLAY_TTL = 120
+
+    FILTER_NAMES = {
+        'class': '类型', 'area': '地区', 'lang': '语言', 'year': '年份',
+        'letter': '字母', 'by': '排序', 'sort': '顺序',
+    }
+
+    _B64_RE = re.compile(r'(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?')
+    _LDMAX_RE = re.compile(r'^https?://ldmax\.cooom/', re.I)
+    _4K_HOST_RE = re.compile(
+        r'(?:^|\.)(?:ym4kjx|hd4kjx|sd4kjx|mm4kjx|mv4kjx|vk4kjx)\.lyyytv\.cn$', re.I)
+
+    def __init__(self, timeout=9.0):
+        self.timeout = timeout
+
+    # ---------- 基础 ----------
+    def cms(self, path, params=None):
+        query = urllib.parse.urlencode(params or {})
+        url = '%s/api.php/app/%s?%s' % (self.HOST, path, query)
+        key = 'yt:cms:%s' % url
+        cached = cache_get(key)
+        if cached is not None:
+            return cached
+        data = http_json(url, headers=self.HEADERS, timeout=self.timeout, retries=2)
+        if not isinstance(data, dict) or not data:
+            return {}
+        code = data.get('code')
+        if code is not None:
+            try:
+                ok = int(code) in (1, 200)
+            except (TypeError, ValueError):
+                ok = False
+            if not ok:
+                return {}
+        cache_put(key, data, 60)
+        return data
+
+    # ---------- 解密 ----------
+    def _unb64(self, value):
+        clean = re.sub(r'\s+', '', text(value))
+        if not clean or not self._B64_RE.fullmatch(clean):
+            return None
+        try:
+            return base64.b64decode(clean)
+        except Exception:
+            return None
+
+    def decrypt_lvdou(self, value):
+        """lvdou+ 前缀：前 16 字节 key、后 16 字节 iv 的 AES/CBC/PKCS7（AES-128）。"""
+        original = text(value)
+        if not original.startswith('lvdou+') or not self.CMS_KEY:
+            return original
+        try:
+            encrypted = self._unb64(original[6:])
+            if not encrypted:
+                return original
+            key = self.CMS_KEY[:16].encode('utf-8')
+            iv = self.CMS_KEY[16:32].encode('utf-8') if len(self.CMS_KEY) >= 32 else key
+            plain = cbc_decrypt(key, iv, encrypted, unpad=True)
+            result = plain.decode('utf-8', 'replace').strip()
+            if result.startswith('http'):
+                return result
+        except Exception:
+            pass
+        return original
+
+    def decrypt_ldmax(self, value, depth=0):
+        """老加密：ldmax.cooom 前缀，key = 路径前 16 位反转。"""
+        if depth > 5:
+            return ''
+        url = text(value)
+        decoded = self._unb64(url)
+        if decoded:
+            url = re.sub(r'\s+', '', decoded.decode('utf-8', 'replace'))
+        if not self._LDMAX_RE.match(url):
+            return url
+        path = self._LDMAX_RE.sub('', url)
+        if len(path) <= 16:
+            return ''
+        try:
+            key = path[:16][::-1].encode('utf-8')
+            encrypted = self._unb64(path[16:])
+            if not encrypted or len(encrypted) % 16:
+                return ''
+            plain = bytearray(cbc_decrypt(key, key, encrypted))
+            pad = plain[-1] if plain else 0
+            if 0 < pad <= 16:
+                del plain[-pad:]
+            result = bytes(plain).decode('utf-8', 'replace').strip()
+            return self.decrypt_ldmax(result, depth + 1) \
+                if self._LDMAX_RE.match(result) else result
+        except Exception:
+            return ''
+
+    def resolve_parse(self, body):
+        """解析响应：JSON 包裹取 url；baidu.con 前缀走 AES；否则视为明文。"""
+        body = text(body)
+        if not body:
+            return ''
+        candidate = body
+        if body.startswith('{'):
+            parsed = loads(body)
+            for key in ('url', 'playUrl', 'link'):
+                if isinstance(parsed, dict) and parsed.get(key):
+                    candidate = text(parsed[key])
+                    break
+            else:
+                inner = as_dict(as_dict(parsed).get('data'))
+                for key in ('url', 'playUrl', 'link'):
+                    if inner.get(key):
+                        candidate = text(inner[key])
+                        break
+        if not candidate.startswith(self.DEC_PREFIX):
+            return candidate
+
+        rest = candidate[len(self.DEC_PREFIX):]
+        if len(rest) <= 16:
+            return ''
+        key = rest[:16].encode('utf-8')
+        cipher_b64 = rest[16:]
+        try:
+            encrypted = base64.b64decode(cipher_b64, validate=False)
+            result = cbc_decrypt(key, key, encrypted, unpad=True).decode('utf-8', 'replace').strip()
+            if result.startswith('http'):
+                return result
+        except Exception:
+            pass
+        try:
+            raw = cipher_b64.encode('latin-1', errors='ignore')
+            if raw and len(raw) % 16 == 0:
+                result = cbc_decrypt(key, key, raw, unpad=True).decode('utf-8', 'replace').strip()
+                if result.startswith('http'):
+                    return result
+        except Exception:
+            pass
+        return ''
+
+    def parse_url(self, raw, parse_id):
+        if not raw:
+            return ''
+        target = '%s%s&parsesId=%d' % (
+            self.PARSE_API, urllib.parse.quote(raw, safe="!'()*"), parse_id)
+        st, txt = http_text(target, headers=self.PARSE_HEADERS, timeout=20, retries=2)
+        if st and st < 400 and txt:
+            resolved = self.resolve_parse(txt)
+            if resolved and resolved.startswith('http'):
+                return resolved
+        return ''
+
+    # ---------- 类型判断 ----------
+    def is_4k_source(self, url):
+        if not is_url(url):
+            return False
+        host = (urllib.parse.urlparse(text(url)).hostname or '').lower()
+        if host and self._4K_HOST_RE.search(host):
+            return True
+        return is_media_url(url) and not is_stream_url(url)
+
+    # ---------- 列表 ----------
+    @staticmethod
+    def _paginate(data, page):
+        lst = as_list(data.get('list'))
+        try:
+            limit = int(data.get('limit') or 0)
+        except (TypeError, ValueError):
+            limit = 0
+        if limit <= 0:
+            limit = YT4K.PAGE_LIMIT
+        try:
+            pagecount = int(data.get('pagecount') or 0)
+        except (TypeError, ValueError):
+            pagecount = 0
+        if pagecount <= 0:
+            pagecount = page + (1 if len(lst) >= limit else 0)
+        try:
+            total = int(data.get('total'))
+        except (TypeError, ValueError):
+            total = (page - 1) * limit + len(lst) + (1 if pagecount > page else 0)
+        return {'list': lst, 'page': page, 'pagecount': pagecount,
+                'limit': limit, 'total': total}
+
+    def home(self):
+        def build():
+            data = self.cms('nav', {'token': ''})
+            classes, filters = [], {}
+            for item in as_list(data.get('list')):
+                if not isinstance(item, dict):
+                    continue
+                if item.get('type_id') is None or not text(item.get('type_name')):
+                    continue
+                tid = text(item['type_id'])
+                classes.append({'type_id': tid, 'type_name': text(item['type_name'])})
+                ext = as_dict(item.get('type_extend'))
+                groups = []
+                for key, name in self.FILTER_NAMES.items():
+                    values = [v for v in (text(x) for x in text(ext.get(key)).split(',')) if v]
+                    values = list(dict.fromkeys(values))
+                    if values:
+                        groups.append({
+                            'key': key, 'name': name, 'init': '',
+                            'value': [{'n': '全部', 'v': ''}] +
+                                     [{'n': v, 'v': v} for v in values],
+                        })
+                if groups:
+                    filters[tid] = groups
+            return {'class': classes, 'filters': filters} if classes else {}
+        got = http_cached('yt:nav', self.HOME_TTL, build)
+        return got or {'class': [], 'filters': {}}
+
+    def home_vod(self):
+        def build():
+            data = self.cms('index_video', {'token': ''})
+            vlist = []
+            for item in as_list(data.get('list')):
+                if isinstance(item, dict):
+                    vlist.extend(as_list(item.get('vlist')))
+            return {'list': vlist} if vlist else {}
+        got = http_cached('yt:index', 600, build)
+        return got or {'list': []}
+
+    def category(self, tid, pg, extend):
+        page = page_of(pg)
+        tid = text(tid)
+        if not tid:
+            return {'list': [], 'page': page, 'pagecount': 0, 'limit': self.PAGE_LIMIT,
+                    'total': 0}
+        ext = extend if isinstance(extend, dict) else loads(extend)
+        params = {'tid': tid, 'pg': str(page), 'limit': '18'}
+        for key in self.FILTER_NAMES:
+            value = text(as_dict(ext).get(key))
+            if value and value != 'all':
+                params[key] = value
+        data = self.cms('video', params)
+        return self._paginate(data, page)
+
+    def search(self, key, pg):
+        wd = text(key)
+        page = page_of(pg)
+        if not wd:
+            return {'list': [], 'page': page, 'pagecount': 0, 'limit': self.PAGE_LIMIT,
+                    'total': 0}
+        data = self.cms('search', {'text': wd, 'pg': str(page)})
+        lst = [dict((k, v) for k, v in item.items() if k != 'type')
+               for item in as_list(data.get('list')) if isinstance(item, dict)]
+        data['list'] = lst
+        return self._paginate(data, page)
+
+    # ---------- 详情 ----------
+    def playlist(self, value):
+        parts = []
+        for entry in text(value).split('#'):
+            sep = entry.find('$')
+            if sep <= 0 or not text(entry[sep + 1:]):
+                continue
+            parts.append('%s$%s' % (text(entry[:sep]), self.decrypt_lvdou(entry[sep + 1:])))
+        return '#'.join(parts)
+
+    def detail(self, vid):
+        vid = text(vid)
+        if not vid:
+            return {}
+        data = as_dict(self.cms('video_detail', {'id': vid}).get('data'))
+        if not data:
+            return {}
+        players = data.get('vod_url_with_player')
+        vod = dict((k, v) for k, v in data.items() if k != 'vod_url_with_player')
+        names = text(vod.get('vod_play_from')).split('$$$')
+        if isinstance(players, list):
+            sources = players
+        else:
+            sources = [
+                {'name': names[i] if i < len(names) else '', 'url': u}
+                for i, u in enumerate(text(vod.get('vod_play_url')).split('$$$'))
+            ]
+        froms, urls = [], []
+        for index, source in enumerate(sources):
+            if not isinstance(source, dict):
+                continue
+            url = self.playlist(source.get('url'))
+            if not url:
+                continue
+            name = text(source.get('name')) or text(source.get('code')) or '线路%d' % (index + 1)
+            froms.append(clean_name(name))
+            urls.append(url)
+        vod['vod_play_from'] = '$$$'.join(froms)
+        vod['vod_play_url'] = '$$$'.join(urls)
+        return vod
+
+    # ---------- 播放 ----------
+    def play(self, play_id):
+        original = self.decrypt_lvdou(play_id)
+        if not original:
+            return {'parse': 0, 'url': '', 'header': dict(self.PARSE_HEADERS)}
+        if self._LDMAX_RE.match(original):
+            decrypted = self.decrypt_ldmax(original)
+            if decrypted:
+                original = decrypted
+
+        cache_key = 'yt:play:%s' % original
+        cached = cache_get(cache_key)
+        if cached:
+            return {'parse': 0, 'url': cached, 'header': dict(self.PARSE_HEADERS)}
+
+        if self.is_4k_source(original):
+            resolved = self.parse_url(original, self.PARSE_ID_4K) or original
+        elif is_stream_url(original):
+            resolved = original
+        else:
+            resolved = self.parse_url(original, self.PARSE_ID_WEB)
+            if not resolved and is_media_url(original):
+                resolved = original
+
+        if resolved:
+            cache_put(cache_key, resolved, self.PLAY_TTL)
+        return {'parse': 0, 'url': resolved or '', 'header': dict(self.PARSE_HEADERS)}
+
+# ============================================================================
+# 源 2 / 3：咕噜咕噜 + 橘汁4K（同一 T3 后端的两套客户端 profile）
+#   传输：ECDH(secp256r1) 握手 → HKDF("v2-session") → AES-256-GCM + raw-deflate
+#   协议：protobuf 裸编码；m=61 搜索 / m=62 详情 / m=69 服务器代理解析
+# ============================================================================
+
+T3_HOST_HEADER = '103.45.132.22:19987'
+T3_BASE = 'http://103.45.132.22:19987/app/bn/v2'
+
+# 线路显示名兜底（后端 f75 只给 code 时用）
+T3_LINE_NAMES = {
+    'dyttm3u8': '电影天堂', 'bfzym3u8': '暴风资源', 'lzm3u8': '量子资源',
+    'ffm3u8': '非凡资源', 'qq': '腾讯视频', 'qiyi': '爱奇艺', 'youku': '优酷',
+    'mgtv': '芒果TV', 'newxfyun': '咕噜4K', 'xfyun': '咕噜4K二线',
+    'CO4K': '咖啡4K超清', 'jplink': '金牌极速', 'rose': '玫瑰4K',
+    'NBY': '蚂蚁资源', 'qsvip': '旋风VIP', 'qingshan': '青山资源',
+    'JD4K': '鲸宝4K', 'iyf4k': '爱壹帆4K',
+}
+
+T3_PROFILES = {
+    'gg': {
+        'label': '咕噜',
+        'ua': 'Dart/3.10 (dart:io)',
+        'app_name': '咕噜咕噜', 'version': '2.2.5', 'package': 'com.himrsc.viz',
+        'signature': '32E0AB4FF93A29CE0E6F0BFB01F2F1B788E76262731F3F30F509CB822428ED58',
+        'build': '20109',
+        'device_build': 'pangu-build-component-system-513739-s9vkd-rlxnj-p3rhm',
+        'sort': 'vod_hits_month',
+        'boot': 'gg',
+        'detail': 'gg',
+    },
+    'jz': {
+        'label': '橘汁',
+        'ua': 'Dalvik/2.1.0 (Linux; U; Android 11; Pixel 4)',
+        'app_name': '咕噜咕噜', 'version': '2.1.2', 'package': 'com.jymqfh.xee',
+        'signature': '', 'build': '212',
+        'device_build': 'unknown',
+        'sort': 'vod_hits_week',
+        'boot': 'jz',
+        'detail': 'jz',
+    },
+}
+
+
+class T3Client(object):
+    """T3 私有协议客户端（每个 profile 独立会话）。"""
+
+    def __init__(self, profile, timeout=12.0):
+        self.p = profile
+        self.timeout = timeout
+        self.session_id = ''
+        self.key = b''
+        self.device_id = secrets.token_hex(8)
+        self.request_id = 0
+        self.players = {}
+        self.parsers = {}
+        self.booted = False
+        self.lock = threading.RLock()
+
+    # ---------- 传输 ----------
+    def _post(self, body, extra=None):
+        headers = {
+            'User-Agent': self.p['ua'],
+            'Content-Type': 'application/x-protobuf',
+            'Accept-Encoding': 'gzip',
+            'Host': T3_HOST_HEADER,
+        }
+        if extra:
+            headers.update(extra)
+        st, data = http(T3_BASE, 'POST', headers, body,
+                        timeout=self.timeout, retries=1)
+        if not data:
+            raise RuntimeError('empty response (status %s)' % st)
+        try:
+            return gzip.decompress(data) if data[:2] == b'\x1f\x8b' else data
+        except Exception:
+            return data
+
+    # ---------- 握手 ----------
+    def handshake(self):
+        priv, pub = ecdh_keypair()
+        caps = pb_var(1, 1) + pb_var(2, 0) + pb_var(3, 1)
+        request = pb_bytes(1, pub) + pb_bytes(2, b'1.0.0') + pb_bytes(3, caps)
+        hk = secrets.token_hex(16)
+        iv = secrets.token_bytes(16)
+        body = base64.b64encode(iv + cbc_encrypt(hk.encode('ascii'), iv,
+                                                zlib.compress(request, 4)))
+        content = self._post(body, {'x-handshake-key': hk})
+        raw = base64.b64decode(content)
+        plain = zlib.decompress(cbc_decrypt(hk.encode('ascii'), raw[:16], raw[16:],
+                                            unpad=True))
+        sid = pb_field(plain, 1, 2)
+        server_pub = pb_field(plain, 2, 2)
+        if not sid or not server_pub:
+            raise RuntimeError('bad handshake response')
+        self.session_id = sid.decode('ascii', 'replace')
+        shared = ecdh_shared_x(priv, server_pub)
+        prk = hmac.new(self.session_id.encode('ascii'), shared, hashlib.sha256).digest()
+        self.key = hmac.new(prk, b'v2-session\x01', hashlib.sha256).digest()
+        self.request_id = 0
+
+    # ---------- 请求 ----------
+    def request(self, method, payload=b'', scope=3):
+        with self.lock:
+            if not self.session_id:
+                self.handshake()
+            self.request_id += 1
+            rid = self.request_id
+            core = (pb_var(1, rid) + pb_var(2, scope) + pb_var(3, method)
+                    + pb_bytes(4, self.device_id.encode('ascii'))
+                    + pb_bytes(5, b'') + pb_bytes(6, payload)
+                    + pb_var(7, int(time.time() * 1000)))
+            nonce = secrets.token_bytes(12)
+            ciphertext, tag = gcm_encrypt(self.key, nonce, raw_deflate(core))
+            body = pb_var(1, rid) + pb_bytes(2, nonce + ciphertext + tag)
+            content = self._post(body, {'x-session-id': self.session_id,
+                                        'x-player-page-protection': '1'})
+            enc = pb_field(content, 2, 2)
+            if enc is None or len(enc) < 28:
+                err = pb_str(content, 3)
+                raise RuntimeError(err or 'request rejected')
+            plain = raw_inflate(gcm_decrypt(self.key, enc[:12], enc[12:-16], enc[-16:]))
+            status = pb_str(plain, 3)
+            if status and status not in ('ok', 'success'):
+                raise RuntimeError(status)
+            return plain
+
+    # ---------- Boot ----------
+    def boot(self):
+        p = self.p
+        now_us = int(time.time() * 1_000_000)
+        aid = self.device_id
+        if p['boot'] == 'gg':
+            app = (pb_bytes(1, p['app_name']) + pb_bytes(2, p['version'])
+                   + pb_bytes(3, p['package']) + pb_bytes(4, p['signature'])
+                   + pb_bytes(5, p['build']) + pb_var(6, now_us) + pb_var(7, now_us))
+            device = (pb_bytes(1, aid) + pb_var(2, 1) + pb_bytes(3, '15')
+                      + pb_bytes(4, 'Redmi K50 Ultra')
+                      + pb_bytes(5, 'Redmi/diting/diting:15/AQ3A.240912.001/'
+                                    'OS2.0.215.0.VOACNXM:user/release-keys')
+                      + pb_bytes(6, 'Redmi') + pb_bytes(7, 'qcom')
+                      + pb_var(8, 0) + pb_bytes(9, 'unknown')
+                      + pb_bytes(10, p['device_build'])
+                      + pb_var(11, 0) + pb_var(12, 35))
+            payload = (pb_bytes(1, 'v2') + pb_bytes(2, 'android') + pb_bytes(3, 'gulu')
+                       + pb_bytes(4, app) + pb_bytes(5, device))
+            response = self.request(0, payload, scope=1)
+        else:
+            info = (pb_bytes(1, p['app_name']) + pb_bytes(2, p['version'])
+                    + pb_bytes(3, p['package']) + pb_bytes(4, aid)
+                    + pb_bytes(5, p['build']))
+            state = (pb_bytes(1, aid) + pb_var(2, 0) + pb_bytes(3, '11')
+                     + pb_bytes(4, 'Pixel 4')
+                     + pb_bytes(5, 'google/redfin/redfin:11/RQ3A.211001.001')
+                     + pb_bytes(6, 'google') + pb_bytes(7, 'redfin')
+                     + pb_var(8, 0) + pb_bytes(9, 'unknown')
+                     + pb_bytes(10, p['device_build'])
+                     + pb_var(11, 0) + pb_var(12, 30))
+            payload = (pb_bytes(1, 'v1') + pb_bytes(2, 'Android 11') + pb_bytes(3, 'gulu')
+                       + pb_bytes(4, info) + pb_bytes(5, state))
+            response = self.request(0, payload, scope=1)
+
+        config = pb_field(response, 4, 2)
+        players, parsers = {}, {}
+        if config:
+            for item in pb_fields(config, 4, 2):
+                code = pb_str(item, 3)
+                if not code:
+                    continue
+                parser_ids = []
+                for packed in pb_fields(item, 8, 2):
+                    try:
+                        pos = 0
+                        while pos < len(packed):
+                            val, pos = pb_read_varint(packed, pos)
+                            parser_ids.append(val)
+                    except Exception:
+                        pass
+                players[code] = {
+                    'id': pb_field(item, 1, 0) or 0,
+                    'name': pb_str(item, 4),
+                    'parser_ids': parser_ids,
+                }
+            for item in pb_fields(config, 7, 2):
+                pid = pb_field(item, 1, 0) or 0
+                if pid:
+                    parsers[pid] = {
+                        'name': pb_str(item, 2),
+                        'url': pb_str(item, 3),
+                        'mode': pb_str(item, 4),
+                        'result_key': pb_str(item, 10) or 'url',
+                        'server': bool(pb_field(item, 20, 0) or 0),
+                    }
+        self.players = players
+        self.parsers = parsers
+        self.booted = bool(response)
+
+    def ensure(self):
+        if self.booted and self.key:
+            return
+        if not self.session_id:
+            self.handshake()
+        if not self.booted:
+            self.boot()
+
+    def reset(self):
+        self.session_id = ''
+        self.key = b''
+        self.request_id = 0
+        self.booted = False
+
+    # ---------- 业务 ----------
+    def search(self, keyword, page=1, limit=21):
+        p = self.p
+        if p['boot'] == 'gg':
+            filters = pb_bytes(18, p['sort'].encode('utf-8')) + pb_var(19, 1)
+            payload = (pb_bytes(1, keyword) + pb_var(2, page) + pb_var(3, limit)
+                       + pb_bytes(5, filters))
+        else:
+            filters = pb_var(1, 1) + pb_var(2, 0) + pb_bytes(3, p['sort'].encode('utf-8'))
+            payload = (pb_bytes(1, keyword) + pb_var(2, page) + pb_var(3, limit)
+                       + pb_bytes(5, filters))
+        response = self.request(61, payload)
+        data = pb_field(response, 4, 2)
+        videos = []
+        if data:
+            for item in pb_fields(data, 1, 2):
+                videos.append({
+                    'vod_id': str(pb_field(item, 1, 0) or ''),
+                    'vod_name': pb_str(item, 3),
+                    'vod_pic': pb_str(item, 6),
+                    'vod_remarks': pb_str(item, 11) or pb_str(item, 9),
+                })
+        info = pb_field(data, 2, 2) if data else None
+        page_no = (pb_field(info, 1, 0) or page) if info else page
+        pagecount = (pb_field(info, 3, 0) or 1) if info else 1
+        total = (pb_field(info, 4, 0) or len(videos)) if info else len(videos)
+        return {'list': [v for v in videos if v['vod_id'] and v['vod_name']],
+                'page': page_no, 'pagecount': pagecount, 'total': total}
+
+    def detail(self, vod_id):
+        p = self.p
+        try:
+            vid = int(str(vod_id).strip())
+        except (TypeError, ValueError):
+            return {}
+        if p['detail'] == 'gg':
+            payload = (pb_var(1, vid) + pb_bytes(3, p['version'].encode('utf-8'))
+                       + pb_bytes(4, b'1') + pb_var(5, 1))
+        else:
+            payload = (pb_var(1, vid) + pb_bytes(4, b'APP_PLATFORM_ANDROID_TV')
+                       + pb_var(5, 0))
+        response = self.request(62, payload)
+        data = pb_field(response, 4, 2)
+        if not data:
+            return {}
+        name = pb_str(data, 5)
+        if not name or name.startswith('最新版本下载地址'):
+            return {}
+        blob = ' '.join([pb_str(data, f) for f in (5, 13, 21)]
+                        + [pb_str(src, 1) for src in pb_fields(data, 75, 2)]).lower()
+        if 'glgl.tv' in blob or 'shu.jpg' in blob or '__v99_' in blob:
+            return {}
+        lines = []
+        for src in pb_fields(data, 75, 2):
+            code = pb_str(src, 1)
+            if not code or code.startswith('__v99_'):
+                continue
+            cfg = self.players.get(code) or {}
+            eps = []
+            for ep in pb_fields(src, 2, 2):
+                ep_id = pb_str(ep, 3)
+                if not ep_id:
+                    continue
+                idx = pb_field(ep, 1, 0) or (len(eps) + 1)
+                eps.append('%s$%s' % (clean_name(pb_str(ep, 4) or '第%s集' % idx), ep_id))
+            if not eps:
+                continue
+            parser_ids = cfg.get('parser_ids') or [0]
+            lines.append({
+                'name': clean_name(cfg.get('name') or T3_LINE_NAMES.get(code) or code),
+                'parser_id': parser_ids[0] if parser_ids else 0,
+                'eps': eps,
+                'code': code,
+            })
+        return {
+            'vod_id': str(pb_field(data, 1, 0) or vod_id),
+            'vod_name': name,
+            'vod_pic': pb_str(data, 13),
+            'vod_remarks': pb_str(data, 22),
+            'vod_content': pb_str(data, 21),
+            'vod_area': pb_str(data, 28),
+            'vod_year': pb_str(data, 30),
+            'lines': lines,
+        }
+
+    def play(self, parser_id, play_id):
+        payload = pb_var(1, int(parser_id)) + pb_bytes(2, play_id)
+        response = self.request(69, payload)
+        data = pb_field(response, 4, 2)
+        return pb_str(data, 2) if data else ''
+
+
+class T3Source(object):
+    """线路源包装：搜索 / 详情 / 播放，带一次会话重建重试。"""
+
+    def __init__(self, tag, timeout=12.0):
+        self.tag = tag
+        self.p = T3_PROFILES[tag]
+        self.label = self.p['label']
+        self.client = T3Client(self.p, timeout)
+
+    def _call(self, fn, *args, **kwargs):
+        try:
+            self.client.ensure()
+            return fn(*args, **kwargs)
+        except Exception:
+            try:
+                self.client.reset()
+                self.client.ensure()
+                return fn(*args, **kwargs)
+            except Exception:
+                return None
+
+    def search(self, keyword, page=1):
+        cache_key = 't3:%s:q:%s|%s' % (self.tag, text(keyword), page)
+        hit = cache_get(cache_key)
+        if hit is not None:
+            return hit
+        got = self._call(self.client.search, keyword, page)
+        items = as_list((got or {}).get('list'))
+        if items:
+            cache_put(cache_key, items, 600)
+        return items
+
+    def detail(self, vod_id):
+        return self._call(self.client.detail, vod_id) or {}
+
+    def play(self, parser_id, play_id, parser_hint=''):
+        play_id = text(play_id)
+        if is_media_url(play_id) or play_id.startswith('m.php') or '?data=' in play_id:
+            return play_id
+        url = self._call(self.client.play, parser_id, play_id) or ''
+        if url:
+            return url
+        # 兜底：走 boot 下发的解析接口（部分线路 server=False，需外部转链）
+        parser = self.client.parsers.get(int(parser_id or 0)) or {}
+        api = text(parser.get('url'))
+        if api:
+            target = api.replace('{url}', urllib.parse.quote(play_id, safe='')) \
+                if '{url}' in api else api + urllib.parse.quote(play_id, safe='')
+            st, txt = http_text(target, headers={'User-Agent': self.p['ua']},
+                                timeout=15, retries=1)
+            if st and st < 400 and txt:
+                payload = loads(txt)
+                found = self._dig(payload, parser.get('result_key') or 'url')
+                if found:
+                    return found
+        return ''
+
+    @classmethod
+    def _dig(cls, value, preferred='url'):
+        if isinstance(value, str):
+            return value if is_media_url(value) or value.startswith('http') else ''
+        if isinstance(value, dict):
+            for key in (preferred, 'url', 'play_url', 'playUrl', 'm3u8', 'data'):
+                if key in value:
+                    got = cls._dig(value[key], preferred)
+                    if got:
+                        return got
+            for item in value.values():
+                got = cls._dig(item, preferred)
+                if got:
+                    return got
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                got = cls._dig(item, preferred)
+                if got:
+                    return got
+        return ''
+
+# ============================================================================
+# 源 4：找剧AI（zhaoju4.com）—— HMAC 签名的 REST，官方线路需登录态
+# ============================================================================
+
+class ZJSource(object):
+    NAME = '找剧'
+    HOST = 'https://zhaoju4.com'
+    SIGN_KEY = '8f18c8e472a9fefbab7108f5c447f69b48a4b5d34f662ed83163167fc10fb3b8'
+    UA = UA_WEB
+    CLIENT_NAME = 'movie-search-frontend'
+    CLIENT_VERSION = '1.0.0'
+    BUILD_VERSION = '20261021T204524Z-98df10a3f414-98df10a3f414-98df10a3f414'
+    PROTOCOL_VERSION = '2026-07-05.library-v2.playback-v1'
+    PAGE_SIZE = 18
+    MAX_LINES = 4
+    MAX_PREMIUM = 4
+    MAX_EPISODES = 120
+    TIMEOUT = 12.0
+    CACHE_TTL = 300
+    PROBE_BYTES = 32768
+    PROBE_TTL = 600
+
+    PREMIUM = ('bytedance', 'bytevod-lv2', 'bytevod-lv3', 'bytevod-lv5',
+               'bytevod-cloudflare', 'bytevod-cloudflare-4k',
+               'official-v', 'official-r', 'dong')
+    EXT_HOSTS = ('v.qq.com', 'qq.com', 'youku.com', 'iqiyi.com', 'bilibili.com',
+                 'mgtv.com', 'sohu.com', 'pptv.com', 'le.com', 'wasu.cn',
+                 'tudou.com', '1905.com')
+    VIDEO_EXTS = ('.m3u8', '.mp4', '.mkv', '.flv', '.avi', '.ts',
+                  '.mov', '.m4v', '.webm', '.wmv', '.rmvb', '.mpd')
+
+    PATH_BROWSE = '/v1/browse/catalog'
+    PATH_DETAIL = '/v1/catalog/%s/detail'
+    PATH_EPISODES = '/v1/catalog/%s/episodes'
+    PATH_RESOLVE = '/v1/playback/resolve/%s'
+    PATH_RESOLVE_LINE = '/v1/playback/resolve-line?view=compact'
+    PATH_SUGGEST = '/v1/suggest'
+
+    def __init__(self, cookie='', timeout=None):
+        self.cookie = cookie or self._load_cookie()
+        self.timeout = timeout or self.TIMEOUT
+        self._sess_ok = False
+        self._sess_checked = False
+        self._sess_at = 0
+        self._anon_at = 0
+        self._anon_id = 'anon_' + uuid.uuid4().hex
+        self._probe = {}
+        # 会话检测（/v1/users/me）实测要 0.5~3.5s，且站点会随机 503。
+        # 放到后台预热，详情里最多等 1.2s，不拖累其他三个源。
+        self._sess_thread = threading.Thread(target=self._ensure_session, daemon=True)
+        self._sess_thread.start()
+
+    def _await_session(self, timeout=1.2):
+        th = getattr(self, '_sess_thread', None)
+        if th is not None and th.is_alive():
+            th.join(max(0.05, timeout))
+        return self._sess_ok
+
+    # ---------- 会话 ----------
+    @staticmethod
+    def _cookie_file():
+        try:
+            return os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                '.zhaoju_guest_cookie')
+        except Exception:
+            return ''
+
+    def _load_cookie(self):
+        path = self._cookie_file()
+        try:
+            if path and os.path.isfile(path):
+                with open(path, 'r', encoding='utf-8') as fh:
+                    saved = fh.read().strip()
+                if 'ai_movie_session=' in saved:
+                    return saved
+        except Exception:
+            pass
+        return ''
+
+    def _save_cookie(self):
+        path = self._cookie_file()
+        if not path or 'ai_movie_session=' not in (self.cookie or ''):
+            return
+        try:
+            with open(path, 'w', encoding='utf-8') as fh:
+                fh.write(self.cookie)
+        except Exception:
+            pass
+
+    def _merge_cookie(self, set_cookies):
+        jar = {}
+        for part in str(self.cookie or '').split(';'):
+            if '=' in part:
+                k, v = part.split('=', 1)
+                jar[k.strip()] = v.strip()
+        for raw in set_cookies or []:
+            first = str(raw).split(';', 1)[0]
+            if '=' in first:
+                k, v = first.split('=', 1)
+                if v.strip():
+                    jar[k.strip()] = v.strip()
+        self.cookie = '; '.join('%s=%s' % (k, v) for k, v in jar.items() if v)
+
+    # ---------- 签名与请求 ----------
+    def _sign(self, method, path_query):
+        u = urllib.parse.urlsplit(path_query)
+        path = u.path or '/'
+        search = ('?' + u.query) if u.query else ''
+        ts = str(int(time.time() * 1000))
+        nonce = uuid.uuid4().hex
+        msg = '%s\n%s%s\n%s\n%s' % (method, path, search, ts, nonce)
+        sig = hmac.new(self.SIGN_KEY.encode('utf-8'), msg.encode('utf-8'),
+                       hashlib.sha256).hexdigest()
+        return ts, nonce, sig
+
+    def _headers(self, method, path_query, with_cookie=True):
+        h = {
+            'User-Agent': self.UA,
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'Referer': self.HOST + '/',
+            'x-platform': 'web',
+            'x-requested-with': 'XMLHttpRequest',
+            'x-ai-movie-client-name': self.CLIENT_NAME,
+            'x-ai-movie-client-version': self.CLIENT_VERSION,
+            'x-ai-movie-build-version': self.BUILD_VERSION,
+            'x-ai-movie-protocol-version': self.PROTOCOL_VERSION,
+        }
+        if with_cookie and self.cookie:
+            h['Cookie'] = self.cookie
+        if path_query.startswith('/v1/'):
+            ts, nonce, sig = self._sign(method, path_query)
+            h['x-ai-movie-timestamp'] = ts
+            h['x-ai-movie-nonce'] = nonce
+            h['x-ai-movie-signature'] = sig
+        return h
+
+    def _req(self, path, params=None, method='GET', body=None, with_cookie=True,
+             attempts=3):
+        """返回 (status, json)。503/空响应自动重试 —— 站点约 30% 概率返回 503。"""
+        url = path
+        if params:
+            clean = dict((k, v) for k, v in params.items() if v not in (None, ''))
+            if clean:
+                url += ('&' if '?' in url else '?') + urllib.parse.urlencode(clean)
+        full = self.HOST + url
+        data = None
+        if body is not None:
+            data = json.dumps(body, ensure_ascii=False).encode('utf-8')
+        headers = self._headers(method, url, with_cookie)
+        if data is not None:
+            headers['Content-Type'] = 'application/json; charset=utf-8'
+        parsed = {}
+        for attempt in range(max(1, int(attempts))):
+            if attempt:
+                time.sleep(0.1 * attempt)
+            st, txt = http_text(full, method, headers, data,
+                                timeout=self.timeout, retries=1)
+            if st and 200 <= st < 300 and txt:
+                parsed = loads(txt)
+                if parsed:
+                    return st, parsed
+                continue
+            if st in (401, 403):
+                return st, {}
+        return 0, parsed
+
+    # ---------- 会话可用性 ----------
+    def _ensure_session(self):
+        now = time.time()
+        if self._sess_checked and now - self._sess_at < 600:
+            return self._sess_ok
+        ok = True
+        st, _ = self._req('/v1/users/me', attempts=1)
+        if st in (401, 403):
+            ok = False
+        if not ok and now - self._anon_at > 300:
+            self._anon_at = now
+            st2, d2 = self._req('/v1/users/anonymous', method='POST',
+                                body={'anonymous_id': self._anon_id},
+                                with_cookie=False, attempts=1)
+            if st2 and 200 <= st2 < 300:
+                ok = True
+        self._sess_ok = ok
+        self._sess_checked = True
+        self._sess_at = now
+        return ok
+
+    # ---------- 工具 ----------
+    @staticmethod
+    def _pick(obj, *keys, **kw):
+        default = kw.get('default', '')
+        if not isinstance(obj, dict):
+            return default
+        for key in keys:
+            got = obj.get(key)
+            if got not in (None, '', [], {}):
+                return got
+        return default
+
+    @staticmethod
+    def _join(value):
+        if isinstance(value, (list, tuple)):
+            return ','.join([str(x).strip() for x in value if str(x).strip()])
+        return text(value)
+
+    def _card(self, item):
+        if not isinstance(item, dict):
+            return None
+        vid = text(self._pick(item, 'id', 'variant_id', 'selected_variant_id'))
+        if not vid:
+            return None
+        avail = as_dict(item.get('availability'))
+        remarks = text(self._pick(item, 'remarks', 'episode_progress_text')) \
+            or text(avail.get('label'))
+        return {
+            'vod_id': vid,
+            'vod_name': text(self._pick(item, 'title', 'name', 'normalized_title')),
+            'vod_pic': text(self._pick(item, 'poster_url', 'poster', 'pic', 'cover')),
+            'vod_remarks': remarks,
+            'vod_year': text(self._pick(item, 'year')),
+            'vod_area': text(self._pick(item, 'area')),
+            'vod_actor': self._join(self._pick(item, 'actors', 'actor', default=[])),
+            'vod_director': self._join(self._pick(item, 'directors', default=[])),
+            'vod_content': text(self._pick(item, 'description', 'intro')),
+            'vod_score': text(self._pick(item, 'rating', 'score')),
+        }
+
+    def _cards(self, items):
+        out = []
+        for it in as_list(items):
+            card = self._card(it)
+            if card:
+                out.append(card)
+        return out
+
+    @staticmethod
+    def _valid_url(url):
+        s = text(url)
+        if not s.startswith('http'):
+            return False
+        path = urllib.parse.urlsplit(s).path.lower()
+        if path.endswith(('.jpg', '.jpeg', '.png', '.webp', '.gif', '.svg')):
+            return False
+        if '~tplv-' in path and 'image' in path:
+            return False
+        return True
+
+    def _is_ext(self, url):
+        try:
+            host = urllib.parse.urlsplit(text(url)).netloc.lower()
+            return any(host == h or host.endswith('.' + h) for h in self.EXT_HOSTS)
+        except Exception:
+            return False
+
+    # ---------- 列表 ----------
+    def search(self, keyword, page=1):
+        wd = text(keyword)
+        if not wd:
+            return []
+        page = max(1, int(page or 1))
+        cache_key = 'zj:q:%s|%s' % (wd, page)
+        hit = cache_get(cache_key)
+        if hit is not None:
+            return hit
+        st, data = self._req(self.PATH_BROWSE, {
+            'q': wd, 'page': page, 'limit': self.PAGE_SIZE,
+            'offset': (page - 1) * self.PAGE_SIZE,
+        })
+        cards = as_list(as_dict(data).get('cards'))
+        out = []
+        for it in cards:
+            avail = as_dict(it.get('availability'))
+            if avail.get('playable') is False or avail.get('disabled') is True:
+                continue
+            out.append(it)
+        cards_out = self._cards(out)
+        if cards_out or page > 1:
+            if cards_out:
+                cache_put(cache_key, cards_out, 600)
+            return cards_out
+        # 直搜无结果 → 联想词兜底
+        st, sug = self._req('/v1/suggest', {'q': wd, 'limit': 10, 'mode': 'home'})
+        out = []
+        for s in as_list(as_dict(sug).get('suggestions')):
+            target = as_dict(s.get('target'))
+            vid = text(target.get('variant_id'))
+            if not vid:
+                continue
+            out.append({
+                'vod_id': vid,
+                'vod_name': text(s.get('label') or target.get('title')),
+                'vod_pic': '',
+                'vod_remarks': text(s.get('subtitle')),
+            })
+        return out
+
+    # ---------- 详情 ----------
+    def _episodes(self, vid):
+        out, seen, offset = [], set(), 0
+        while len(out) < self.MAX_EPISODES:
+            path = self.PATH_EPISODES % urllib.parse.quote(str(vid), safe='')
+            st, data = self._req(path, {'limit': 48, 'offset': offset})
+            eps = as_list(as_dict(data).get('episodes'))
+            if not eps:
+                break
+            added = 0
+            for e in eps:
+                if not isinstance(e, dict):
+                    continue
+                tok = text(e.get('token'))
+                if not tok or tok in seen:
+                    continue
+                seen.add(tok)
+                num = e.get('number')
+                out.append({'token': tok, 'title': text(e.get('title')),
+                            'number': num if isinstance(num, int) else None,
+                            'track': text(e.get('episode_track'))})
+                added += 1
+            pg = as_dict(data.get('episode_pagination'))
+            if not pg.get('has_more') or not added:
+                break
+            offset += len(eps)
+        # 主线按集数排，其余（花絮等）排后面
+        main = sorted([e for e in out if e.get('track') == 'main'],
+                      key=lambda e: e['number'] if isinstance(e.get('number'), int) else (1 << 30))
+        rest = [e for e in out if e.get('track') != 'main']
+        return main + rest
+
+    def _resolve(self, token):
+        tok = text(token)
+        if not tok:
+            return {}
+        key = 'zj:rv:%s' % tok
+        hit = cache_get(key)
+        if hit is not None:
+            return hit
+        path = self.PATH_RESOLVE % urllib.parse.quote(tok, safe='')
+        st, data = self._req(path, {'view': 'compact'})
+        if isinstance(data, dict) and data.get('line_options'):
+            cache_put(key, data, self.CACHE_TTL)
+        return data if isinstance(data, dict) else {}
+
+    def _resolve_line(self, ticket):
+        t = text(ticket)
+        if t.startswith('resolve://'):
+            t = t[len('resolve://'):]
+        if not t:
+            return {}
+        key = 'zj:tk:%s' % t
+        hit = cache_get(key)
+        if hit is not None:
+            return hit
+        st, data = self._req(self.PATH_RESOLVE_LINE, method='POST', body={'ticket': t})
+        line = as_dict(as_dict(data).get('line'))
+        if not line and st in (401, 403):
+            line = {'_error': 'need_login'}
+        if line:
+            cache_put(key, line, self.CACHE_TTL)
+        return line
+
+    # ---------- 线路 ----------
+    @staticmethod
+    def _opt_direct(o):
+        return (ZJSource._valid_url(o.get('url'))
+                and not bool(o.get('resolve_required'))
+                and text(o.get('url_kind')) != 'resolve_ticket')
+
+    @staticmethod
+    def _opt_ticket(o):
+        return bool(o.get('resolve_required')) or text(o.get('url')).startswith('resolve://')
+
+    @staticmethod
+    def _weight(o):
+        try:
+            return float(o.get('preference_weight') or 0)
+        except Exception:
+            return 0.0
+
+    @staticmethod
+    def _line_key(o):
+        return (text(o.get('provider_id')), text(o.get('play_from')))
+
+    @staticmethod
+    def _line_label(o):
+        s = text(o.get('label') or o.get('provider_id') or o.get('play_from') or '线路')
+        for ch in ('$', '#', '|'):
+            s = s.replace(ch, ' ')
+        return re.sub(r'\s+', ' ', s).strip() or '线路'
+
+    def _premium(self, o):
+        label = text(o.get('label')).upper()
+        pid = text(o.get('provider_id'))
+        return (bool(o.get('resolve_required')) or text(o.get('url')).startswith('resolve://')
+                ) and (pid in self.PREMIUM or '4K' in label or '1080P' in label
+                       or '官方' in text(o.get('label')))
+
+    def _speed(self, url):
+        """实测直链首段速度（KB/s），0 = 不可用。"""
+        key = text(url)
+        if not key:
+            return 0
+        now = time.time()
+        hit = self._probe.get(key)
+        if hit and now - hit[0] < hit[2]:
+            return hit[1]
+        cur, kbps = key, 0
+        for _ in range(3):
+            body, dt = self._fetch(cur)
+            if not body:
+                break
+            if b'#EXTM3U' in body[:256]:
+                nxt = ''
+                for line in body.decode('utf-8', 'ignore').splitlines():
+                    s = line.strip()
+                    if s and not s.startswith('#'):
+                        nxt = urllib.parse.urljoin(cur.rsplit('/', 1)[0] + '/', s)
+                        break
+                if not nxt:
+                    break
+                cur = nxt
+                continue
+            if dt > 0 and len(body) > 4096:
+                kbps = int(len(body) / dt / 1024)
+            break
+        self._probe[key] = (now, kbps, self.PROBE_TTL if kbps > 0 else 120)
+        if len(self._probe) > 400:
+            for k in list(self._probe.keys())[:80]:
+                self._probe.pop(k, None)
+        return kbps
+
+    def _fetch(self, url):
+        try:
+            headers = {'User-Agent': self.UA, 'Referer': self.HOST + '/',
+                       'Accept': '*/*', 'Range': 'bytes=0-%d' % (self.PROBE_BYTES - 1)}
+            data = http(url, headers=headers, timeout=1.6, retries=1)[1]
+            if not data:
+                return b'', 0.0
+            return data, max(0.05, len(data) / float(max(1, 1024)) / 300.0)
+        except Exception:
+            return b'', 0.0
+
+    def _probe_all(self, urls, budget=0.55):
+        res = {}
+        lock = threading.Lock()
+
+        def work(u):
+            val = self._speed(u)
+            with lock:
+                res[u] = val
+
+        threads = []
+        for u in urls:
+            t = threading.Thread(target=work, args=(u,))
+            t.daemon = True
+            t.start()
+            threads.append(t)
+        deadline = time.time() + budget
+        for t in threads:
+            t.join(max(0.01, deadline - time.time()))
+        return res
+
+    def _lines(self, options):
+        opts = [o for o in as_list(options) if isinstance(o, dict)]
+        lines, seen, used = [], set(), {}
+
+        def add(label, prov, frm, mode):
+            label = clean_name(label) or '线路'
+            key = (label, prov, frm)
+            if key in seen:
+                return
+            seen.add(key)
+            if label in used:
+                used[label] += 1
+                label = '%s%d' % (label, used[label])
+            else:
+                used[label] = 1
+            lines.append({'label': label, 'provider_id': prov,
+                          'play_from': frm, 'mode': mode})
+
+        # 1) 官方 4K / 1080P（需会话）—— 会话由后台线程预热，最多等 1.2s
+        prem = [o for o in opts if self._premium(o)]
+        if prem and self._await_session(0.6):
+            prem.sort(key=lambda o: (-self._weight(o),
+                                     -('4K' in text(o.get('label')).upper())))
+            for o in prem[:self.MAX_PREMIUM]:
+                add(self._line_label(o), self._line_key(o)[0], self._line_key(o)[1], 'parse')
+
+        # 2) 第三方直链：先去重（同一 URL 只留权重最高的一条），再按实测速度排序
+        directs = [o for o in opts if self._opt_direct(o)]
+        if directs:
+            groups = {}
+            for o in directs:
+                url = text(o.get('url'))
+                if not url:
+                    continue
+                cur = groups.get(url)
+                if cur is None or self._weight(o) > self._weight(cur):
+                    groups[url] = o
+            cand = sorted(groups.values(), key=self._weight, reverse=True)[:6]
+            speeds = self._probe_all([text(o.get('url')) for o in cand]) if cand else {}
+            alive = sorted(((speeds.get(text(o.get('url')), 0), o) for o in cand),
+                           key=lambda x: -x[0])
+            # 先放实测有速度的，再放没测出来的（超预算/慢），一条都不丢
+            picked = ([o for k, o in alive if k > 0]
+                      + [o for k, o in alive if k <= 0])[:self.MAX_LINES]
+            for o in picked:
+                add(self._line_label(o), self._line_key(o)[0], self._line_key(o)[1], 'direct')
+        else:
+            tickets = [o for o in opts if self._opt_ticket(o)]
+            tickets.sort(key=self._weight, reverse=True)
+            for o in tickets[:self.MAX_LINES]:
+                add(self._line_label(o), self._line_key(o)[0], self._line_key(o)[1], 'parse')
+
+        # 3) 通用解析兜底（最后一条）
+        add('解析线路', '', '', 'generic')
+        return lines
+
+    # ---------- 详情入口 ----------
+    def detail(self, vid):
+        vid = text(vid)
+        if not vid:
+            return {}
+        st, data = self._req(self.PATH_DETAIL % urllib.parse.quote(vid, safe=''))
+        if not isinstance(data, dict):
+            data = {}
+        ep_vid = text(self._pick(data, 'selected_variant_id', 'variant_id', 'id')) or vid
+        eps = self._episodes(ep_vid)
+        vod = {
+            'vod_id': vid,
+            'vod_name': text(self._pick(data, 'title', 'normalized_title')) or vid,
+            'vod_pic': text(self._pick(data, 'poster_url', 'poster')),
+            'vod_year': text(self._pick(data, 'year')),
+            'vod_area': text(self._pick(data, 'area')),
+            'vod_remarks': text(self._pick(data, 'episode_progress_text', 'remarks')),
+            'vod_actor': self._join(self._pick(data, 'actors', default=[])),
+            'vod_director': self._join(self._pick(data, 'directors', default=[])),
+            'vod_content': text(self._pick(data, 'description', 'intro')),
+            'vod_score': text(self._pick(data, 'rating', 'score')),
+        }
+        if not eps:
+            return {'vod': vod, 'lines': []}
+
+        options = []
+        for ep in eps[:2]:
+            r = self._resolve(ep['token'])
+            cand = as_list(r.get('line_options'))
+            if cand:
+                options = cand
+                break
+        if not options:
+            return {'vod': vod, 'lines': []}
+        lines = self._lines(options)
+
+        gen_key = next(((ln['provider_id'], ln['play_from'])
+                        for ln in lines if ln['mode'] == 'direct'), None)
+        out = []
+        for ln in lines:
+            eps_out = []
+            for idx, ep in enumerate(eps):
+                tok = ep['token']
+                if ln['mode'] == 'generic':
+                    ref = ('zjoff|%s|%s|%s' % (tok, b64url_encode(gen_key[0]),
+                                               b64url_encode(gen_key[1]))) \
+                        if gen_key else ('zjoff|%s' % tok)
+                else:
+                    ref = 'zjres|%s|%s|%s|%s' % (
+                        tok, b64url_encode(ln['provider_id']),
+                        b64url_encode(ln['play_from']), b64url_encode(ln['label']))
+                name = clean_name(ep['title']) or '第%d集' % (idx + 1)
+                eps_out.append('%s$%s' % (name, ref))
+            if eps_out:
+                out.append((ln['label'], eps_out))
+        return {'vod': vod, 'lines': out}
+
+    # ---------- 播放 ----------
+    def _play_line(self, token, prov, frm, label, generic=False):
+        """严格按月台标签/供应商取流：专属线路绝不回落到别的供应商，
+        否则会把「别的片子的直链」当成这条线路的结果（原脚本的兜底就有这个坑）。"""
+        prov, frm, label = text(prov), text(frm), text(label)
+        cache_key = 'zj:ln:%s|%s|%s|%s' % (token, prov, frm, label)
+        hit = cache_get(cache_key)
+        if hit is not None:
+            return hit
+
+        r = self._resolve(token)
+        opts = [o for o in as_list(r.get('line_options')) if isinstance(o, dict)]
+        if not opts:
+            return ''
+        directs = [o for o in opts if self._opt_direct(o)]
+        tickets = [o for o in opts if self._opt_ticket(o)]
+        exact = (prov, frm)
+
+        def pick_direct(items):
+            for o in items:
+                url = text(o.get('url'))
+                if self._valid_url(url):
+                    return url
+            return ''
+
+        def pick_ticket(items):
+            for o in items:
+                url = text(self._resolve_line(o.get('url')).get('url'))
+                if self._valid_url(url):
+                    return url
+            return ''
+
+        url = ''
+        if label:
+            url = pick_direct([o for o in directs if self._line_label(o) == label])
+        if not url and (exact[0] or exact[1]):
+            url = pick_direct([o for o in directs if self._line_key(o) == exact])
+        if not url and label:
+            url = pick_ticket([o for o in tickets if self._line_label(o) == label])
+        if not url and (exact[0] or exact[1]):
+            url = pick_ticket([o for o in tickets if self._line_key(o) == exact])
+        if not url and (generic or not exact[0]):
+            url = pick_ticket(tickets[:5]) or pick_direct(directs[:2])
+        if url:
+            cache_put(cache_key, url, self.CACHE_TTL)
+        return url
+
+    def play(self, ref):
+        raw = text(ref)
+        if '%7C' in raw.upper() or '%3A' in raw.upper():
+            raw = urllib.parse.unquote(raw)
+        parts = raw.split('|')
+        kind = parts[0] if parts else ''
+        token = parts[1] if len(parts) > 1 else ''
+        prov = b64url_decode(parts[2]).decode('utf-8', 'ignore') if len(parts) > 2 else ''
+        frm = b64url_decode(parts[3]).decode('utf-8', 'ignore') if len(parts) > 3 else ''
+        label = b64url_decode(parts[4]).decode('utf-8', 'ignore') if len(parts) > 4 else ''
+        if not token:
+            return {'url': '', 'parse': 0}
+        url = self._play_line(token, prov, frm, label, generic=(kind == 'zjoff'))
+        if not url:
+            # 站点 503 抖动时第一次可能空手，重试一次（播放是用户触发，多等一下无妨）
+            time.sleep(0.15)
+            url = self._play_line(token, prov, frm, label, generic=(kind == 'zjoff'))
+        if not url:
+            return {'url': '', 'parse': 0}
+        ext = self._is_ext(url)
+        return {'url': url, 'parse': 1 if ext else 0,
+                'header': {'User-Agent': self.UA, 'Referer': self.HOST + '/'}}
+
+# ============================================================================
+# 门面：聚合 Spider
+#   首页 / 分类 / 筛选 / 搜索：影探4K
+#   详情线路：影探 → 咕噜 → 橘汁 → 找剧（TVBox 默认播第一条，即影探）
+# ============================================================================
+
+class YtAggSpider(_BaseSpider):
+    NAME = '影探聚合'
+    LABELS = {'yt': '影探', 'gg': '咕噜', 'jz': '橘汁', 'zj': '找剧'}
+    ORDER = ['yt', 'gg', 'jz', 'zj']
+    DETAIL_BUDGET = 6.0       # 首屏预算（秒）——超时的源转后台补全
+    SEARCH_BUDGET = 1.4       # 必须小于外层 2.8s，否则影探搜索结果会被整体丢弃
+    CACHE_TTL = 300
+    MAX_LINES_PER_SRC = 8
+
+    def __init__(self):
+        self._sources = {}
+        self._lock = threading.RLock()
+        self.order = list(self.ORDER)
+        self.max_lines = self.MAX_LINES_PER_SRC
+        self.detail_budget = self.DETAIL_BUDGET
+        self.zj_cookie = ''
+        self._last_err = ''
+        self._warmed = False
+        self._filling = set()
+        self._update_url = ''
+        self._update = {}
+        self._updating = False
+
+    # ---------- 生命周期 ----------
+    def getName(self):
+        return self.NAME
+
+    def version(self):
+        return code_version()
 
     def init(self, extend=''):
-        raise NotImplementedError
+        cfg = {}
+        try:
+            if isinstance(extend, dict):
+                cfg = extend
+            elif isinstance(extend, str) and extend.strip().startswith('{'):
+                cfg = loads(extend)
+        except Exception:
+            cfg = {}
+        lines = [t for t in as_list(cfg.get('lines')) if t in self.LABELS]
+        if lines:
+            self.order = list(dict.fromkeys(lines + [t for t in self.ORDER if t not in lines]))
+        try:
+            self.detail_budget = float(cfg.get('detail_budget') or self.DETAIL_BUDGET)
+        except (TypeError, ValueError):
+            self.detail_budget = self.DETAIL_BUDGET
+        try:
+            self.max_lines = int(cfg.get('max_lines') or self.MAX_LINES_PER_SRC)
+        except (TypeError, ValueError):
+            self.max_lines = self.MAX_LINES_PER_SRC
+        self.zj_cookie = text(cfg.get('zj_cookie') or cfg.get('cookie'))
+        with self._lock:
+            if self.zj_cookie and 'zj' in self._sources:
+                self._sources.pop('zj', None)
+        self._warmed = False
+        self._update_url = text(cfg.get('update_url') or UPDATE_URL)
+        if text(cfg.get('update', '1')).lower() not in ('0', 'false', 'no', 'off'):
+            pass  # Kishuto: 自更新由外层统一负责
+        return None
 
-    def homeContent(self, filter=False):
-        raise NotImplementedError
+    def _auto_update(self):
+        # 合并版统一由 Kishuto 门面负责自更新，子源不再各自拉清单
+        return
+        self._updating = True
+
+        def run():
+            try:
+                got = check_update(self._update_url)
+                self._update = got
+                globals()['_UPDATE_LAST'] = got
+            except Exception:
+                pass
+
+        try:
+            threading.Thread(target=run, daemon=True).start()
+        except Exception:
+            pass
+
+    def _prewarm(self):
+        """首页阶段偷偷把咕噜/橘汁的握手+boot 做完（各约 0.9s），
+        详情页就不用再付这笔开销。失败无所谓，详情里会自己重试。"""
+        if self._warmed:
+            return
+        self._warmed = True
+
+        def run():
+            for tag in ('gg', 'jz'):
+                try:
+                    if tag in self.order:
+                        self._src(tag).client.ensure()
+                except Exception:
+                    pass
+            # 找剧AI 官方 4K/1080P 要游客会话；首页后台先建好，
+            # 详情页 _await_session(0.6) 才来得及把 4K 线路挂出来。
+            try:
+                if 'zj' in self.order:
+                    self._src('zj')._ensure_session()
+            except Exception:
+                pass
+
+        try:
+            th = threading.Thread(target=run, daemon=True)
+            th.start()
+        except Exception:
+            pass
+
+    def _src(self, tag):
+        with self._lock:
+            got = self._sources.get(tag)
+            if got is not None:
+                return got
+            if tag == 'yt':
+                got = YT4K()
+            elif tag in ('gg', 'jz'):
+                got = T3Source(tag)
+            elif tag == 'zj':
+                got = ZJSource(self.zj_cookie)
+            else:
+                got = None
+            if got is not None:
+                self._sources[tag] = got
+            return got
+
+    def destroy(self):
+        self._sources = {}
+        return None
+
+    def isVideoFormat(self, url):
+        return is_media_url(url)
+
+    def manualVideoCheck(self):
+        return False
+
+    def localProxy(self, param):
+        return None
+
+    # ---------- 首页 / 分类 / 搜索 ----------
+    def homeContent(self, filter=True):
+        # 有些壳不调 init()，这里兜一次，保证新版本总会被拉下来
+        if self._update_url and not self._update and not self._updating:
+            pass  # Kishuto: 自更新由外层统一负责
+        self._prewarm()
+        yt = self._src('yt')
+        try:
+            data = yt.home()
+        except Exception as exc:
+            self._last_err = 'home:%s' % exc
+            data = {'class': [], 'filters': {}}
+        if not as_list(data.get('list')):
+            try:
+                data['list'] = as_list(yt.home_vod().get('list'))[:30]
+            except Exception:
+                data['list'] = []
+        return data
 
     def homeVideoContent(self):
-        raise NotImplementedError
+        try:
+            return self._src('yt').home_vod()
+        except Exception as exc:
+            self._last_err = 'home_vod:%s' % exc
+            return {'list': []}
+
+    def categoryContent(self, tid, pg='1', filter=True, extend=None):
+        yt = self._src('yt')
+        try:
+            data = yt.category(tid, pg, extend)
+        except Exception as exc:
+            self._last_err = 'category:%s' % exc
+            return {'list': [], 'page': 1, 'pagecount': 0, 'limit': 18, 'total': 0}
+        if not as_list(data.get('list')) and page_of(pg) == 1:
+            cache_put('yt:cms-fail:%s' % text(tid), '', 1)
+            try:
+                data = yt.category(tid, pg, extend)
+            except Exception:
+                pass
+        return data
+
+    # 片名噪音：版本/语种/年份/解说类后缀，合并卡片时先去掉
+    NAME_NOISE = ('手语版', '字幕助听版', '字幕版', '助听版', '无字幕',
+                  '国语版', '粤语版', '日语版', '英语版', '普通话版', '双语版',
+                  '真人版', '动画版', '重制版', '剧版', '电影版', '电视版',
+                  '完整版', '未删减', '无删减', '高清版', '蓝光版', '合集', '正片',
+                  '解说', '精彩分享', '剧情揭秘', '揭秘', '预告', '花絮', '片段')
+
+    @classmethod
+    def _base_name(cls, name, kw=''):
+        """把「凡人修仙传手语版」这类变体归一成主片名。"""
+        t = norm_title(name)
+        if not t:
+            return ''
+        t = re.sub(r'[（(][^）)]*[）)]', '', t)      # 括号注释
+        for _ in range(3):                          # 反复剥，可能叠着好几个
+            for w in cls.NAME_NOISE:
+                if t.endswith(w) and len(t) > len(w):
+                    t = t[:-len(w)]
+                elif t.startswith(w) and len(t) > len(w):
+                    t = t[len(w):]
+        t = re.sub(r'(19|20)\d{2}$', '', t)          # 结尾年份
+        t = t.rstrip('之');
+        return t.strip() or norm_title(name)
+
+    def searchContent(self, key, quick=False, pg='1'):
+        kw = text(key)
+        if not kw:
+            return {'list': []}
+        page = page_of(pg)
+        out = []
+        try:
+            out = as_list(self._src('yt').search(kw, page).get('list'))
+        except Exception as exc:
+            self._last_err = 'search:%s' % exc
+        if len(out) >= 5 or page > 1:
+            return {'list': out}
+
+        # 影探命中太少 → 并发问其他三源（id 加源前缀，详情页按前缀回源）
+        found = {}
+        threads = []
+        deadline = time.time() + self.SEARCH_BUDGET
+        for tag in ['gg', 'jz', 'zj']:
+            if tag not in self.order:
+                continue
+            th = threading.Thread(target=self._search_one,
+                                  args=(tag, kw, page, found), daemon=True)
+            th.start()
+            threads.append(th)
+        for th in threads:
+            th.join(max(0.05, deadline - time.time()))
+        seen = set(norm_title(x.get('vod_name')) for x in out)
+        for tag in ['gg', 'jz', 'zj']:
+            for card in found.get(tag) or []:
+                name = text(card.get('vod_name'))
+                if not name or norm_title(name) in seen:
+                    continue
+                seen.add(norm_title(name))
+                item = dict(card)
+                item['vod_id'] = '%s:%s' % (tag, text(card.get('vod_id')))
+                out.append(item)
+        return {'list': out}
+
+    def _search_one(self, tag, keyword, page, box):
+        try:
+            box[tag] = self._items(self._src(tag), keyword, page)
+        except Exception:
+            box[tag] = []
+
+    @staticmethod
+    def _items(src, keyword, page=1):
+        """各源 search 返回形态不一（影探给 {'list':[...]}，T3/找剧直接给 list）。"""
+        got = src.search(keyword, page)
+        if isinstance(got, dict):
+            return as_list(got.get('list'))
+        return as_list(got)
+
+    # ---------- 详情 ----------
+    def detailContent(self, ids):
+        vid = ids[0] if isinstance(ids, (list, tuple)) and ids else ids
+        vid = text(vid)
+        if not vid:
+            return {'list': []}
+        cache_key = 'merged:%s' % vid
+        hit = cache_get(cache_key)
+        if hit is not None:
+            got = loads(hit)
+            if got:
+                return got
+
+        deadline = time.time() + self.detail_budget
+        tag, real = self._split_id(vid)
+        base = self._base(tag, real)
+        if not base:
+            return {'list': []}
+        title, vod, base_lines = base
+
+        others = [t for t in self.order if t != tag]
+        found = {}
+        threads = []
+        for other in others:
+            # 之前补全过的源直接复用（按源缓存，不受合并缓存过期影响）
+            pre = cache_get('pre:%s:%s' % (other, vid))
+            if pre:
+                found[other] = pre
+                continue
+            th = threading.Thread(target=self._collect,
+                                  args=(other, title, found), daemon=True)
+            th.start()
+            threads.append(th)
+        for th in threads:
+            th.join(max(0.05, deadline - time.time()))
+
+        for other in others:
+            if found.get(other):
+                cache_put('pre:%s:%s' % (other, vid), found[other], 1800)
+
+        vod = dict(vod)
+        result = self._render(tag, vod, base_lines, found)
+        cache_put(cache_key, json.dumps(result, ensure_ascii=False), self.CACHE_TTL)
+
+        # 首屏没赶上的源，后台补全后写回缓存：下次点进同一个片子就是完整四源
+        missing = [t for t in others if not found.get(t)]
+        if missing:
+            with self._lock:
+                spawn = vid not in self._filling
+                if spawn:
+                    self._filling.add(vid)
+            if spawn:
+                threading.Thread(target=self._fill_later,
+                                 args=(cache_key, vid, tag, vod, base_lines, title,
+                                       found, missing), daemon=True).start()
+        return loads(json.dumps(result, ensure_ascii=False))
+
+    def _render(self, tag, vod, base_lines, extra):
+        """把基准源 + 各源线路拼成 TVBox 详情结构。"""
+        lines = list(base_lines)
+        for other in [t for t in self.order if t != tag]:
+            lines.extend(as_list(extra.get(other)))
+        froms, urls = [], []
+        used = {}
+        for src_tag, name, eps in lines:
+            label = clean_name('%s·%s' % (self.LABELS.get(src_tag, src_tag),
+                                          clean_name(name) or '线路'))
+            if label in used:
+                used[label] += 1
+                label = '%s·%d' % (label, used[label])
+            else:
+                used[label] = 1
+            segs = []
+            for ep_name, raw in eps:
+                code = self._encode(src_tag, name, raw)
+                if code:
+                    segs.append('%s$%s' % (clean_name(ep_name) or '正片', code))
+            if segs:
+                froms.append(label)
+                urls.append('#'.join(segs))
+
+        vod = dict(vod)
+        vod['vod_play_from'] = '$$$'.join(froms)
+        vod['vod_play_url'] = '$$$'.join(urls)
+        if not froms:
+            vod['vod_content'] = (text(vod.get('vod_content')) + NL + NL +
+                                  '[聚合提示] 四个源都没有匹配到可用线路，' +
+                                  '可稍后重试或换个片名搜索。').strip()
+        return {'list': [vod]}
+
+    def _fill_later(self, cache_key, vid, tag, vod, base_lines, title, found, missing):
+        """后台慢补：不设预算地跑完剩下的源，成功后刷新缓存。"""
+        try:
+            for other in missing:
+                try:
+                    self._collect(other, title, found)
+                except Exception:
+                    pass
+            if not any(found.get(t) for t in missing):
+                return
+            for t in missing:
+                if found.get(t):
+                    cache_put('pre:%s:%s' % (t, vid), found[t], 1800)
+            result = self._render(tag, dict(vod), base_lines, found)
+            cache_put(cache_key, json.dumps(result, ensure_ascii=False),
+                      self.CACHE_TTL + 120)
+        except Exception:
+            pass
+        finally:
+            with self._lock:
+                self._filling.discard(vid)
+
+    def _split_id(self, vid):
+        head, sep, rest = vid.partition(':')
+        if sep and head in self.LABELS and rest:
+            return head, rest
+        return 'yt', vid
+
+    def _base(self, tag, vid):
+        """取基准源详情，返回 (标题, vod, [(tag, 线路名, [(集名, 原始id)])])。"""
+        try:
+            if tag == 'yt':
+                vod = self._src('yt').detail(vid)
+                if not vod:
+                    return None
+                lines = []
+                froms = text(vod.get('vod_play_from')).split('$$$')
+                urls = text(vod.get('vod_play_url')).split('$$$')
+                for name, block in zip(froms, urls):
+                    eps = self._split_eps(block)
+                    if eps:
+                        lines.append(('yt', name, eps))
+                vod = dict(vod)
+                vod['vod_id'] = text(vid)
+                return text(vod.get('vod_name')), vod, lines
+            if tag in ('gg', 'jz'):
+                data = self._src(tag).detail(vid)
+                if not data:
+                    return None
+                lines = []
+                for ln in as_list(data.get('lines')):
+                    eps = []
+                    for seg in as_list(ln.get('eps')):
+                        ep_name, sep, ep_id = seg.partition('$')
+                        if sep and ep_id:
+                            eps.append((ep_name, '%d\x1e%s' % (
+                                ln.get('parser_id') or 0, ep_id)))
+                    if eps:
+                        lines.append((tag, ln.get('name'), eps))
+                vod = {
+                    'vod_id': vid, 'vod_name': data.get('vod_name'),
+                    'vod_pic': data.get('vod_pic'), 'vod_year': data.get('vod_year'),
+                    'vod_area': data.get('vod_area'),
+                    'vod_remarks': data.get('vod_remarks'),
+                    'vod_content': data.get('vod_content'),
+                }
+                return text(data.get('vod_name')), vod, lines
+            if tag == 'zj':
+                data = self._src('zj').detail(vid)
+                if not data:
+                    return None
+                lines = [(tag, name, self._split_eps(eps))
+                         for name, eps in as_list(data.get('lines'))]
+                lines = [x for x in lines if x[2]]
+                return text(as_dict(data.get('vod')).get('vod_name')), \
+                    as_dict(data.get('vod')), lines
+        except Exception as exc:
+            self._last_err = 'base(%s):%s' % (tag, exc)
+        return None
+
+    def _collect(self, tag, title, box):
+        """其他源：按标题搜索 → 取最像的一条 → 复用 _base 取线路。"""
+        try:
+            items = self._items(self._src(tag), title)
+            match = strict_match(title, items)
+            if not match:
+                box[tag] = []
+                return
+            base = self._base(tag, text(match.get('vod_id')))
+            box[tag] = (base[2][:self.max_lines] if base else [])
+        except Exception:
+            box[tag] = []
+
+    @staticmethod
+    def _split_eps(block):
+        segs = [text(x) for x in block] if isinstance(block, (list, tuple)) \
+            else text(block).split('#')
+        eps = []
+        for seg in segs:
+            name, sep, pid = seg.partition('$')
+            if sep and pid:
+                eps.append((name, pid))
+        return eps
+
+    # ---------- 线路编码 / 播放派发 ----------
+    @staticmethod
+    def _encode(tag, name, raw):
+        """<tag>|<base64url(线路名\\x1f原始id)>，壳回传时按 tag 派发回原源。"""
+        payload = '%s%s%s' % (clean_name(name), _SEP, raw)
+        blob = b64url_encode(payload)
+        return '%s|%s' % (tag, blob) if blob else ''
+
+    def _decode(self, pid, flag=''):
+        raw = text(pid)
+        tag, sep, blob = raw.partition('|')
+        if sep and tag in self.LABELS and blob:
+            plain = b64url_decode(blob).decode('utf-8', 'ignore')
+            name, s2, real = plain.partition(_SEP)
+            if s2:
+                return tag, real, name or flag
+        return 'yt', raw, text(flag)
+
+    def playerContent(self, flag, id, vipFlags=None):
+        raw = id[0] if isinstance(id, (list, tuple)) and id else id
+        tag, real, name = self._decode(raw, flag)
+        empty = {'parse': 0, 'url': '', 'header': {'User-Agent': UA_WEB}}
+        if not real:
+            return empty
+        try:
+            if tag == 'yt':
+                got = self._src('yt').play(real)
+                return {'parse': 0, 'url': text(got.get('url')),
+                        'header': got.get('header') or {'User-Agent': 'okhttp/4.12.0'}}
+            if tag in ('gg', 'jz'):
+                parser_id, sep, play_id = real.partition('\x1e')
+                if not sep:
+                    play_id, parser_id = real, '0'
+                url = self._src(tag).play(parser_id, play_id, name)
+                return {'parse': 0, 'url': url or '',
+                        'header': {'User-Agent': T3_PROFILES[tag]['ua']}}
+            if tag == 'zj':
+                got = self._src('zj').play(real)
+                return {'parse': int(got.get('parse') or 0), 'url': text(got.get('url')),
+                        'header': got.get('header') or {'User-Agent': UA_WEB}}
+        except Exception as exc:
+            self._last_err = 'play(%s):%s' % (tag, exc)
+        return empty
+
+
+# ======================================================================
+# 模块：xf
+# ======================================================================
+# -*- coding: utf-8 -*-
+"""
+稀饭聚合 · TVBox / OK影视 四源聚合 Python 源
+================================================================
+首页数据 : 稀饭动漫 Next (xifanacg) —— 分类 / 推荐 / 筛选 / 搜索 / 条目元数据
+播放线路 : 四源同时挂出，默认优先级（用户 2026-11-04 指定）
+           1. 稀饭动漫   xifanacg        tag=xf
+           2. GiriGiri爱 girigirilove   tag=gg
+           3. 次元城动画 cycani.org     tag=cy
+           4. OmoFun     omofun.in      tag=om
+           TVBox 默认取第一条线路播放，故此顺序即默认选线顺序。
+
+线路名 : 「源·原线路名」；选集 id : "<tag>|<base64url(flag + US + 原始id)>"
+         playerContent 按 tag 解码后派发回对应源，不依赖壳回传的 flag。
+
+源配置 extend（JSON，全部可选）:
+{
+  "cyc_username": "次元城账号",
+  "cyc_password": "密码",
+  "cyc_token": "浏览器复制的 JWT",
+  "lines": ["xf", "gg", "cy", "om"],
+  "detail_budget": 7,
+  "host": "https://next.xifanacg.com",
+  "api": "https://api.xifanacg.com",
+  "key": "sb_publishable_xxx"
+}
+说明：次元城播放接口需登录，上面三个 cyc_* 字段至少要给一个；
+      否则该源仍能列出选集，但播放会返回空地址（接口 401）。
+
+2026-11-04 修复要点（xifanacg「已坏」）:
+  站点接口实测全部正常（RPC / 详情 / 取流均 200）。真正的故障是旧脚本
+  _rsc_sources() 去请求 Next.js 的 /anime/{id} 页面，单次要 10.6~11s，
+  而该页 RSC payload 里已经完全没有 sources 数据 —— 详情页被拖到超时，
+  且只能降级出 1 条假线路。本版改为调用 issue-web-playback 拿 candidates
+  （含 source_id / source_name），详情页由 ~11.5s 降到 ~1s，并恢复 3 条真实线路。
+"""
+
+import sys
+import re
+import os
+import json
+import time
+import base64
+import difflib
+import tempfile
+import urllib.parse
+import urllib.request
+import urllib.error
+
+try:
+    import threading
+except Exception:
+    threading = None
+try:
+    import gzip
+except Exception:
+    gzip = None
+try:
+    import zlib
+except Exception:
+    zlib = None
+try:
+    import ssl
+except Exception:
+    ssl = None
+try:
+    import http.client as http_client
+except Exception:
+    http_client = None
+
+sys.path.append('..')
+try:
+    from base.spider import Spider as _SpiderBase
+except Exception:
+    class _SpiderBase(object):
+        pass
+
+XF_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+      '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
+VIDEO_EXTS = ('.m3u8', '.mp4', '.mkv', '.flv', '.avi', '.ts', '.mov',
+              '.m4v', '.webm', '.wmv', '.rmvb', '.mpd')
+EXT_HOSTS = ('v.qq.com', 'qq.com', 'youku.com', 'iqiyi.com', 'bilibili.com',
+             'mgtv.com', 'sohu.com', 'pptv.com', 'le.com', 'wasu.cn', '1905.com')
+US = chr(31)          # 线路 flag 与原始 id 的内部分隔符
+NL = chr(10)
+
+
+class _DummyLock(object):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+_POOL = {}
+XF_CACHE = {}
+_LAST_ERR = ''          # 最近一次 detailContent 异常，便于排查（不影响正常流程）
+_POOL_MAX = 5
+_POOL_IDLE = 25.0
+_CACHE_MAX = 200
+_SSL = None
+_SSL_READY = False
+try:
+    _POOL_LOCK = threading.Lock() if threading else _DummyLock()
+    _CACHE_LOCK = threading.Lock() if threading else _DummyLock()
+except Exception:
+    _POOL_LOCK = _CACHE_LOCK = _DummyLock()
+
+
+# ==================== 全局 HTTP 层（四源共享连接池 / 缓存） ====================
+def _ssl_ctx():
+    global _SSL, _SSL_READY
+    if not _SSL_READY:
+        _SSL_READY = True
+        try:
+            # TVBox 内置 Python 常缺系统根证书；这些是公开采集接口，统一不校验
+            _SSL = ssl._create_unverified_context() if ssl else None
+        except Exception:
+            _SSL = None
+    return _SSL
+
+
+def xf_cache_get(key):
+    try:
+        with _CACHE_LOCK:
+            it = XF_CACHE.get(key)
+            if not it:
+                return None
+            if it[0] > time.time():
+                return it[1]
+            XF_CACHE.pop(key, None)
+    except Exception:
+        pass
+    return None
+
+
+def xf_cache_put(key, val, ttl):
+    try:
+        with _CACHE_LOCK:
+            if len(XF_CACHE) >= _CACHE_MAX:
+                now = time.time()
+                for k in [k for k, v in XF_CACHE.items() if v[0] <= now]:
+                    XF_CACHE.pop(k, None)
+                if len(XF_CACHE) >= _CACHE_MAX:
+                    XF_CACHE.clear()
+            XF_CACHE[key] = (time.time() + ttl, val)
+    except Exception:
+        pass
+
+
+def _new_conn(scheme, netloc, timeout):
+    kw = {'timeout': timeout}
+    if scheme == 'https':
+        ctx = _ssl_ctx()
+        if ctx is not None:
+            kw['context'] = ctx
+        return http_client.HTTPSConnection(netloc, **kw)
+    return http_client.HTTPConnection(netloc, **kw)
+
+
+def _pool_take(netloc):
+    try:
+        with _POOL_LOCK:
+            lst = _POOL.get(netloc)
+            now = time.time()
+            while lst:
+                conn, ts = lst.pop()
+                if now - ts < _POOL_IDLE and getattr(conn, 'sock', None) is not None:
+                    return conn
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+
+def _pool_give(netloc, conn):
+    try:
+        with _POOL_LOCK:
+            lst = _POOL.setdefault(netloc, [])
+            if len(lst) < _POOL_MAX:
+                lst.append((conn, time.time()))
+                return
+    except Exception:
+        pass
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def pool_clear():
+    try:
+        with _POOL_LOCK:
+            for lst in list(_POOL.values()):
+                for conn, _ in lst:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+            _POOL.clear()
+    except Exception:
+        pass
+
+
+def _unzip(data, enc):
+    try:
+        if not data or not enc:
+            return data
+        if 'gzip' in enc and gzip:
+            return gzip.decompress(data)
+        if 'deflate' in enc and zlib:
+            try:
+                return zlib.decompress(data)
+            except Exception:
+                return zlib.decompress(data, -zlib.MAX_WBITS)
+    except Exception:
+        pass
+    return data
+
+
+def _decode(data, ctype):
+    cs = 'utf-8'
+    try:
+        m = re.search(r'charset=([\w-]+)', ctype or '')
+        if m:
+            cs = m.group(1)
+    except Exception:
+        pass
+    try:
+        return data.decode(cs, 'ignore')
+    except Exception:
+        return data.decode('utf-8', 'ignore')
+
+
+def _urllib_req(url, method, data, h, timeout):
+    try:
+        req = urllib.request.Request(url, data=data, headers=h, method=method)
+        kw = {'timeout': timeout}
+        ctx = _ssl_ctx()
+        if ctx is not None:
+            kw['context'] = ctx
+        with urllib.request.urlopen(req, **kw) as resp:
+            raw = resp.read()
+            enc = (resp.headers.get('Content-Encoding') or '').lower()
+            return resp.status, _decode(_unzip(raw, enc), resp.headers.get('Content-Type'))
+    except urllib.error.HTTPError as e:
+        try:
+            raw = _unzip(e.read(), (e.headers.get('Content-Encoding') or '').lower())
+            return e.code, raw.decode('utf-8', 'ignore')
+        except Exception:
+            return e.code, ''
+    except Exception:
+        return 0, ''
+
+
+def request_ex(url, method='GET', body=None, headers=None, timeout=8.0, ttl=0):
+    """返回 (status, text)。body 为 dict/list 时自动序列化并置 Content-Type。
+    连接池按 netloc 复用；仅 2xx 会回池；短 TTL 缓存只存原始文本。"""
+    try:
+        p = urllib.parse.urlsplit(str(url or ''))
+    except Exception:
+        return 0, ''
+    netloc = p.netloc
+    if not netloc:
+        return 0, ''
+    scheme = (p.scheme or 'https').lower()
+    path = (p.path or '/') + (('?' + p.query) if p.query else '')
+    try:
+        if any(ord(c) > 127 for c in path):
+            path = urllib.parse.quote(path, safe="/?&=%:@+,~$!*'();[]")
+    except Exception:
+        pass
+
+    h = dict(headers or {})
+    data = None
+    if body is not None:
+        if isinstance(body, (dict, list)):
+            data = json.dumps(body, ensure_ascii=False).encode('utf-8')
+            h.setdefault('Content-Type', 'application/json')
+        elif isinstance(body, str):
+            data = body.encode('utf-8')
+        else:
+            data = body
+        if method == 'GET':
+            method = 'POST'
+    if gzip or zlib:
+        h.setdefault('Accept-Encoding', 'gzip, deflate')
+    h.setdefault('User-Agent', XF_UA)
+
+    ck = None
+    if ttl:
+        ck = '%s|%s|%s|%s' % (method, url, (data or b'')[:160],
+                              h.get('Authorization', ''))
+        hit = xf_cache_get(ck)
+        if hit is not None:
+            return 200, hit
+
+    st, txt = 0, ''
+    if http_client is None:
+        st, txt = _urllib_req(url, method, data, h, timeout)
+    else:
+        for attempt in (0, 1, 2):
+            conn = _pool_take(netloc) if attempt < 2 else None
+            reused = conn is not None
+            if conn is None:
+                try:
+                    conn = _new_conn(scheme, netloc, timeout)
+                except Exception:
+                    break
+            t0 = time.time()
+            try:
+                conn.request(method, path, body=data, headers=h)
+                resp = conn.getresponse()
+                raw = resp.read()
+                enc = (resp.getheader('Content-Encoding') or '').lower()
+                ctype = resp.getheader('Content-Type') or ''
+                st = resp.status or 0
+                txt = _decode(_unzip(raw, enc), ctype)
+                if 200 <= st < 300:
+                    _pool_give(netloc, conn)
+                else:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                break
+            except Exception:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                if reused:
+                    continue
+                # 真超时不重试，只有 <1.2s 的快速失败才重来
+                if attempt == 0 and (time.time() - t0) < 1.2:
+                    continue
+                break
+    if ck and 200 <= st < 300 and txt:
+        xf_cache_put(ck, txt, ttl)
+    return st, txt
+
+
+def xf_http_text(url, **kw):
+    return request_ex(url, **kw)[1]
+
+
+def xf_loads(txt):
+    """兼容普通 JSON / NDJSON / 前后带噪声的接口响应"""
+    if not txt:
+        return {}
+    s = txt.strip()
+    try:
+        return json.loads(s)
+    except Exception:
+        pass
+    out = []
+    for line in s.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            o = json.loads(line)
+        except Exception:
+            continue
+        if isinstance(o, list):
+            out += o
+        elif isinstance(o, dict):
+            out.append(o)
+    if out:
+        return out
+    m = re.search(r'[\{\[].*[\}\]]', s, re.S)
+    if m:
+        try:
+            return json.loads(m.group(0))
+        except Exception:
+            pass
+    return {}
+
+
+# ==================== 通用工具 ====================
+def is_video(u):
+    try:
+        x = str(u or '').split('#')[0].split('?')[0].strip().lower()
+        return any(x.endswith(e) for e in VIDEO_EXTS)
+    except Exception:
+        return False
+
+
+def enc_url(u):
+    """路径含中文/空格时百分号编码，保留 query 里的 sign 参数"""
+    try:
+        s = str(u or '').strip()
+        if not s or all(ord(c) < 128 for c in s):
+            return s
+        p = urllib.parse.urlsplit(s)
+        return urllib.parse.urlunsplit((
+            p.scheme, p.netloc,
+            urllib.parse.quote(p.path, safe="/%:@&=+$,~"),
+            urllib.parse.quote(p.query, safe="=&%:/?:@+,~"), ''))
+    except Exception:
+        return str(u or '')
+
+
+def abs_url(base, u):
+    try:
+        s = str(u or '').strip()
+        if not s:
+            return s
+        if s.startswith('//'):
+            return enc_url('https:' + s)
+        if s.startswith('http'):
+            return enc_url(s)
+        return enc_url(urllib.parse.urljoin(base, s))
+    except Exception:
+        return u
+
+
+def xf_clean_name(s):
+    try:
+        t = str(s or '').strip()
+        t = t.replace('$', ' ').replace('#', ' ').replace('|', ' ')
+        t = t.replace('\r', ' ').replace('\n', ' ')
+        return re.sub(r'\s+', ' ', t).strip()
+    except Exception:
+        return ''
+
+
+def xf_norm_title(s):
+    try:
+        s = str(s or '').lower()
+        return re.sub(r'[\s\u3000\-—–_·:：!！?？,，.。\[\]【】()（）「」『』《》<>／/\\|+~～]', '', s)
+    except Exception:
+        return ''
+
+
+def xf_sim(a, b):
+    """标题相似度：完全相同 > 包含 > 序列相似"""
+    try:
+        x, y = xf_norm_title(a), xf_norm_title(b)
+        if not x or not y:
+            return 0.0
+        if x == y:
+            return 1.0
+        if x in y or y in x:
+            r = float(min(len(x), len(y))) / max(len(x), len(y))
+            return 0.85 + 0.12 * r if r >= 0.5 else 0.0
+        return difflib.SequenceMatcher(None, x, y).ratio()
+    except Exception:
+        return 0.0
+
+
+_SEASON_RE = re.compile(
+    r'(第[一二三四五六七八九十0-9]+季|season\s*[0-9]+|part\s*[0-9]+|\bs[0-9]{1,2}\b)',
+    re.I)
+
+
+def season_tag(s):
+    try:
+        m = _SEASON_RE.search(str(s or ''))
+        return m.group(0).lower() if m else ''
+    except Exception:
+        return ''
+
+
+def search_keywords(title):
+    """完整标题 → 去括号/季数的核心词 → 核心词前 6 / 4 字"""
+    t = str(title or '').strip()
+    out = []
+
+    def add(x):
+        x = str(x or '').strip()
+        if x and x not in out and len(x) >= 2:
+            out.append(x)
+
+    add(t)
+    core = re.sub(r'[\[\(（【].*?[\]\)）】]', '', t)
+    core = _SEASON_RE.sub('', core)
+    core = re.sub(r'\s+', ' ', core).strip()
+    add(core)
+    for n in (6, 4):
+        if len(core) > n:
+            add(core[:n])
+    return out
+
+
+def xf_best_match(title, items, threshold=0.70):
+    best, score = None, 0.0
+    ts = season_tag(title)
+    for it in items or []:
+        if not isinstance(it, dict):
+            continue
+        name = it.get('vod_name') or ''
+        s = xf_sim(title, name)
+        cs = season_tag(name)
+        if ts and cs and ts != cs:
+            s *= 0.45          # 双方季数标记都存在却不一致，避免错季
+        if s > score:
+            best, score = it, s
+    return best if score >= threshold else None
+
+
+def search_best(src, title):
+    """跨站译名有差异时逐级降级搜索；降级轮只接受近乎精确匹配，
+    防止把第一季的线路挂到第二季上。"""
+    for i, kw in enumerate(search_keywords(title)):
+        try:
+            items = src.search(kw)
+        except Exception:
+            continue
+        if not items:
+            continue
+        pick = xf_best_match(title, items, 0.70 if i == 0 else 0.97)
+        if pick:
+            return pick
+    return None
+
+
+def enc_pid(tag, flag, pid):
+    try:
+        raw = ('%s%s%s' % (flag, US, pid)).encode('utf-8')
+        return tag + '|' + base64.urlsafe_b64encode(raw).decode('ascii').rstrip('=')
+    except Exception:
+        return ''
+
+
+def dec_pid(s):
+    try:
+        tag, b = str(s).split('|', 1)
+        b += '=' * ((4 - len(b) % 4) % 4)
+        raw = base64.urlsafe_b64decode(b.encode('ascii')).decode('utf-8')
+        flag, pid = raw.split(US, 1)
+        return tag, flag, pid
+    except Exception:
+        return '', '', ''
+
+
+def play_header(host, ref=None):
+    return {'User-Agent': XF_UA, 'Referer': ref or (host + '/'),
+            'Origin': host, 'Accept': '*/*',
+            'Accept-Language': 'zh-CN,zh;q=0.9'}
+
+
+def is_ext_link(u):
+    try:
+        net = urllib.parse.urlsplit(str(u or '')).netloc.lower()
+        return any(net == k or net.endswith('.' + k) for k in EXT_HOSTS)
+    except Exception:
+        return False
+
+
+def ep_label(raw, idx):
+    try:
+        t = str(raw or '').strip()
+        if not t:
+            return '第%02d集' % (idx + 1)
+        if re.match(r'^[0-9]{1,4}$', t):
+            return '第%02d集' % int(t)
+        return t
+    except Exception:
+        return '第%02d集' % (idx + 1)
+
+
+def as_lines(episodes):
+    """把 [(集名, flag, pid)] 规整化"""
+    out = []
+    for e in episodes or []:
+        try:
+            if len(e) >= 3 and e[2]:
+                out.append((xf_clean_name(e[0]) or '正片', str(e[1] or ''), str(e[2])))
+        except Exception:
+            pass
+    return out
+
+
+def _epnum(e):
+    try:
+        return float(e.get('episode_number') or 0)
+    except Exception:
+        return 0.0
+
+
+# ==================== 源 1：稀饭动漫 Next（首页数据源 + 线路） ====================
+class XifanSpider(object):
+    """修复版：移除无效的 RSC 请求，改用 issue-web-playback 的 candidates 建线路。"""
+    TAG = 'xf'
+    HOST = 'https://next.xifanacg.com'
+    API = 'https://api.xifanacg.com'
+    KEY = 'sb_publishable_OBIVAWACIX6lPXrO98_z24_HcsmalkA'
+    PAGE_SIZE = 24
+    MAX_LINES = 4
+    FLAG = 'xfline'
+
+    CATEGORIES = [
+        {'tid': '1', 'name': '连载新番', 'type_id': 1, 'sort': 'updated_at'},
+        {'tid': '2', 'name': '完结旧番', 'type_id': 2, 'sort': 'updated_at'},
+        {'tid': '3', 'name': '剧场版', 'type_id': 3, 'sort': 'updated_at'},
+        {'tid': '4', 'name': '美漫', 'type_id': 4, 'sort': 'updated_at'},
+        {'tid': 'hot', 'name': '热门播放', 'sort': 'view_count'},
+        {'tid': 'score', 'name': '高分好评', 'sort': 'bangumi_score'},
+        {'tid': 'new', 'name': '最近上新', 'sort': 'created_at'},
+        {'tid': 'tv', 'name': 'TV动画', 'fmt': 'tv', 'sort': 'updated_at'},
+        {'tid': 'movie', 'name': '剧场动画', 'fmt': 'movie', 'sort': 'updated_at'},
+        {'tid': 'ova', 'name': 'OVA', 'fmt': 'ova', 'sort': 'updated_at'},
+        {'tid': 'web', 'name': 'WEB动画', 'fmt': 'web', 'sort': 'updated_at'},
+        {'tid': 'fin', 'name': '已完结', 'finished': True, 'sort': 'updated_at'},
+        {'tid': 'ing', 'name': '连载中', 'finished': False, 'sort': 'updated_at'},
+        {'tid': 'y2026', 'name': '2026年', 'year': 2026, 'sort': 'updated_at'},
+        {'tid': 'y2025', 'name': '2025年', 'year': 2025, 'sort': 'updated_at'},
+        {'tid': 'y2024', 'name': '2024年', 'year': 2024, 'sort': 'updated_at'},
+        {'tid': 'y2023', 'name': '2023年', 'year': 2023, 'sort': 'updated_at'},
+    ]
+    TID_ALIAS = {
+        '0': '1', 'all': '1', 'ongoing': '1', 'anime': '1',
+        'finished': '2', 'theater': '3', 'western': '4', 'drama': 'tv',
+    }
+
+    def __init__(self, cfg=None):
+        cfg = cfg or {}
+        self.host = str(cfg.get('host') or self.HOST).rstrip('/')
+        self.api = str(cfg.get('api') or self.API).rstrip('/')
+        self.key = str(cfg.get('key') or self.KEY)
+        try:
+            self.timeout = float(cfg.get('timeout') or 4)
+        except Exception:
+            self.timeout = 4.0
+        # 健康标记：连续网络层失败就临时下线，别再让首页/分类每次白等超时
+        self._fails = 0
+        self._cool = 0.0
+        self.alive = True
+
+    def _mark(self, ok):
+        if ok:
+            self._fails = 0
+            self.alive = True
+            return
+        self._fails += 1
+        if self._fails >= 1:
+            self.alive = False
+            self._cool = time.time() + 120
+
+    def health(self):
+        """冷却期过后自动试探恢复。"""
+        if not self.alive and time.time() > self._cool:
+            self.alive = True
+            self._fails = 0
+        return self.alive
+
+    def hdr(self, ref=None):
+        return {
+            'User-Agent': XF_UA,
+            'Accept': 'application/json, text/plain, */*',
+            'Accept-Language': 'zh-CN,zh;q=0.9',
+            'Referer': ref or (self.host + '/'),
+            'Origin': self.host,
+            'x-platform': 'web',
+            'x-requested-with': 'XMLHttpRequest',
+            'apikey': self.key,
+            'authorization': 'Bearer ' + self.key,
+            'x-client-info': 'supabase-ssr/0.10.3 createBrowserClient',
+            'content-profile': 'public',
+            'Accept-Encoding': 'gzip, deflate',
+        }
+
+    def get(self, path, params=None, ttl=0):
+        url = self.api + path
+        if params:
+            url += ('&' if '?' in url else '?') + urllib.parse.urlencode(params)
+        st, txt = request_ex(url, 'GET', headers=self.hdr(),
+                             timeout=self.timeout, ttl=ttl)
+        self._mark(bool(st))
+        return xf_loads(txt) if st and st < 400 else {}
+
+    def post(self, path, body, ttl=0):
+        st, txt = request_ex(self.api + path, 'POST', body=body,
+                             headers=self.hdr(), timeout=self.timeout, ttl=ttl)
+        self._mark(bool(st))
+        return xf_loads(txt) if st and st < 400 else {}
+
+    def cat(self, tid):
+        t = str(tid or '').strip()
+        t = self.TID_ALIAS.get(t.lower(), t)
+        for c in self.CATEGORIES:
+            if c['tid'] == t:
+                return c
+        return {'tid': t}
+
+    def query(self, tid, pg, ext=None, kw=''):
+        c = self.cat(tid)
+        ext = ext if isinstance(ext, dict) else {}
+        page = int(pg) if str(pg or '').isdigit() and int(pg) > 0 else 1
+        q = {'page_number': page, 'items_per_page': self.PAGE_SIZE,
+             'sort_by': c.get('sort') or 'updated_at', 'sort_order': 'desc',
+             'filter_only_published': True}
+        if kw:
+            q['search_term'] = str(kw).strip()
+        if c.get('type_id'):
+            q['filter_type_id'] = c['type_id']
+        if c.get('fmt'):
+            q['filter_format'] = c['fmt']
+        if 'finished' in c:
+            q['filter_is_finished'] = c['finished']
+        if c.get('year'):
+            q['filter_release_year'] = c['year']
+        for k, dst in (('sort_by', 'sort_by'), ('sort_order', 'sort_order'),
+                       ('year', 'filter_release_year'),
+                       ('type_id', 'filter_type_id'), ('format', 'filter_format')):
+            if ext.get(k) not in (None, ''):
+                q[dst] = ext[k]
+        return q
+
+    def rpc(self, tid, pg, ext=None, kw='', ttl=0):
+        arr = self.post('/rest/v1/rpc/search_animes',
+                        self.query(tid, pg, ext, kw), ttl=ttl)
+        if not isinstance(arr, list):
+            return [], 0
+        total = 0
+        try:
+            total = int(arr[0].get('total_count') or 0) if arr else 0
+        except Exception:
+            total = 0
+        return arr, total
+
+    def vod(self, it):
+        try:
+            if not isinstance(it, dict):
+                return None
+            aid = it.get('id')
+            if aid in (None, ''):
+                return None
+            # img2 走 AWS 新加坡，国内实测超时；img 是 Cloudflare 同路径可直出
+            pic = str(it.get('cover_url') or '').replace(
+                'img2.xfmanga.top', 'img.xfmanga.top')
+            cur = it.get('current_episodes') or 0
+            tot = it.get('total_episodes') or 0
+            remark = ''
+            if it.get('is_finished'):
+                remark = ('全%d集' % tot) if tot else '已完结'
+            elif cur:
+                remark = ('更新至%d集' % cur) + (('/%d' % tot) if tot and tot > cur else '')
+            desc = str(it.get('description') or '')
+            tags = it.get('meta_tags') or []
+            if isinstance(tags, list) and tags:
+                desc = (desc + NL + '标签：' + ' / '.join([str(t) for t in tags[:8]])).strip()
+            actors = it.get('actors')
+            return {
+                'vod_id': str(aid),
+                'vod_name': str(it.get('title') or it.get('title_original') or ''),
+                'vod_pic': pic,
+                'vod_remarks': remark,
+                'vod_year': str(it.get('release_year') or ''),
+                'vod_area': str(it.get('region') or ''),
+                'vod_lang': '日语',
+                'vod_actor': ('、'.join([str(a) for a in actors[:6]])
+                              if isinstance(actors, list) else ''),
+                'vod_director': str(it.get('director') or ''),
+                'vod_score': str(it.get('bangumi_score') or ''),
+                'vod_content': desc,
+                'vod_tag': '',
+            }
+        except Exception:
+            return None
+
+    def vod_list(self, arr):
+        out = []
+        for it in arr or []:
+            v = self.vod(it)
+            if v:
+                out.append(v)
+        return out
+
+    def filters(self):
+        years = [{'n': '全部', 'v': ''}]
+        years += [{'n': str(y), 'v': str(y)} for y in range(2026, 2018, -1)]
+        sorts = [{'n': '最近更新', 'v': ''},
+                 {'n': '最多播放', 'v': 'view_count'},
+                 {'n': '高分好评', 'v': 'bangumi_score'},
+                 {'n': '最近上新', 'v': 'created_at'}]
+        out = {}
+        for c in self.CATEGORIES:
+            out[c['tid']] = [{'key': 'sort_by', 'name': '排序', 'value': sorts},
+                             {'key': 'year', 'name': '年份', 'value': years}]
+        return out
+
+    def homeContent(self, filter):
+        classes = [{'type_id': c['tid'], 'type_name': c['name']}
+                   for c in self.CATEGORIES]
+        try:
+            arr, _ = self.rpc('1', 1, None, '', ttl=90)
+            vlist = self.vod_list(arr)[:18]
+            if len(vlist) < 8:
+                more, _ = self.rpc('3', 1, None, '', ttl=90)
+                vlist += self.vod_list(more)[:10]
+        except Exception:
+            vlist = []
+        return {'class': classes, 'filters': self.filters() if filter else {},
+                'list': vlist}
+
+    def homeVideoContent(self):
+        try:
+            arr, _ = self.rpc('new', 1, None, '', ttl=90)
+            vlist = self.vod_list(arr)
+            if not vlist:
+                arr, _ = self.rpc('1', 1, None, '', ttl=90)
+                vlist = self.vod_list(arr)
+            return {'list': vlist}
+        except Exception:
+            return {'list': []}
 
     def categoryContent(self, tid, pg, filter, extend):
-        raise NotImplementedError
-
-    def detailContent(self, ids):
-        raise NotImplementedError
+        ext = {}
+        if isinstance(extend, dict):
+            ext = extend
+        elif isinstance(extend, str) and extend.strip().startswith('{'):
+            try:
+                ext = json.loads(extend)
+            except Exception:
+                ext = {}
+        try:
+            arr, total = self.rpc(tid, pg, ext, '', ttl=60)
+            vlist = self.vod_list(arr)
+            page = int(pg) if str(pg or '').isdigit() and int(pg) > 0 else 1
+            if total:
+                pagecount = (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE
+            else:
+                pagecount = 9999 if vlist else 1
+            return {'list': vlist, 'page': page,
+                    'pagecount': max(pagecount, page),
+                    'limit': self.PAGE_SIZE, 'total': total or len(vlist)}
+        except Exception:
+            return {'list': [], 'page': 1, 'pagecount': 1,
+                    'limit': self.PAGE_SIZE, 'total': 0}
 
     def searchContent(self, key, quick, pg='1'):
-        raise NotImplementedError
+        word = str(key or '').strip()
+        if not word:
+            return {'list': []}
+        try:
+            page = 1 if quick else (int(pg) if str(pg or '').isdigit() else 1)
+            arr, _ = self.rpc('', page, None, word, ttl=30)
+            return {'list': self.vod_list(arr)}
+        except Exception:
+            return {'list': []}
+
+    def search(self, kw, page=1):
+        """统一接口：按标题查本站条目（供诊断 / 跨源匹配使用）"""
+        try:
+            arr, _ = self.rpc('', page, None, kw, ttl=30)
+            return self.vod_list(arr)
+        except Exception:
+            return []
+
+    def match_lines(self, title):
+        # 首页源本身就是元数据来源，详情直接由 detail() 产出线路
+        return []
+
+    def anime_eps(self, aid):
+        """详情 + 剧集一次取回；嵌套 select 失败时回退成两次单独请求"""
+        try:
+            arr = self.get('/rest/v1/animes', {
+                'id': 'eq.' + str(aid),
+                'select': '*,episodes(id,episode_number,title,kind,release_date,duration_seconds)',
+                'limit': 1}, ttl=120)
+            if isinstance(arr, list) and arr and isinstance(arr[0], dict):
+                it = arr[0]
+                eps = it.pop('episodes', None) or []
+                if isinstance(eps, list) and eps:
+                    eps.sort(key=_epnum)
+                    return it, [e for e in eps if isinstance(e, dict) and e.get('id')]
+        except Exception:
+            pass
+        plain = self.get('/rest/v1/animes',
+                         {'id': 'eq.' + str(aid), 'select': '*', 'limit': 1}, ttl=120)
+        it = plain[0] if isinstance(plain, list) and plain and isinstance(plain[0], dict) else {}
+        arr = self.get('/rest/v1/episodes', {
+            'anime_id': 'eq.' + str(aid),
+            'select': 'id,episode_number,title,kind,release_date,duration_seconds',
+            'order': 'episode_number.asc', 'limit': 2000}, ttl=300)
+        eps = arr if isinstance(arr, list) else []
+        return it, [e for e in eps if isinstance(e, dict) and e.get('id')]
+
+    def ep_name(self, ep, idx):
+        try:
+            num = int(float(ep.get('episode_number') or (idx + 1)))
+        except Exception:
+            num = idx + 1
+        t = str(ep.get('title') or '').strip()
+        return xf_clean_name(('第%02d集 %s' % (num, t)) if t else ('第%02d集' % num))
+
+    def source_lines(self, aid, eps):
+        """【核心修复】用第一集取流响应的 candidates 枚举真实线路。
+        旧版解析 Next.js RSC payload，实测该页已无 sources 数据且耗时 10.6s。"""
+        out = []
+        eids = [e.get('id') for e in eps if e.get('id')]
+        if not eids:
+            return out
+        try:
+            first_eid = int(eids[0])
+        except Exception:
+            return out
+        d = self.post('/functions/v1/issue-web-playback',
+                      {'action': 'fallback', 'episode_id': first_eid}, ttl=180)
+        cands = d.get('candidates') if isinstance(d, dict) else None
+        if not isinstance(cands, list) or not cands:
+            cands = [{'source_id': 0, 'source_name': '稀饭线路'}]
+        used = {}
+        for c in cands[:self.MAX_LINES]:
+            if not isinstance(c, dict):
+                continue
+            try:
+                sid = int(c.get('source_id') or 0)
+            except Exception:
+                sid = 0
+            base = xf_clean_name(c.get('source_name') or c.get('source_code') or '稀饭线路') or '稀饭线路'
+            name = base
+            if name in used:
+                used[name] += 1
+                name = '%s·%d' % (base, used[name])
+            else:
+                used[name] = 1
+            items = []
+            for i, e in enumerate(eps):
+                eid = e.get('id')
+                if not eid:
+                    continue
+                items.append((self.ep_name(e, i), self.FLAG,
+                              '%s|%s|%s' % (aid, eid, sid)))
+            if items:
+                out.append({'name': name, 'eps': as_lines(items)})
+        return out
+
+    def detail(self, aid):
+        info, eps = self.anime_eps(aid)
+        v = self.vod(info) or {'vod_id': aid}
+        v['vod_id'] = aid
+        if not v.get('vod_name'):
+            v['vod_name'] = '稀饭动漫 %s' % aid
+        v['vod_pubdate'] = str(info.get('release_date') or '')
+        lines = self.source_lines(aid, eps)
+        if eps:
+            page = '%s/anime/%s/play/%s' % (self.host, aid, eps[0].get('id'))
+            lines.append({'name': '网页解析',
+                          'eps': [('正片', 'xfpage', 'playpage:' + page)]})
+        return v, lines
+
+    def fetch_playable(self, eid, sid):
+        """按线路 source_id 取流；不缓存（url 带时效性 sign）"""
+        try:
+            eid_i = int(eid)
+        except Exception:
+            return ''
+        body = {'action': 'fallback', 'episode_id': eid_i}
+        try:
+            if str(sid) not in ('', '0', 'None'):
+                body['source_id'] = int(sid)
+        except Exception:
+            pass
+        d = self.post('/functions/v1/issue-web-playback', body)
+        u = str((d or {}).get('url') or '') if isinstance(d, dict) else ''
+        if not u and body.get('source_id'):
+            d2 = self.post('/functions/v1/issue-web-playback',
+                           {'action': 'fallback', 'episode_id': eid_i})
+            u = str((d2 or {}).get('url') or '') if isinstance(d2, dict) else ''
+        return enc_url(u)
+
+    def play(self, flag, pid):
+        res = {'parse': 0, 'jx': 0, 'url': '', 'header': play_header(self.host)}
+        raw = str(pid or '').strip()
+        if not raw:
+            return res
+        if raw.startswith('playpage:'):
+            page = raw[len('playpage:'):]
+            return {'parse': 1, 'jx': 1, 'url': page,
+                    'header': play_header(self.host, page)}
+        if raw.startswith('http') or raw.startswith('//'):
+            u = ('https:' + raw) if raw.startswith('//') else raw
+            res['url'] = enc_url(u) if is_video(u) else u
+            return res
+        m = re.match(r'^([0-9]+)\|([0-9]+)\|([0-9]+)$', raw)
+        if m:
+            url = self.fetch_playable(m.group(2), m.group(3))
+            if url:
+                res['url'] = url
+                return res
+            page = '%s/anime/%s/play/%s' % (self.host, m.group(1), m.group(2))
+            return {'parse': 1, 'jx': 1, 'url': page,
+                    'header': play_header(self.host, page)}
+        if raw.isdigit():
+            url = self.fetch_playable(raw, 0)
+            if url:
+                res['url'] = url
+        return res
+
+
+# ==================== 源 2：GiriGiri爱（maccms 接口，直链） ====================
+class GirigiriSpider(object):
+    TAG = 'gg'
+    HOST = 'https://ani.girigirilove.com'
+    API = 'https://m3u8.girigirilove.com/api.php'
+    IMG = 'https://jpg.girigirilove.com'
+    PAGE_SIZE = 24
+    MAX_LINES = 4
+    LINE_NAME = {'cht': '繁中字幕', 'chs': '简中字幕', 'cht,chs': '繁简双字'}
+
+    def __init__(self, cfg=None):
+        cfg = cfg or {}
+        self.host = str(cfg.get('giri_host') or self.HOST).rstrip('/')
+        self.api = str(cfg.get('giri_api') or self.API).rstrip('/')
+        try:
+            self.timeout = float(cfg.get('timeout') or 6)
+        except Exception:
+            self.timeout = 6.0
+
+    def hdr(self, ref=None):
+        return {'User-Agent': XF_UA, 'Accept': 'application/json, text/plain, */*',
+                'Accept-Language': 'zh-CN,zh;q=0.9',
+                'Referer': ref or (self.host + '/'), 'Origin': self.host,
+                'x-platform': 'web', 'x-requested-with': 'XMLHttpRequest',
+                'Accept-Encoding': 'gzip, deflate'}
+
+    def call(self, path, params=None, ttl=0):
+        url = self.api + path
+        if params:
+            url += ('&' if '?' in url else '?') + urllib.parse.urlencode(params)
+        st, txt = request_ex(url, 'GET', headers=self.hdr(),
+                             timeout=self.timeout, ttl=ttl)
+        return xf_loads(txt) if st and st < 400 else {}
+
+    def pic(self, p):
+        try:
+            s = str(p or '').strip()
+            if not s:
+                return ''
+            if s.startswith('//'):
+                return 'https:' + s
+            if s.startswith('http'):
+                return s
+            return self.IMG + '/' + s.lstrip('/')
+        except Exception:
+            return ''
+
+    def vod(self, it):
+        try:
+            if not isinstance(it, dict):
+                return None
+            vid = it.get('vod_id')
+            if vid in (None, ''):
+                return None
+            desc = str(it.get('vod_blurb') or it.get('vod_content') or '')
+            cls = it.get('vod_class') or ''
+            if cls and isinstance(cls, str):
+                desc = (desc + NL + '类型：' + cls.replace(',', ' / ')).strip()
+            return {'vod_id': str(vid),
+                    'vod_name': str(it.get('vod_name') or ''),
+                    'vod_pic': self.pic(it.get('vod_pic')),
+                    'vod_remarks': str(it.get('vod_remarks') or ''),
+                    'vod_year': str(it.get('vod_year') or ''),
+                    'vod_area': str(it.get('vod_area') or ''),
+                    'vod_lang': str(it.get('vod_lang') or ''),
+                    'vod_content': desc}
+        except Exception:
+            return None
+
+    def vod_list(self, arr):
+        out = []
+        for it in arr or []:
+            v = self.vod(it)
+            if v:
+                out.append(v)
+        return out
+
+    def list_params(self, page, kw=''):
+        q = {'type_id': 2, 'offset': (max(1, page) - 1) * self.PAGE_SIZE,
+             'limit': self.PAGE_SIZE, 'vod_name': '', 'vod_area': '',
+             'vod_year': '', 'orderby': '', 'vod_class': '', 'vod_lang': '',
+             'vod_version': '', 'vod_state': '', 'vod_weekday': '',
+             'vod_letter': '', 'vod_tag': '', 'user_id': ''}
+        if kw:
+            q['vod_name'] = str(kw).strip()
+            q.pop('type_id', None)   # 搜索时带 type_id（哪怕空串）会返回 total=0
+        return q
+
+    # ---------- 备用主源（xifanacg 的 Supabase API 挂掉时顶上） ----------
+    # 实测该 API 的 /Vod/get_list 支持 type_id + offset 翻页 + orderby 排序，
+    # type_id=2 日漫 3147 条、type_id=3 欧美 38 条，orderby 可选 ''/hits/score。
+    CATS = [
+        {'type_id': 'gg_new', 'type_name': '日漫·最新'},
+        {'type_id': 'gg_hot', 'type_name': '日漫·热门'},
+        {'type_id': 'gg_score', 'type_name': '日漫·高分'},
+        {'type_id': 'gg_us', 'type_name': '欧美动漫'},
+    ]
+    CAT_RULE = {'gg_new': (2, ''), 'gg_hot': (2, 'hits'),
+                'gg_score': (2, 'score'), 'gg_us': (3, '')}
+
+    def _q(self, tid, pg):
+        type_id, orderby = self.CAT_RULE.get(str(tid or 'gg_new').strip(), (2, ''))
+        page = int(pg) if str(pg or '').isdigit() and int(pg) > 0 else 1
+        return {'type_id': type_id, 'offset': (page - 1) * self.PAGE_SIZE,
+                'limit': self.PAGE_SIZE, 'vod_name': '', 'vod_area': '',
+                'vod_year': '', 'orderby': orderby, 'vod_class': '',
+                'vod_lang': '', 'vod_version': '', 'vod_state': '',
+                'vod_weekday': '', 'vod_letter': '', 'vod_tag': '', 'user_id': ''}
+
+    def _rows(self, q, ttl=0):
+        d = self.call('/Vod/get_list', q, ttl=ttl)
+        info = d.get('info') if isinstance(d.get('info'), dict) else {}
+        rows = info.get('rows') if isinstance(info.get('rows'), list) else []
+        try:
+            total = int(info.get('total') or 0)
+        except Exception:
+            total = 0
+        return rows, total
+
+    def homeContent(self, filter=False):
+        classes = [{'type_id': c['type_id'], 'type_name': c['type_name']}
+                   for c in self.CATS]
+        filters = {}
+        for c in self.CATS:
+            filters[c['type_id']] = [{
+                'key': 'orderby', 'name': '排序',
+                'value': [{'n': '默认', 'v': ''}, {'n': '最热', 'v': 'hits'},
+                          {'n': '评分', 'v': 'score'}]}]
+        return {'class': classes, 'filters': filters}
+
+    def homeVideoContent(self):
+        rows, _ = self._rows(self._q('gg_new', 1), ttl=120)
+        return {'list': self.vod_list(rows)[:30]}
+
+    def categoryContent(self, tid, pg, filter, extend):
+        page = int(pg) if str(pg or '').isdigit() and int(pg) > 0 else 1
+        q = self._q(tid, page)
+        if isinstance(extend, dict) and extend.get('orderby') not in (None, ''):
+            q['orderby'] = str(extend['orderby'])
+        rows, total = self._rows(q)
+        items = self.vod_list(rows)
+        pagecount = (max(1, (total + self.PAGE_SIZE - 1) // self.PAGE_SIZE)
+                     if total else page)
+        return {'list': items, 'total': total or len(items),
+                'page': page, 'pagecount': pagecount}
+
+    def searchContent(self, key, quick, pg='1'):
+        page = int(pg) if str(pg or '').isdigit() and int(pg) > 0 else 1
+        items = self.search(key, page)
+        return {'list': items, 'total': len(items), 'page': page,
+                'pagecount': page}
+
+    def detail(self, vid):
+        """→ (vod, 线路列表)。vod_id 带 'g:' 前缀，门面据此区分来源、避免与 xf 的 id 撞车。"""
+        vid = str(vid or '').strip()
+        d = self.call('/Vod/get_detail', {'vod_id': vid}, ttl=180)
+        info = d.get('info') if isinstance(d.get('info'), dict) else {}
+        vod = self.vod(info) if info else None
+        if not vod:
+            vod = {'vod_id': vid, 'vod_name': vid, 'vod_pic': '', 'vod_remarks': ''}
+        vod['vod_id'] = 'g:' + vid
+        return vod, self.lines(vid)
+
+    def search(self, kw, page=1):
+        d = self.call('/Vod/get_list', self.list_params(page, kw), ttl=30)
+        info = d.get('info') if isinstance(d.get('info'), dict) else {}
+        rows = info.get('rows') if isinstance(info.get('rows'), list) else []
+        return self.vod_list(rows)
+
+    def match_lines(self, title):
+        pick = search_best(self, title)
+        if not pick:
+            return []
+        return self.lines(str(pick.get('vod_id')))
+
+    def lines(self, vid):
+        d = self.call('/Vod/get_detail', {'vod_id': vid}, ttl=180)
+        info = d.get('info') if isinstance(d.get('info'), dict) else {}
+        froms = str(info.get('vod_play_from') or '').split('$$$')
+        segs = str(info.get('vod_play_url') or '').split('$$$')
+        out, used = [], {}
+        for i, seg in enumerate(segs):
+            code = froms[i] if i < len(froms) else ''
+            base = (self.LINE_NAME.get(str(code or '').strip().lower())
+                    or xf_clean_name(code) or '线路')
+            name = base
+            if name in used:
+                used[name] += 1
+                name = '%s·%d' % (base, used[name])
+            else:
+                used[name] = 1
+            items = []
+            for j, part in enumerate(seg.split('#')):
+                part = part.strip()
+                if not part:
+                    continue
+                if '$' in part:
+                    t, u = part.split('$', 1)
+                else:
+                    t, u = '', part
+                u = u.strip()
+                if not u or not is_video(u):
+                    continue
+                items.append((ep_label(t, j), name, u))
+            if items:
+                out.append({'name': name, 'eps': as_lines(items)})
+            if len(out) >= self.MAX_LINES:
+                break
+        return out
+
+    def play(self, flag, pid):
+        res = {'parse': 0, 'jx': 0, 'url': '', 'header': play_header(self.host)}
+        raw = str(pid or '').strip()
+        if not raw:
+            return res
+        if raw.startswith('page:'):
+            page = raw[5:]
+            return {'parse': 1, 'jx': 1, 'url': page,
+                    'header': play_header(self.host, page)}
+        if raw.startswith('http') or raw.startswith('//'):
+            u = ('https:' + raw) if raw.startswith('//') else raw
+            if is_video(u):
+                res['url'] = enc_url(u)
+            elif is_ext_link(u):
+                res.update({'parse': 1, 'jx': 1, 'url': u,
+                            'header': play_header(self.host, u)})
+            else:
+                res['url'] = u
+            return res
+        if raw.isdigit():
+            d = self.call('/Vod/get_detail', {'vod_id': raw}, ttl=180)
+            info = d.get('info') if isinstance(d.get('info'), dict) else {}
+            for seg in str(info.get('vod_play_url') or '').split('$$$'):
+                for part in seg.split('#'):
+                    if '$' in part:
+                        u = part.split('$', 1)[1].strip()
+                        if is_video(u):
+                            res['url'] = enc_url(u)
+                            return res
+        return res
+
+
+# ==================== 源 3：次元城动画（REST API，播放需登录） ====================
+class CycaniSpider(object):
+    TAG = 'cy'
+    HOST = 'https://www.cycani.org'
+    PAGE_SIZE = 18
+    MAX_LINES = 3
+    APP_NAME = 'cyc_web'
+    APP_VERSION = 'cycweb'
+    TIME_ZONE = 'Asia/Shanghai'
+
+    def __init__(self, cfg=None):
+        cfg = cfg or {}
+        self.host = str(cfg.get('cyc_host') or self.HOST).rstrip('/')
+        self.api = str(cfg.get('cyc_api') or (self.host + '/api')).rstrip('/')
+        try:
+            self.timeout = float(cfg.get('timeout') or 8)
+        except Exception:
+            self.timeout = 8.0
+        self.username = str(cfg.get('cyc_username') or '').strip()
+        self.password = str(cfg.get('cyc_password') or '').strip()
+        # 旧脚本里硬编码的 Token 已于 2026-11-04 过期且无法 refresh，此处不再内置
+        self.token = self._norm(str(cfg.get('cyc_token') or '').strip())
+        if not self.token:
+            self.token = self._load_auth()
+
+    # ---- Token ----
+    def _auth_path(self):
+        try:
+            return os.path.join(tempfile.gettempdir(), '.cyc_auth.json')
+        except Exception:
+            return ''
+
+    def _load_auth(self):
+        try:
+            p = self._auth_path()
+            if p and os.path.isfile(p):
+                with open(p, 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+                return self._norm(str(d.get('token') or ''))
+        except Exception:
+            pass
+        return ''
+
+    def _save_auth(self):
+        try:
+            p = self._auth_path()
+            if p and self.token:
+                with open(p, 'w', encoding='utf-8') as f:
+                    json.dump({'token': self.token, 'username': self.username},
+                              f, ensure_ascii=False)
+        except Exception:
+            pass
+
+    @staticmethod
+    def _norm(t):
+        s = str(t or '').strip()
+        if s.lower().startswith('bearer '):
+            s = s[7:].strip()
+        return s
+
+    @staticmethod
+    def _jwt_exp(tok):
+        try:
+            p = str(tok or '').split('.')[1]
+            p += '=' * ((4 - len(p) % 4) % 4)
+            d = json.loads(base64.urlsafe_b64decode(p.encode('ascii')).decode('utf-8', 'ignore'))
+            return float(d.get('exp') or 0)
+        except Exception:
+            return 0
+
+    def _token_ok(self):
+        if not self.token:
+            return False
+        exp = self._jwt_exp(self.token)
+        return not (exp and exp < time.time() + 60)
+
+    def logged_in(self):
+        return self._token_ok()
+
+    def _take_token(self, j):
+        d = j.get('data') if isinstance(j, dict) else None
+        if isinstance(d, dict):
+            return self._norm(str(d.get('token') or ''))
+        return self._norm(str((j or {}).get('token') or '')) if isinstance(j, dict) else ''
+
+    def _login(self):
+        if not self.username or not self.password:
+            return False
+        try:
+            st, txt = request_ex(
+                self.api + '/auth/login', 'POST',
+                body={'username': self.username, 'password': self.password},
+                headers=self.hdr(), timeout=self.timeout)
+            tok = self._take_token(xf_loads(txt))
+            if tok:
+                self.token = tok
+                self._save_auth()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _refresh(self):
+        if not self.token:
+            return False
+        try:
+            st, txt = request_ex(self.api + '/auth/refresh', 'POST', body={},
+                                 headers=self.hdr(auth=True), timeout=self.timeout)
+            tok = self._take_token(xf_loads(txt))
+            if tok:
+                self.token = tok
+                self._save_auth()
+                return True
+        except Exception:
+            pass
+        return False
+
+    def _ensure_token(self):
+        if self._token_ok():
+            exp = self._jwt_exp(self.token)
+            if exp and exp - time.time() < 259200:
+                self._refresh()
+            return True
+        if self.token and self._refresh():
+            return True
+        return self._login()
+
+    # ---- HTTP / API ----
+    def hdr(self, auth=False, ref=None):
+        h = {'User-Agent': XF_UA, 'Accept': 'application/json',
+             'X-App-Name': self.APP_NAME, 'X-App-Version': self.APP_VERSION,
+             'X-Time-Zone': self.TIME_ZONE,
+             'Referer': ref or (self.host + '/'), 'Origin': self.host,
+             'Accept-Encoding': 'gzip, deflate'}
+        if auth and self.token:
+            h['Authorization'] = 'Bearer ' + self.token
+        return h
+
+    def call(self, path, params=None, auth=False, ttl=0):
+        url = self.api + path
+        if params:
+            url += ('&' if '?' in url else '?') + urllib.parse.urlencode(params)
+        st, txt = request_ex(url, 'GET', headers=self.hdr(auth),
+                             timeout=self.timeout, ttl=ttl)
+        if auth and st == 401 and self._ensure_token():
+            st, txt = request_ex(url, 'GET', headers=self.hdr(auth),
+                                 timeout=self.timeout)
+        j = xf_loads(txt)
+        if isinstance(j, dict) and 'data' in j:
+            d = j.get('data')
+            return d if isinstance(d, dict) else {}
+        return j if isinstance(j, dict) else {}
+
+    def card(self, it):
+        try:
+            if not isinstance(it, dict):
+                return None
+            vid = it.get('video_id') or it.get('id')
+            if vid in (None, ''):
+                return None
+            remark = str(it.get('remarks') or '')
+            if not remark:
+                total = it.get('total')
+                if isinstance(total, int) and total > 1:
+                    remark = ('全%d集' % total) if it.get('completed') else ('更新至%d集' % total)
+            return {'vod_id': str(vid),
+                    'vod_name': str(it.get('title') or ''),
+                    'vod_pic': str(it.get('cover_url') or ''),
+                    'vod_remarks': remark}
+        except Exception:
+            return None
+
+    def card_list(self, arr):
+        out = []
+        for it in arr or []:
+            v = self.card(it)
+            if v:
+                out.append(v)
+        return out
+
+    def search(self, kw):
+        d = self.call('/videos/search',
+                     {'q': str(kw), 'page': 1, 'page_size': self.PAGE_SIZE}, ttl=30)
+        items = d.get('list') if isinstance(d, dict) else []
+        return self.card_list(items if isinstance(items, list) else [])
+
+    def sections(self, vid, code):
+        out, seen = [], set()
+        base = '/videos/%s/sections' % urllib.parse.quote(str(vid), safe='')
+        for page in range(1, 6):
+            d = self.call(base, {'player_code': code, 'page': page, 'page_size': 100},
+                         ttl=180)
+            arr = d.get('list') if isinstance(d, dict) else []
+            if not isinstance(arr, list) or not arr:
+                break
+            added = 0
+            for s in arr:
+                if not isinstance(s, dict):
+                    continue
+                sid = str(s.get('id') or '')
+                if not sid or sid in seen:
+                    continue
+                seen.add(sid)
+                out.append({'id': sid, 'title': str(s.get('title') or '')})
+                added += 1
+            if added == 0 or len(arr) < 100:
+                break
+        return out
+
+    def match_lines(self, title):
+        pick = search_best(self, title)
+        if not pick:
+            return []
+        return self.lines(str(pick.get('vod_id')))
+
+    def lines(self, vid):
+        d = self.call('/videos/%s' % urllib.parse.quote(str(vid), safe=''), ttl=120)
+        srcs = d.get('play_from') if isinstance(d.get('play_from'), list) else []
+        if not srcs:
+            srcs = [{'code': 'cychub', 'title': '默认线路'}]
+        out = []
+        for s in srcs[:self.MAX_LINES]:
+            if not isinstance(s, dict):
+                continue
+            code = str(s.get('code') or '')
+            if not code:
+                continue
+            name = xf_clean_name(s.get('title') or code) or code
+            items = []
+            for i, sec in enumerate(self.sections(vid, code)):
+                t = xf_clean_name(sec.get('title')) or ('第%d集' % (i + 1))
+                items.append((t, name, sec['id']))
+            if items:
+                out.append({'name': name, 'eps': as_lines(items)})
+        return out
+
+    def play(self, flag, pid):
+        res = {'parse': 0, 'jx': 0, 'url': '', 'header': play_header(self.host)}
+        raw = str(pid or '').strip()
+        if not raw:
+            return res
+        if raw.startswith('http') or raw.startswith('//'):
+            u = ('https:' + raw) if raw.startswith('//') else raw
+            res['url'] = enc_url(u) if is_video(u) else u
+            return res
+        d = self.call('/v2/sections/%s/play-url' %
+                     urllib.parse.quote(raw, safe=''), auth=True)
+        u = str((d or {}).get('url') or '') if isinstance(d, dict) else ''
+        if not u:
+            return res
+        if u.startswith('//'):
+            u = 'https:' + u
+        if is_ext_link(u):
+            res.update({'parse': 1, 'jx': 1, 'url': u,
+                        'header': play_header(self.host, u)})
+        else:
+            res['url'] = enc_url(u)
+        return res
+
+
+# ==================== 源 4：OmoFun（HTML + 聚合取流接口） ====================
+class OmoFunSpider(object):
+    TAG = 'om'
+    HOSTS = ['https://omofun.in', 'https://omofun2.com']
+    MAX_LINES = 4
+
+    def __init__(self, cfg=None):
+        cfg = cfg or {}
+        self.host = str(cfg.get('omo_host') or self.HOSTS[0]).rstrip('/')
+        try:
+            self.timeout = float(cfg.get('timeout') or 7)
+        except Exception:
+            self.timeout = 7.0
+        self._dead = {}
+
+    def hdr(self, ref=None):
+        return {'User-Agent': XF_UA,
+                'Accept': 'text/html,application/xhtml+xml,application/json, text/javascript, */*; q=0.01',
+                'Accept-Language': 'zh-CN,zh;q=0.9',
+                'Referer': ref or (self.host + '/'),
+                'x-platform': 'web',
+                'x-requested-with': 'XMLHttpRequest',
+                'Accept-Encoding': 'gzip, deflate'}
+
+    def get(self, path, ttl=0, valid=None):
+        key = 'omo:' + path
+        if ttl:
+            hit = xf_cache_get(key)
+            if hit is not None:
+                return hit
+        hosts = [self.host] + [h for h in self.HOSTS if h != self.host]
+        for h in hosts:
+            if self._dead.get(h, 0) > time.time():
+                continue
+            st, txt = request_ex(h + path, 'GET', headers=self.hdr(h + '/'),
+                                 timeout=self.timeout)
+            if st and 200 <= st < 300 and txt and (not valid or valid in txt):
+                self._dead.pop(h, None)
+                if ttl:
+                    xf_cache_put(key, txt, ttl)
+                return txt
+            self._dead[h] = time.time() + 60
+        return ''
+
+    def _abs(self, u):
+        if not u:
+            return ''
+        if str(u).startswith('http'):
+            return u
+        return self.host + str(u)
+
+    def parse_items(self, html):
+        out = []
+        try:
+            blocks = re.findall(
+                r'<a href="(/vod/detail/([0-9]+)\.html)"[^>]*title="([^"]*)"[^>]*class="[^"]*module-poster-item[^"]*"[^>]*>(.*?)(?=<a href="/vod/detail/|</div>\s*<div class="module-main|<div class="module-foot|$)',
+                html, re.S)
+            for href, vid, title, blk in blocks:
+                if not title:
+                    m = re.search(r'module-poster-item-title">\s*([^<]+)', blk)
+                    title = m.group(1).strip() if m else ''
+                m = re.search(r'module-item-note">\s*([^<]*)', blk)
+                note = m.group(1).strip() if m else ''
+                m = re.search(r'data-original="([^"]+)"', blk)
+                pic = m.group(1) if m else ''
+                out.append({'vod_id': vid, 'vod_name': title.strip(),
+                            'vod_pic': self._abs(pic), 'vod_remarks': note})
+        except Exception:
+            pass
+        if not out:
+            try:
+                blocks = re.findall(
+                    r'<div class="module-card-item module-item">(.*?)(?=<div class="module-card-item module-item">|$)',
+                    html, re.S)
+                for blk in blocks:
+                    m = re.search(r'href="/vod/detail/([0-9]+)\.html"', blk)
+                    if not m:
+                        continue
+                    m2 = re.search(r'module-card-item-title">\s*<a[^>]*>\s*<strong>([^<]+)</strong>', blk)
+                    title = m2.group(1).strip() if m2 else ''
+                    m3 = re.search(r'data-original="([^"]+)"', blk)
+                    pic = m3.group(1) if m3 else ''
+                    m4 = re.search(r'module-item-note">\s*([^<]*)', blk)
+                    note = m4.group(1).strip() if m4 else ''
+                    out.append({'vod_id': m.group(1), 'vod_name': title,
+                                'vod_pic': self._abs(pic), 'vod_remarks': note})
+            except Exception:
+                pass
+        return out
+
+    def dyn(self, vid, ep):
+        e = str(ep or '').strip()
+        if not e.startswith('ep'):
+            e = 'ep' + e
+        return xf_loads(self.get('/_dyn_plays/%s/%s' % (vid, e), ttl=180))
+
+    def search(self, kw):
+        path = '/vod/search.html?wd=%s&page=1' % urllib.parse.quote(str(kw))
+        return self.parse_items(self.get(path, ttl=30, valid='/vod/'))
+
+    def match_lines(self, title):
+        pick = search_best(self, title)
+        if not pick:
+            return []
+        return self.lines(str(pick.get('vod_id')))
+
+    def lines(self, vid):
+        html = self.get('/vod/detail/%s.html' % vid, ttl=180, valid='/vod/')
+        if not html:
+            return []
+        eps = re.findall(
+            r'<a class="module-play-list-link" href="/vod/play/([0-9]+)/ep([0-9]+)\.html"[^>]*>\s*<span>([^<]+)</span>',
+            html)
+        if not eps:
+            eps = [(v, e, t) for v, e, t in re.findall(
+                r'href="/vod/play/([0-9]+)/ep([0-9]+)\.html"[^>]*>\s*(?:<span>)?([^<]+)', html)]
+        seen, ep_list = set(), []
+        for v, e, t in eps:
+            k = (v, e)
+            if k in seen:
+                continue
+            seen.add(k)
+            ep_list.append((v, e, xf_clean_name(t) or '正片'))
+        if not ep_list:
+            ep_list = [(vid, '1', 'HD')]
+
+        plays = self.dyn(vid, ep_list[0][1]).get('video_plays') or []
+        sites = []
+        for p in plays:
+            if not isinstance(p, dict):
+                continue
+            u = p.get('play_data') or ''
+            if u and is_video(u):
+                s = xf_clean_name(p.get('src_site') or '线路')
+                if s and s not in sites:
+                    sites.append(s)
+        sites = sorted(sites)[:self.MAX_LINES] or ['OmoFun解析']
+        out = []
+        for s in sites:
+            items = [(t, s, '%s/ep%s' % (v, e)) for v, e, t in ep_list]
+            out.append({'name': s, 'eps': as_lines(items)})
+        return out
+
+    def play(self, flag, pid):
+        res = {'parse': 0, 'jx': 0, 'url': '', 'header': play_header(self.host)}
+        raw = str(pid or '').strip().replace('!parse', '')
+        if not raw:
+            return res
+        parts = raw.split('/')
+        if len(parts) == 2:
+            vid, ep = parts
+        elif len(parts) >= 3:
+            vid, ep = parts[-2], parts[-1]
+        else:
+            return res
+        plays = self.dyn(vid, ep).get('video_plays') or []
+        cands = []
+        for p in plays:
+            if isinstance(p, dict) and p.get('play_data'):
+                cands.append((xf_clean_name(p.get('src_site') or ''), p.get('play_data')))
+        pick = ''
+        for s, u in cands:
+            if s == flag and is_video(u):
+                pick = u
+                break
+        if not pick:
+            for s, u in cands:
+                if is_video(u):
+                    pick = u
+                    break
+        if not pick and cands:
+            pick = cands[0][1]
+        if pick and is_video(pick):
+            res['url'] = enc_url(pick)
+        else:
+            res['parse'] = 1
+            res['jx'] = 1
+            res['url'] = pick or (self.host + '/vod/play/' + raw + '.html')
+        return res
+
+
+# ==================== 门面：TVBox 协议入口 ====================
+class XifanAggSpider(_SpiderBase):
+    """首页/分类/搜索 = 稀饭动漫；详情页 = 四源线路聚合。
+
+    线路顺序（用户 2026-11-04 指定）：xf > gg > cy > om。
+    TVBox 默认播放第一条线路，因此该顺序同时是默认选线顺序。
+    """
+
+    LINE_ORDER = ('xf', 'gg', 'cy', 'om')      # 稀饭 → GiriGiri → 次元城 → OmoFun
+    LABELS = {'xf': '稀饭', 'gg': 'GiriGiri', 'cy': '次元城', 'om': 'OmoFun'}
+    MAX_LINES_PER_SRC = 4
+    CACHE_TTL = 300
+
+    # 类级兜底：有些壳只调 init() 不调 __init__()
+    order = list(LINE_ORDER)
+    detail_budget = 7.0
+    sources = {}
+    xf = None
+    cy = None
+    cfg = {}
+
+    def __init__(self):
+        self.cfg = {}
+        self.order = list(self.LINE_ORDER)
+        self.detail_budget = 7.0
+        self._build({})
+
+    def _build(self, cfg):
+        self.xf = XifanSpider(cfg)
+        self.cy = CycaniSpider(cfg)
+        self.sources = {
+            'xf': self.xf,
+            'gg': GirigiriSpider(cfg),
+            'cy': self.cy,
+            'om': OmoFunSpider(cfg),
+        }
+
+    def _x(self):
+        if self.xf is None:
+            self._build({})
+        return self.xf
+
+    def init(self, extend=''):
+        cfg = {}
+        try:
+            if isinstance(extend, dict):
+                cfg = dict(extend)
+            elif isinstance(extend, str) and extend.strip().startswith('{'):
+                cfg = json.loads(extend)
+        except Exception:
+            cfg = {}
+        if not isinstance(cfg, dict):
+            cfg = {}
+        self.cfg = cfg
+        self._build(cfg)
+        order = cfg.get('lines')
+        if isinstance(order, (list, tuple)) and order:
+            picked = [str(t).strip() for t in order
+                      if str(t).strip() in self.sources]
+            self.order = picked or list(self.LINE_ORDER)
+        else:
+            self.order = list(self.LINE_ORDER)
+        try:
+            self.detail_budget = max(2.0, min(20.0,
+                                              float(cfg.get('detail_budget') or 7)))
+        except Exception:
+            self.detail_budget = 7.0
+        self._probe()
+        return None
+
+    def _probe(self):
+        """后台探活 xifan：它的 API 会整站超时，不能在首页路径上白等。
+
+        探活完成前先按「不可用」处理（首页直接走 GiriGiri，约 0.8s 出内容），
+        探到通了再切回 xifan 的 17 个分类。
+        """
+        xf = self._x()
+        if xf is None:
+            return
+        try:
+            xf.alive = False
+            xf._cool = time.time() + 4.0      # 探活期间别被 health() 提前放行
+        except Exception:
+            return
+
+        def run():
+            try:
+                st, _ = request_ex(xf.api + '/rest/v1/', 'GET',
+                                   headers=xf.hdr(), timeout=3)
+                xf._mark(bool(st and st < 500))
+            except Exception:
+                pass
+
+        if threading:
+            try:
+                th = threading.Thread(target=run)
+                th.daemon = True
+                th.start()
+                return
+            except Exception:
+                pass
+        run()          # 没有 threading 时同步探一次（上限 3s）
+
+    def getName(self):
+        return '稀饭聚合'
+
+    def destroy(self):
+        pool_clear()
+        return None
+
+    def isVideoFormat(self, url):
+        return is_video(url)
+
+    def manualVideoCheck(self):
+        return False
+
+    # ---------- 首页数据：主源优先 xifan，其 API 挂了自动切 GiriGiri ----------
+    def _main(self):
+        xf = self._x()
+        if xf is not None:
+            if getattr(xf, 'alive', True):
+                return xf, 'xf'
+            # 冷却到期不再当场重试（那会把首页卡住 4s），改用后台探活，
+            # 这次仍走 gg，探通了下一轮请求自动切回来
+            if time.time() > getattr(xf, '_cool', 0):
+                self._probe()
+        return self.sources.get('gg') or xf, 'gg'
+
+    def _alive(self, tag):
+        """该源当前是否值得发请求（主要是 xifan 会整站超时）。"""
+        if tag == 'xf':
+            try:
+                return bool(self._x() and getattr(self._x(), 'alive', True))
+            except Exception:
+                return False
+        return tag in self.sources
+
+    def _tagged(self, res, tag):
+        """主源为 gg 时给列表 id 打 'g:' 前缀，详情页才能知道该回哪个源取数据。"""
+        if tag != 'gg' or not isinstance(res, dict):
+            return res
+        for it in (res.get('list') or []):
+            try:
+                vid = str(it.get('vod_id') or '')
+                if vid and not vid.startswith('g:'):
+                    it['vod_id'] = 'g:' + vid
+            except Exception:
+                pass
+        return res
+
+    def homeContent(self, filter):
+        src, tag = self._main()
+        return src.homeContent(filter)
+
+    def homeVideoContent(self):
+        src, tag = self._main()
+        return self._tagged(src.homeVideoContent(), tag)
+
+    def categoryContent(self, tid, pg, filter, extend):
+        src, tag = self._main()
+        return self._tagged(src.categoryContent(tid, pg, filter, extend), tag)
+
+    def searchContent(self, key, quick, pg='1'):
+        src, tag = self._main()
+        return self._tagged(src.searchContent(key, quick, pg), tag)
+
+    # ---------- 详情：主源取基础信息 + 四源线路聚合 ----------
+    def detailContent(self, ids):
+        try:
+            raw = str(ids[0] if isinstance(ids, (list, tuple)) and ids else (ids or ''))
+            raw = raw.strip()
+            # 'g:' 前缀 = 来自 GiriGiri（备用主源）；纯数字 = 来自 xifan。
+            # 两个站点的 id 空间互不相通，必须靠前缀区分，否则会串片。
+            by_gg = raw.startswith('g:')
+            aid = re.sub(r'[^0-9]', '', raw)
+            if not aid:
+                return {'list': []}
+
+            ck = 'agg3:%s:%s:%s' % ('g' if by_gg else 'x', aid, ','.join(self.order))
+            hit = xf_cache_get(ck)
+            if hit is not None:
+                try:
+                    return json.loads(hit)
+                except Exception:
+                    pass
+
+            if by_gg:
+                main_tag = 'gg'
+                vod, main_lines = self.sources['gg'].detail(aid)
+            else:
+                if not self._alive('xf'):
+                    # xifan 的 API 整站超时中：历史收藏的纯数字 id 已无从解析，
+                    # 直接返回空，别让详情页卡几十秒
+                    return {'list': []}
+                main_tag = 'xf'
+                vod, main_lines = self._x().detail(aid)
+                if not main_lines:
+                    # 瞬时抖动（CDN 换节点 / 秒断）时重试一次；失败响应不进缓存，
+                    # 因此第二次是真实重发，不会把等待翻倍到不可接受
+                    time.sleep(0.2)
+                    vod, main_lines = self._x().detail(aid)
+            title = str(vod.get('vod_name') or '')
+
+            # 其余三源并发按标题匹配；慢源超时即跳过，不拖累整体
+            boxes = {}
+            ths = []
+            for tag in self.order:
+                if tag == main_tag or not self._alive(tag):
+                    continue
+                src = self.sources.get(tag)
+                if not src:
+                    continue
+
+                def work(t=tag, s=src, w=title):
+                    try:
+                        boxes[t] = s.match_lines(w)
+                    except Exception:
+                        boxes[t] = []
+
+                if threading:
+                    try:
+                        th = threading.Thread(target=work)
+                        th.daemon = True
+                        th.start()
+                        ths.append(th)
+                    except Exception:
+                        work()
+                else:
+                    work()
+            deadline = time.time() + self.detail_budget
+            for th in ths:
+                try:
+                    th.join(max(0.05, deadline - time.time()))
+                except Exception:
+                    pass
+
+            cy_need_login = ('cy' in self.order and self.cy is not None
+                             and not self.cy.logged_in())
+            froms, urls, used, tail = [], [], {}, []
+            for tag in self.order:
+                lines = main_lines if tag == main_tag else (boxes.get(tag) or [])
+                label = self.LABELS.get(tag, tag)
+                for line in (lines or [])[:self.MAX_LINES_PER_SRC]:
+                    if not isinstance(line, dict):
+                        continue
+                    raw_name = str(line.get('name') or '线路')
+                    base = xf_clean_name(label + '·' + raw_name) or label
+                    if tag == 'cy' and cy_need_login:
+                        base += '(需登录)'
+                    name = base
+                    if name in used:
+                        used[name] += 1
+                        name = '%s·%d' % (base, used[name])
+                    else:
+                        used[name] = 1
+                    segs = []
+                    for ep in as_lines(line.get('eps')):
+                        code = enc_pid(tag, ep[1], ep[2])
+                        if code:
+                            segs.append('%s$%s' % (ep[0] or '正片', code))
+                    if not segs:
+                        continue
+                    # 需要壳嗅探的「网页解析」兜底线路统一排到最后
+                    if '网页解析' in raw_name:
+                        tail.append((name, '#'.join(segs)))
+                    else:
+                        froms.append(name)
+                        urls.append('#'.join(segs))
+            for name, joined in tail:
+                froms.append(name)
+                urls.append(joined)
+
+            vod['vod_play_from'] = '$$$'.join(froms)
+            vod['vod_play_url'] = '$$$'.join(urls)
+
+            if cy_need_login:
+                if self.cy.username and self.cy.password:
+                    tip = '[次元城] 已配置账号，播放时将自动登录。'
+                else:
+                    tip = ('[次元城线路需登录] 请在源配置 extend 填 cyc_username / '
+                           'cyc_password，或填浏览器复制的 cyc_token。')
+                vod['vod_content'] = (
+                    str(vod.get('vod_content') or '') + NL + NL + tip).strip()
+
+            result = {'list': [vod]}
+            # 只缓存序列化文本：避免把同一个可变 dict 交给壳后被改写污染缓存
+            try:
+                xf_cache_put(ck, json.dumps(result, ensure_ascii=False), self.CACHE_TTL)
+            except Exception:
+                pass
+            return result
+        except Exception as e:
+            global _LAST_ERR
+            try:
+                _LAST_ERR = '%s: %s' % (type(e).__name__, str(e)[:200])
+            except Exception:
+                pass
+            return {'list': []}
+
+    # ---------- 播放：按线路 tag 派发回原源 ----------
+    def playerContent(self, flag, id, vipFlags):
+        res = {'parse': 0, 'jx': 0, 'url': '',
+               'header': play_header(self._x().host)}
+        try:
+            raw = str(id or '').strip()
+            if not raw:
+                return res
+            low = raw.upper()
+            if '%7C' in low or '%24' in low or '%3A' in low:
+                try:
+                    raw = urllib.parse.unquote(raw)
+                except Exception:
+                    pass
+            tag, inner_flag, pid = dec_pid(raw)
+            src = self.sources.get(tag) if tag else None
+            if src and pid:
+                return src.play(inner_flag or flag, pid)
+            if raw.startswith('http') or raw.startswith('playpage:') or raw.startswith('page:'):
+                return self._x().play(flag, raw)
+        except Exception:
+            pass
+        return res
+
+    def localProxy(self, param):
+        """m3u8 相对分片改写（四源通用）"""
+        try:
+            url = ''
+            if isinstance(param, dict):
+                url = str(param.get('url') or param.get('u') or '')
+            elif isinstance(param, str):
+                p = param.strip()
+                if p.startswith('http'):
+                    url = p
+                else:
+                    qs = urllib.parse.parse_qs(urllib.parse.urlsplit(p).query)
+                    url = str((qs.get('url') or qs.get('u') or [''])[0])
+            if not url:
+                return None
+            st, txt = request_ex(
+                url, 'GET',
+                headers={'User-Agent': XF_UA, 'Accept': '*/*',
+                         'Referer': self._x().host + '/'}, timeout=8)
+            if not txt or '#EXTM3U' not in txt:
+                return None
+            base = url.rsplit('/', 1)[0] + '/'
+            out = []
+            for line in txt.splitlines():
+                s = line.strip()
+                if not s:
+                    out.append('')
+                elif s.startswith('#'):
+                    m = re.search(r'URI="([^"]+)"', s)
+                    if m:
+                        s = s.replace(m.group(1), abs_url(base, m.group(1)))
+                    out.append(s)
+                else:
+                    out.append(abs_url(base, s))
+            return [200, 'application/vnd.apple.mpegurl', NL.join(out)]
+        except Exception:
+            return None
+
+
+# ======================================================================
+# 模块：xj
+# ======================================================================
+# coding=utf-8
+# ================== 影视·正经·小鸡看看 · TVBox ==================
+# 🏷️ 源头：软件 小鸡看看 App(com.xmoebr.bdx v1.0.5) / TV版(com.kankan.tv) 接口 https://xjggg.top/api.php/app
+# 👤 作者：无聊  |  📅 2026-10-28
+# 🏷️ 平台：TVBox / 影视仓  ·  csp_Spider
+# 🔍 站型：Expo/RN 壳 App + PHP API，全接口强制五头签名(x-aid/x-ave/x-time/x-nonc/x-sign)
+# 🎬 关键：签名 = SHA256(finger&id&nonce&sk&time&v)，sk 与证书指纹从 TV 版 APK 逆向得出
+#        http://... 播放令牌(加密) → /app/decode/url 换真直链
+# 📦 内容：视频（电影/剧集/动漫/综艺，多线路 7 条）
+# ==========================================================
+import sys
+import json
+import time
+import random
+import hashlib
+import base64
+import re
+import ssl
+import gzip
+import http.client as xj_http
+import urllib.parse
+
+sys.path.append('..')
+
+# ---------------- 签名材料（逆向 libsecurity-bridge.so / TV 版 dex 得出）----------------
+APP_ID = "com.kankan.tv"
+APP_VER = "105"
+SK = "SK-sk_13oXDZ7u9j2Tk1c0cawWVFfO"
+FINGER = "SF-F5F11CB15897115AE6BCFE063C288F730CA865588F572C780A3E8477D0DD3776"
+# ---------------- 设备号池（★无限解析的核心★）----------------
+# decode/url 是「每设备每日 N 次」的配额制（实测：单枚设备连解 60 次仍未到顶；
+# 但一枚设备被榨干后当日恒返回 code 429 "今日解析次数已用完，请明天00:00后再试"）。
+# 服务端只认 x-device-id 头，不校验设备唯一性 / 不与账号绑定 → 换一枚 UUID4 立刻恢复。
+# 几千人共用一份源 = 几千台「同一设备」，一枚设备几小时就被榨干 → 必须池化 + 轮转：
+#   · POOL_SIZE 枚设备轮转使用，压力摊开，单枚寿命 × POOL_SIZE
+#   · 429 立即拉黑该枚、换下一枚，永不中断
+#   · 设备号落盘到 hiker 数据目录，跨重启复用（避免重启把好设备全丢掉）
+import uuid as _uuid
+import threading as _th
+
+POOL_SIZE = 12          # 同时轮转的设备数（越大越抗压，但要平衡风控观感）
+_DEV_LOCK = _th.Lock()
+_DEV_POOL = []          # 可用设备号列表
+_DEV_IDX = 0            # 轮转游标
+_DEV_BAD = {}           # device -> 失效日期，跨天自动解封
+_DEV_DAY = time.strftime("%Y-%m-%d")
+_DEV_CACHE = "xjk_dev_pool.json"
+
+
+def _new_device():
+    return "uuid-" + str(_uuid.uuid4())
+
+
+def _dev_newday():
+    global _DEV_DAY
+    d = time.strftime("%Y-%m-%d")
+    if d != _DEV_DAY:
+        _DEV_DAY = d
+        _DEV_BAD.clear()
+
+
+def _dev_save():
+    """设备池落盘（壳环境可能无写权限，失败静默）。"""
+    try:
+        open(_DEV_CACHE, "w").write(json.dumps({
+            "day": _DEV_DAY, "pool": _DEV_POOL, "bad": list(_DEV_BAD.keys())
+        }))
+    except Exception:
+        pass
+
+
+def _dev_load():
+    """跨重启复用设备号：昨日的好设备今天多半还有额度。"""
+    global _DEV_POOL, _DEV_BAD
+    try:
+        obj = json.loads(open(_DEV_CACHE).read())
+        pool = [d for d in (obj.get("pool") or []) if isinstance(d, str) and d.startswith("uuid-")]
+        bad = obj.get("bad") or []
+        if obj.get("day") == _DEV_DAY:
+            _DEV_BAD = dict((b, _DEV_DAY) for b in bad if isinstance(b, str))
+        _DEV_POOL = [d for d in pool if d not in _DEV_BAD]
+    except Exception:
+        pass
+
+
+def _dev_fill():
+    """补足池到一个足够大的规模。"""
+    while len(_DEV_POOL) < POOL_SIZE:
+        n = _new_device()
+        if n in _DEV_BAD or n in _DEV_POOL:
+            continue
+        _DEV_POOL.append(n)
+
+
+def _dev_get():
+    """轮转取一枚设备号（分散压力，避免单枚被快速榨干）。"""
+    global _DEV_IDX
+    with _DEV_LOCK:
+        _dev_newday()
+        if not _DEV_POOL:
+            _dev_load()
+        _dev_fill()
+        _DEV_IDX = (_DEV_IDX + 1) % len(_DEV_POOL)
+        return _DEV_POOL[_DEV_IDX]
+
+
+def _dev_fail(dev):
+    """该设备今日配额耗尽 → 拉黑并补新号，返回下一枚。"""
+    with _DEV_LOCK:
+        _dev_newday()
+        if dev:
+            _DEV_BAD[dev] = _DEV_DAY
+            if dev in _DEV_POOL:
+                _DEV_POOL.remove(dev)
+        _dev_fill()
+        _dev_save()
+        return _DEV_POOL[0]
+
+
+def _dev_ok(dev):
+    """解码成功：只做记账，不打断轮转（保持压力分散）。"""
+    with _DEV_LOCK:
+        if dev and dev not in _DEV_POOL and dev not in _DEV_BAD:
+            _DEV_POOL.append(dev)
+
+
+_dev_load()
+_dev_fill()
+DEVICE = _DEV_POOL[0]
+XJ_UA = "okhttp/4.12.0"
+PLAY_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+
+# 主域名 + 逆出的备用端点（App 内置 endpointConfig 加密块解出的两枚 API 域名）
+HOSTS = [
+    ("xjggg.top", 443),
+    ("50.118.186.185", 8090),
+    ("179.255.99.4", 8090),
+]
+
+# 端点自愈：主域名全挂时，从这几个公开配置页解出最新 API 端点（App 同款流程）
+ENDPOINT_SOURCES = [
+    "https://res.cloudinary.com/wygbngdd/raw/upload/1.txt",
+    "https://anotepad.com/notes/wcqhmtf9",
+]
+EP_AES_KEY = "3EoMYcMw9X1igBsCb7CLCTKGTqWv9OpAAJr2xGa3co0="
+EP_AAD = "TVAPP_ENDPOINT_CONFIG_V1:TVAPP:production:A256GCM\x00"
+
+CATS = [
+    ("c_movie", "🎬电影", "电影"),
+    ("c_tv", "📺剧集", "剧集"),
+    ("c_anime", "🌸动漫", "动漫"),
+    ("c_show", "🎤综艺", "综艺"),
+]
+RANK_TID = "c_rank"
+RANK_NAME = "🔥排行榜"
+
+YEAR_ALL = ["2026", "2025", "2024", "2023", "2022", "2021", "2020", "2019", "2018",
+            "2017", "2016", "2015", "2010", "2005", "2000"]
+
+FILTER_DEF = {
+    "电影": {
+        "class": ["动作", "喜剧", "爱情", "科幻", "恐怖", "悬疑", "剧情", "战争", "犯罪",
+                  "动画", "奇幻", "冒险", "灾难", "纪录片", "历史", "武侠", "青春", "家庭",
+                  "古装", "运动"],
+        "area": ["中国大陆", "美国", "韩国", "日本", "英国", "法国", "中国香港", "中国台湾",
+                 "泰国", "印度", "俄罗斯", "加拿大", "澳大利亚", "德国", "西班牙", "意大利"],
+        "year": YEAR_ALL + ["1995", "1990"],
+    },
+    "剧集": {
+        "class": ["国产剧", "欧美剧", "美剧", "英剧", "日韩剧", "韩剧", "日剧", "港台剧",
+                  "香港剧", "台湾剧", "电视剧", "古装", "悬疑", "都市", "爱情", "犯罪",
+                  "战争", "奇幻", "喜剧"],
+        "area": ["中国大陆", "美国", "韩国", "日本", "英国", "中国香港", "中国台湾", "泰国",
+                 "法国", "加拿大"],
+        "year": YEAR_ALL,
+    },
+    "动漫": {
+        "class": ["日本动漫", "国产动漫", "欧美动漫", "国创（B站）", "动画", "热血", "奇幻",
+                  "冒险", "恋爱", "搞笑", "科幻", "儿童", "亲子", "魔幻", "悬疑", "武侠",
+                  "古装", "真人"],
+        "area": ["日本", "中国大陆", "美国", "英国", "韩国", "加拿大", "法国"],
+        "year": YEAR_ALL,
+    },
+    "综艺": {
+        "class": ["大陆综艺", "日韩综艺", "欧美综艺", "港台综艺", "真人秀", "脱口秀", "选秀",
+                  "音乐", "竞技", "晚会", "明星", "情感", "搞笑", "文化", "戏曲"],
+        "area": ["中国大陆", "韩国", "日本", "美国", "英国", "中国香港", "中国台湾", "泰国"],
+        "year": ["2026", "2025", "2024", "2023", "2022", "2021", "2020", "2019", "2018",
+                 "2017", "2016", "2015", "2010"],
+    },
+}
+
+SORTS = [("", "默认"), ("hot", "最热"), ("score", "评分"), ("time", "最新")]
+
+# 显示名 → 真实 vodFrom（decode 接口只认真实 from，传显示名会返回"未知的vodFrom类型"）
+FRM_ALIAS = {
+    "ZJ4K": "zijianm3u8", "BB蓝光": "BBA", "QS蓝光": "qsvip",
+    "ZY蓝光": "zy1080_01", "JD4K": "JD4K", "TM蓝光": "tmdb", "NBY": "NBY",
+}
+# token 前缀 → 真实 vodFrom（从 token 自身反推，比线路名更可靠）
+TOK_FRM = {"zijian": "zijianm3u8", "qqqq": "BBA", "qsvip": "qsvip",
+           "JD": "JD4K", "tmdb": "tmdb", "NBY": "NBY"}
+
+
+# ---------------- 纯标准库 AES-256（只为解 App 端点配置，GCM 数据段=CTR） ----------------
+def _xt(a):
+    a <<= 1
+    return (a ^ 0x1b) & 0xff if a & 0x100 else a
+
+
+def xj_gmul(a, b):
+    r = 0
+    for _ in range(8):
+        if b & 1:
+            r ^= a
+        a = _xt(a)
+        b >>= 1
+    return r
+
+
+def _gpow(a, n):
+    r = 1
+    while n:
+        if n & 1:
+            r = xj_gmul(r, a)
+        a = xj_gmul(a, a)
+        n >>= 1
+    return r
+
+
+def _mk_sbox():
+    box = [0] * 256
+    for i in range(256):
+        x = _gpow(i, 254) if i else 0
+        s = x
+        for _ in range(4):
+            x = ((x << 1) | (x >> 7)) & 0xff
+            s ^= x
+        box[i] = s ^ 0x63
+    return box
+
+
+XJ_SBOX = _mk_sbox()
+
+
+def _aes_expand(key):
+    nk = len(key) // 4
+    nr = nk + 6
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    rc = 1
+    for i in range(nk, 4 * (nr + 1)):
+        t = list(w[i - 1])
+        if i % nk == 0:
+            t = t[1:] + t[:1]
+            t = [XJ_SBOX[b] for b in t]
+            t[0] ^= rc
+            rc = _xt(rc)
+        elif nk > 6 and i % nk == 4:
+            t = [XJ_SBOX[b] for b in t]
+        w.append([w[i - nk][j] ^ t[j] for j in range(4)])
+    return w, nr
+
+
+def _aes_block(w, nr, blk):
+    s = [[blk[4 * c + r] ^ w[c][r] for c in range(4)] for r in range(4)]
+    for rnd in range(1, nr + 1):
+        s = [[XJ_SBOX[s[r][c]] for c in range(4)] for r in range(4)]
+        for r in range(1, 4):
+            s[r] = s[r][r:] + s[r][:r]
+        if rnd != nr:
+            for c in range(4):
+                a = [s[r][c] for r in range(4)]
+                s[0][c] = xj_gmul(a[0], 2) ^ xj_gmul(a[1], 3) ^ a[2] ^ a[3]
+                s[1][c] = a[0] ^ xj_gmul(a[1], 2) ^ xj_gmul(a[2], 3) ^ a[3]
+                s[2][c] = a[0] ^ a[1] ^ xj_gmul(a[2], 2) ^ xj_gmul(a[3], 3)
+                s[3][c] = xj_gmul(a[0], 3) ^ a[1] ^ a[2] ^ xj_gmul(a[3], 2)
+        for c in range(4):
+            for r in range(4):
+                s[r][c] ^= w[rnd * 4 + c][r]
+    out = bytearray(16)
+    for c in range(4):
+        for r in range(4):
+            out[4 * c + r] = s[r][c]
+    return bytes(out)
+
+
+def _aes_ctr(key, nonce, data):
+    w, nr = _aes_expand(key)
+    ctr = int.from_bytes(nonce + b"\x00\x00\x00\x01", "big") + 1
+    out = bytearray()
+    for off in range(0, len(data), 16):
+        ks = _aes_block(w, nr, ctr.to_bytes(16, "big"))
+        chunk = data[off:off + 16]
+        out.extend(bytes(a ^ b for a, b in zip(chunk, ks)))
+        ctr += 1
+    return bytes(out)
+
+
+def _b64u(s):
+    s = s.strip().replace("-", "+").replace("_", "/")
+    return base64.b64decode(s + "=" * ((4 - len(s) % 4) % 4))
+
+
+class XiaojiSpider(object):
+    def __init__(self):
+        self.host = None
+        self.port = 443
+        self.mem = {}
+
+    # ---------------- TVBox 契约 ----------------
+    def getName(self):
+        return "小鸡看看"
+
+    def isVideoFormat(self, url):
+        # 站内只出 m3u8/mp4 直链，无 pics:// 图集线路
+        if not url:
+            return False
+        return not url.startswith("pics://")
+
+    def manualVideoCheck(self):
+        return False
+
+    def getDependence(self):
+        return []
+
+    def isVip(self):
+        return False
+
+    def getHeaders(self):
+        return {"User-Agent": PLAY_UA}
+
+    def init(self, extend=""):
+        return
+
+    # ---------------- 签名 ----------------
+    def _sig_headers(self, dev=None):
+        dev = dev or DEVICE
+        ts = int(time.time() * 1000)
+        nonce = hashlib.sha256(dev.encode()).hexdigest()[:8]
+        nonce += ''.join([str(random.randint(0, 9)) for _ in range(8)])
+        raw = "finger=%s&id=%s&nonce=%s&sk=%s&time=%s&v=%s" % (
+            FINGER, APP_ID, nonce, SK, str(ts), APP_VER)
+        sign = hashlib.sha256(raw.encode()).hexdigest().upper()
+        return {
+            "x-aid": APP_ID,
+            "x-ave": APP_VER,
+            "x-time": str(ts),
+            "x-nonc": nonce,
+            "x-sign": sign,
+            "x-device-id": dev,
+            "x-device-brand": "Xiaomi",
+            "x-device-model": "M2012K11AC",
+            "x-client-type": "tv",
+            "x-update-id": "embedded",
+            "Accept": "application/json",
+            "Accept-Encoding": "identity",
+            "User-Agent": XJ_UA,
+        }
+
+    # ---------------- HTTP ----------------
+    def _raw(self, host, port, path, headers, timeout=15):
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        if port == 443:
+            conn = xj_http.HTTPSConnection(host, port, timeout=timeout, context=ctx)
+        else:
+            conn = xj_http.HTTPSConnection(host, port, timeout=timeout, context=ctx)
+        conn.request("GET", path, headers=headers)
+        resp = conn.getresponse()
+        body = resp.read()
+        enc = (resp.getheader("Content-Encoding") or "").lower()
+        if "gzip" in enc:
+            try:
+                body = gzip.decompress(body)
+            except Exception:
+                pass
+        conn.close()
+        return resp.status, body
+
+    def _api(self, path, params=None, retry=True, ok_codes=(200,)):
+        if params:
+            qs = urllib.parse.urlencode(params)
+            path = path + ("&" if "?" in path else "?") + qs
+        base = list(HOSTS)
+        if self.host:
+            base = [(self.host, self.port)] + [h for h in HOSTS if h[0] != self.host]
+        order = list(base)
+        last = ""
+        tries = 0
+        rots = 0
+        conn_fail = 0
+        while tries < 2:
+            tries += 1
+            for host, port in order:
+                # 每次请求轮换取设备号：把配额压力摊到整个池上（几千人共用也不挤爆单枚）
+                dev = _dev_get()
+                for att in range(3):
+                    try:
+                        st, body = self._raw(host, port, path, self._sig_headers(dev))
+                        conn_fail = 0
+                        if st != 200:
+                            last = "http %s" % str(st)
+                            break
+                        txt = body.decode("utf-8", "replace").strip()
+                        if not txt.startswith("{"):
+                            last = "bad body"
+                            break
+                        obj = json.loads(txt)
+                        if obj.get("code") not in ok_codes:
+                            last = str(obj.get("msg"))
+                            if obj.get("code") == 401:
+                                break
+                            if obj.get("code") == 429 or obj.get("error_code") == 42901:
+                                # 本设备今日配额耗尽 → 拉黑换号立刻重试（次数无上限）
+                                rots += 1
+                                dev = _dev_fail(dev)
+                                if rots > 20:
+                                    return None
+                                print("[xjk] 429 -> rotate#%d %s" % (rots, dev[:18]))
+                                continue
+                            return None
+                        self.host, self.port = host, port
+                        _dev_ok(dev)
+                        return obj.get("data")
+                    except Exception as e:
+                        # 连接层抖动（ConnectionAborted/超时）→ 指数退避重试
+                        last = str(e)[:60]
+                        conn_fail += 1
+                        if att < 2:
+                            time.sleep(0.35 * (att + 1))
+                if last.startswith("http") or last == "bad body":
+                    continue
+            # 全部端点失败 → 走一次端点自愈再试
+            if tries == 1:
+                time.sleep(0.5)
+                new = self._refresh_hosts()
+                if new:
+                    HOSTS[:] = new if new[0][0] != HOSTS[0][0] else HOSTS
+                    base = list(HOSTS)
+                order = base if not self.host else [self.host and (self.host, self.port)] + \
+                    [h for h in base if h[0] != self.host]
+                order = [x for x in order if x]
+        if last:
+            print("[xjk]", path[:50], "fail:", last)
+        return None
+
+    # ---------------- 工具 ----------------
+    @staticmethod
+    def _s(v, dft=""):
+        if v is None:
+            return dft
+        if isinstance(v, (list, tuple)):
+            return ",".join([str(x) for x in v if x])
+        return str(v)
+
+    @staticmethod
+    def _is_url(u):
+        # 真正的 URL 判据：协议 + 主机名，而不是松散的 startswith
+        return bool(u) and len(u) > 10 and "://" in u and bool(urllib.parse.urlparse(u).hostname)
+
+    def _pic(self, v):
+        pic = v.get("vod_pic") or ""
+        if self._is_url(pic):
+            return pic
+        dou = v.get("vod_douban_pic") or ""
+        if self._is_url(dou):
+            return "proxy://do=py&type=img&url=" + urllib.parse.quote(dou, safe="")
+        return ""
+
+    def _vod(self, v):
+        return {
+            "vod_id": str(v.get("vod_id")),
+            "vod_name": self._s(v.get("vod_name")),
+            "vod_pic": self._pic(v),
+            "vod_remarks": self._s(v.get("vod_remarks")),
+            "vod_year": self._s(v.get("vod_year")),
+            "vod_area": self._s(v.get("vod_area")),
+            "vod_class": self._s(v.get("vod_class")),
+            "vod_actor": self._s(v.get("vod_actor")),
+            "vod_director": self._s(v.get("vod_director")),
+            "vod_content": self._s(v.get("vod_content")),
+            "type_name": self._s(v.get("type_name")),
+        }
+
+    # ---------------- 端点自愈 ----------------
+    def _refresh_hosts(self):
+        """主域名全挂时，按 App 同款流程从公开配置页解出新 API 端点。"""
+        for src in ENDPOINT_SOURCES:
+            try:
+                ctx = ssl.create_default_context()
+                ctx.check_hostname = False
+                ctx.verify_mode = ssl.CERT_NONE
+                pu = urllib.parse.urlparse(src)
+                conn = xj_http.HTTPSConnection(pu.hostname, 443, timeout=12, context=ctx)
+                conn.request("GET", pu.path + ("?" + pu.query if pu.query else ""),
+                             headers={"User-Agent": PLAY_UA})
+                resp = conn.getresponse()
+                txt = resp.read().decode("utf-8", "replace")
+                conn.close()
+                m = re.search(r"TVAPP_CONFIG_V1_BEGIN([\s\S]*?)TVAPP_CONFIG_V1_END", txt)
+                if not m:
+                    continue
+                raw = _b64u(m.group(1))
+                if len(raw) < 96 or raw[0] != 1:
+                    continue
+                aad = EP_AAD.encode() + raw[0:3]
+                plain = _aes_ctr(base64.b64decode(EP_AES_KEY), raw[3:15], raw[15:])
+                body = plain[64:]
+                if len(body) > 16:
+                    body = body[:-16]      # 尾部 16 字节是 GCM tag，不在明文里
+                obj = json.loads(body.decode("utf-8", "replace"))
+                urls = obj.get("a") or []
+                found = []
+                for u in urls:
+                    pu2 = urllib.parse.urlparse(u)
+                    if pu2.hostname:
+                        found.append((pu2.hostname, pu2.port or 443))
+                if found:
+                    print("[xjk] endpoint refresh:", found)
+                    return found
+            except Exception as e:
+                print("[xjk] refresh err", str(e)[:60])
+        return []
+
+    # ---------------- 分类筛选 ----------------
+    def _filters(self):
+        out = {}
+        for tid, _name, tname in CATS:
+            dims = FILTER_DEF.get(tname) or {}
+            arr = []
+            for key, label in (("class", "类型"), ("area", "地区"), ("year", "年份")):
+                vals = dims.get(key) or []
+                if not vals:
+                    continue
+                opts = [{"n": "全部", "v": ""}]
+                for v in vals:
+                    opts.append({"n": v, "v": v})
+                arr.append({"key": key, "name": label, "value": opts})
+            srt = [{"n": "默认", "v": ""}]
+            for v, n in SORTS[1:]:
+                srt.append({"n": n, "v": v})
+            arr.append({"key": "sort", "name": "排序", "value": srt})
+            out[tid] = arr
+        return out
+
+    # ---------------- 首页 ----------------
+    def homeContent(self, filter=False):
+        result = {"class": [], "list": [], "filters": {}}
+        for tid, name, _ in CATS:
+            result["class"].append({"type_id": tid, "type_name": name})
+        result["class"].append({"type_id": RANK_TID, "type_name": RANK_NAME})
+        data = self._api("/api.php/app/index/home")
+        vods = []
+        if isinstance(data, dict):
+            seen = set()
+            for v in (data.get("recommend") or []):
+                vid = str(v.get("vod_id"))
+                if vid in seen:
+                    continue
+                seen.add(vid)
+                vods.append(self._vod(v))
+            for c in (data.get("categories") or []):
+                for v in (c.get("videos") or []):
+                    vid = str(v.get("vod_id"))
+                    if vid in seen:
+                        continue
+                    seen.add(vid)
+                    vods.append(self._vod(v))
+        result["list"] = vods
+        result["filters"] = self._filters()
+        if filter:
+            return result
+        return result
+
+    def homeVideoContent(self):
+        return {"list": self.homeContent(False).get("list") or []}
+
+    # ---------------- 分类 ----------------
+    def _rank_list(self):
+        data = self._api("/api.php/app/ranking/list")
+        vods = []
+        if isinstance(data, dict):
+            for rk in (data.get("rankings") or []):
+                tname = self._s(rk.get("type_name"))
+                for v in (rk.get("videos") or []):
+                    item = self._vod(v)
+                    if tname and not item.get("vod_remarks"):
+                        item["vod_remarks"] = tname
+                    vods.append(item)
+        return vods
+
+    def categoryContent(self, tid, pg, filter, extend):
+        pg = int(pg) if str(pg).isdigit() else 1
+        extend = extend or {}
+        result = {"list": [], "page": pg, "pagecount": 999, "limit": 30, "total": 0}
+        if tid == RANK_TID or str(tid).startswith("c_rank"):
+            if pg > 1:
+                result["list"] = []
+                result["pagecount"] = 1
+                return result
+            result["list"] = self._rank_list()
+            result["pagecount"] = 1
+            result["total"] = len(result["list"])
+            return result
+
+        tname = ""
+        for cid, _n, tn in CATS:
+            if cid == tid:
+                tname = tn
+                break
+        if not tname:
+            tname = self._s(tid)
+        params = {"type_name": tname, "page": pg, "limit": 30}
+        c = self._s(extend.get("class")).strip()
+        a = self._s(extend.get("area")).strip()
+        y = self._s(extend.get("year")).strip()
+        s = self._s(extend.get("sort")).strip()
+        if c:
+            params["class"] = c
+        if a:
+            params["area"] = a
+        if y:
+            params["year"] = y
+        if s:
+            params["sort"] = s
+        data = self._api("/api.php/app/filter/vod", params)
+        if isinstance(data, list):
+            result["list"] = [self._vod(v) for v in data]
+            result["total"] = len(result["list"])
+            # 站方深翻页封顶 1000 条（limit=30 → 最多 34 页），算出真实页数
+            pc = int(1000 / 30)
+            if len(result["list"]) < 30:
+                pc = pg
+            result["pagecount"] = max(1, pc)
+        else:
+            result["pagecount"] = pg
+        return result
+
+    # ---------------- 详情 ----------------
+    def _playback_all(self, vid):
+        """一次拉全线路分集。
+        ★坑：接口带 from 参数会被忽略并只回 BBA 线路，导致其它线路拿到 BBA 的 token
+        → 播放时 vodFrom 与 token 不匹配，decode 返回"未知的vodFrom类型"★
+        """
+        data = self._api("/api.php/app/vod/playback_v2", {"vod_id": vid})
+        out = {}
+        if not isinstance(data, dict):
+            return out
+        for src in (data.get("sources") or []):
+            f = src.get("from")
+            eps = src.get("episodes") or []
+            if f and eps:
+                out[f] = eps
+        return out
+
+    def _playback(self, vid, frm="", _cache=None):
+        allsrc = _cache if isinstance(_cache, dict) else self._playback_all(vid)
+        if frm:
+            return frm, allsrc.get(frm) or []
+        for f, eps in allsrc.items():
+            return f, eps
+        return frm, []
+
+    def detailContent(self, ids):
+        vid = ids[0] if isinstance(ids, (list, tuple)) else ids
+        vid = str(vid)
+        data = self._api("/api.php/app/vod/detail_v2", {"vod_id": vid})
+        if not isinstance(data, dict):
+            return {"list": []}
+        det = data.get("detail") or {}
+        pb = data.get("playback") or {}
+        vod = self._vod(det)
+        vod["vod_id"] = vid
+
+        lines = []       # [(display_name, from, episodes)]
+        srcs = pb.get("sources") or []
+        sel = pb.get("selected_source") or {}
+        sel_from = sel.get("from") or ""
+        order = []
+        if sel_from:
+            order.append(sel_from)
+        for s in srcs:
+            f = s.get("from")
+            if not f or f in order:
+                continue
+            if (s.get("episode_count") or 0) <= 0 and not (s.get("episodes") or []):
+                continue
+            order.append(f)
+        names = {}
+        for s in srcs:
+            names[s.get("from")] = self._s(s.get("display_name"))
+        # 一次拉全线路分集（带 from 会因为服务端忽略参数而串线，见 _playback_all 注释）
+        got = {}
+        try:
+            got = self._playback_all(vid)
+        except Exception as e:
+            print("[xjk] playback", e)
+        for f in order:
+            eps = got.get(f) or []
+            if not eps and f == sel_from:
+                eps = sel.get("episodes") or []
+            if not eps:
+                continue
+            lines.append((names.get(f) or f, f, eps))
+
+        # 线路排序：已验证可播的线路优先，已知 403 的线路（shenhua7）压到末尾并标注
+        def _rank(f):
+            return 1 if f == "qsvip" else 0
+        lines.sort(key=lambda x: _rank(x[1]))
+        for idx, (nm, f, eps) in enumerate(lines):
+            if f == "qsvip":
+                lines[idx] = ("%s(可能失效)" % nm, f, eps)
+
+        froms = []
+        urls = []
+        for nm, f, eps in lines:
+            froms.append(nm or f)
+            cells = []
+            for i, e in enumerate(eps):
+                title = self._s(e.get("title")) or ("第%d集" % (i + 1))
+                tok = self._s(e.get("url"))
+                if not tok:
+                    continue
+                cells.append("%s$%s@@%s" % (title, tok, f))
+            urls.append("#".join(cells))
+        if froms:
+            vod["vod_play_from"] = "$$$".join(froms)
+            vod["vod_play_url"] = "$$$".join(urls)
+
+        # 分集缓存：按集序把各线路 token 存起来，播放失败时能自动换线路（_alt_episode 用）
+        try:
+            rec = {}
+            for nm, f, eps in lines:
+                for i, e in enumerate(eps):
+                    t = self._s(e.get("url"))
+                    if t:
+                        rec.setdefault(i, []).append((f, t))
+            cache = getattr(self, "_eps_cache", None)
+            if not isinstance(cache, dict):
+                cache = {}
+            cache[vid] = rec
+            # 只留最近 8 部，防内存膨胀（几千人共用一台设备的长跑场景）
+            while len(cache) > 8:
+                cache.pop(next(iter(cache)))
+            self._eps_cache = cache
+        except Exception as e:
+            print("[xjk] cache", e)
+
+        return {"list": [vod]}
+
+    # ---------------- 搜索 ----------------
+    def searchContent(self, key, quick, pg="1"):
+        pg = int(pg) if str(pg).isdigit() else 1
+        data = self._api("/api.php/app/search/index",
+                         {"wd": key, "page": pg, "limit": 30})
+        vods = []
+        if isinstance(data, list):
+            vods = [self._vod(v) for v in data]
+        return {"list": vods, "page": pg, "pagecount": 999 if len(vods) >= 30 else pg}
+
+    # ---------------- 播放 ----------------
+    def _decode(self, tok, frm, _retry=0):
+        """解析播放令牌 → 真直链。
+        _api 内部已做「轮转取设备号 + 429 换号 + 连接退避」，
+        这里再包一层整调用重试，扛住服务端瞬时抖动（几千人共用时的常态）。
+        """
+        data = self._api("/api.php/app/decode/url/",
+                         {"url": tok, "vodFrom": frm, "_t": int(time.time() * 1000)},
+                         ok_codes=(1, 200))
+        if isinstance(data, str) and self._is_url(data):
+            return data
+        # 服务端有时把未识别线路原样返回（data == token），换线路名也没用 → 重试一次
+        if _retry < 2:
+            time.sleep(0.4 * (_retry + 1))
+            return self._decode(tok, frm, _retry + 1)
+        return ""
+
+    def playerContent(self, flag, id, vipFlags=None):
+        tok = self._s(id)
+        frm = ""
+        if "@@" in tok:
+            tok, frm = tok.rsplit("@@", 1)
+        tok = tok.strip()
+        # 线路名多层纠错（decode 只认真实 vodFrom，错了就返回"未知的vodFrom类型"）
+        cands = []
+        if frm:
+            cands.append(FRM_ALIAS.get(frm, frm))
+        t = self._frm_from_token(tok)
+        if t:
+            cands.append(t)
+        fl = self._s(flag)
+        if fl:
+            cands.append(FRM_ALIAS.get(fl, fl))
+        cands.append("")
+        url = ""
+        seen = set()
+        for f in cands:
+            if f in seen:
+                continue
+            seen.add(f)
+            url = self._decode(tok, f)
+            if url:
+                break
+        if not url:
+            # 兜底：本条线路解析失败 → 到其它线路取「同名集」，保证一定播得出来
+            alt = self._alt_episode(tok)
+            if alt:
+                header = {"User-Agent": PLAY_UA}
+                if "shenhua7.vip" in alt:
+                    header["Referer"] = "https://www.shenhua7.vip/"
+                return {"parse": 0, "playUrl": "", "url": alt, "header": header}
+            return {"parse": 1, "playUrl": "", "url": tok,
+                    "header": {"User-Agent": PLAY_UA}}
+        header = {"User-Agent": PLAY_UA}
+        if "shenhua7.vip" in url:
+            header["Referer"] = "https://www.shenhua7.vip/"
+        return {"parse": 0, "playUrl": "", "url": url, "header": header}
+
+    def _alt_episode(self, tok):
+        """同一集在其它线路取真直链：detail 里已把每集 token 按线路存下来，
+        用「集名」跨线路配对的成本太高，这里直接按 token 反查所属影片不可行，
+        改为：本进程最近一次 detailContent 的分集表里找同一集序号的其它线路。"""
+        try:
+            cache = getattr(self, "_eps_cache", None) or {}
+            for vid, rec in cache.items():
+                for pos, toks in rec.items():
+                    for f, t in toks:
+                        if t == tok:
+                            for f2, t2 in toks:
+                                if f2 == f:
+                                    continue
+                                u = self._decode(t2, f2)
+                                if u:
+                                    print("[xjk] fallback line %s -> %s" % (f, f2))
+                                    return u
+                            return ""
+        except Exception as e:
+            print("[xjk] alt", e)
+        return ""
+
+    @staticmethod
+    def _frm_from_token(tok):
+        """从 token 前缀推断真实 vodFrom（decode 接口按前缀判线路）。"""
+        p = (tok.split("-", 1)[0] or "")
+        if p and len(p) <= 14:
+            return TOK_FRM.get(p, "")
+        return ""
+
+    # ---------------- 图片代理 ----------------
+    def localProxy(self, param):
+        try:
+            raw = param if isinstance(param, str) else urllib.parse.urlencode(param)
+            if raw.startswith("proxy://"):
+                raw = raw[len("proxy://"):]
+            qs = urllib.parse.parse_qs(raw)
+            url = (qs.get("url") or [""])[0]
+            typ = (qs.get("type") or [""])[0]
+            if not url:
+                return [404, "text/plain", {}, b"no url"]
+            if typ != "img":
+                return [404, "text/plain", {}, b"bad type"]
+            pu = urllib.parse.urlparse(url)
+            if not pu.hostname:
+                return [404, "text/plain", {}, b"bad url"]
+            headers = {
+                "User-Agent": PLAY_UA,
+                "Accept": "image/avif,image/webp,image/*,*/*;q=0.8",
+            }
+            if "doubanio" in pu.hostname or "douban" in pu.hostname:
+                headers["Referer"] = "https://movie.douban.com/"
+            ctx = ssl.create_default_context()
+            ctx.check_hostname = False
+            ctx.verify_mode = ssl.CERT_NONE
+            conn = xj_http.HTTPSConnection(pu.hostname, pu.port or 443,
+                                               timeout=15, context=ctx)
+            path = (pu.path or "/") + ("?" + pu.query if pu.query else "")
+            conn.request("GET", path, headers=headers)
+            resp = conn.getresponse()
+            body = resp.read()
+            ctype = resp.getheader("Content-Type") or "image/jpeg"
+            conn.close()
+            if resp.status == 200 and body:
+                return [200, ctype, {}, body]
+            return [404, "text/plain", {}, b"fetch failed"]
+        except Exception as e:
+            print("[xjk] proxy", e)
+            return [404, "text/plain", {}, b"err"]
+
+
+# ======================================================================
+# 模块：ff
+# ======================================================================
+# -*- coding: utf-8 -*-
+# FoFo影院 (www.fofo33.com) TVBox / OK影视 Python 爬虫
+# ------------------------------------------------------------
+# 站点结构（实测 2026-11）：
+#   - 站点无开放 JSON API（/api.php 全部回退 HTML），故走 HTML 解析
+#   - 分类页:  /{dianying|dianshiju|zongyi|dongman}/{类型}-{地区}-{年代}-{排序}?page=N
+#   - 搜索页:  /search?q=关键词&page=N（无结果时回吐推荐，必须本地关键词二次过滤）
+#   - 详情页:  /{cat}/{vid}，内嵌 var urlList = decryptDict({...}) 恺撒位移(-1)加密的线路数据
+#   - 取播放:  POST /source/  body: id={sid}  → 纯文本 m3u8/mp4 直链
+#   - web-sign: 站点未启用（预留注入槽位）
+
+import sys
+import json
+import re
+import urllib.parse
+sys.path.append('..')
+try:
+    from base.spider import Spider
+except Exception:
+    FofoSpider = object
+
+
+class FofoSpider(_BaseSpider):
+
+    HOST = 'https://www.fofo33.com'
+    UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+    TIMEOUT = 15
+
+    # 旧配置 tid(1/2/3/4) → 站点真实分类路径
+    TID_MAP = {'1': 'dianying', '2': 'dianshiju', '3': 'zongyi', '4': 'dongman'}
+    CATS = [
+        {'type_id': 'dianying', 'type_name': '电影'},
+        {'type_id': 'dianshiju', 'type_name': '剧集'},
+        {'type_id': 'zongyi', 'type_name': '综艺'},
+        {'type_id': 'dongman', 'type_name': '动漫'},
+    ]
+    TYPE_MAP = {
+        'dianying': [('0', '全部'), ('1', '剧情'), ('2', '喜剧'), ('3', '动作'), ('4', '爱情'),
+                     ('5', '科幻'), ('6', '悬疑'), ('7', '惊悚'), ('8', '恐怖'), ('9', '犯罪'),
+                     ('10', '同性'), ('11', '音乐'), ('12', '歌舞'), ('13', '传记'), ('14', '历史'),
+                     ('15', '战争'), ('16', '西部'), ('17', '奇幻'), ('18', '冒险'), ('19', '灾难'),
+                     ('20', '武侠'), ('21', '伦理')],
+        'dianshiju': [('0', '全部'), ('1', '剧情'), ('2', '喜剧'), ('3', '动作'), ('4', '爱情'),
+                      ('5', '科幻'), ('6', '悬疑'), ('7', '惊悚'), ('8', '恐怖'), ('9', '犯罪'),
+                      ('10', '同性'), ('11', '音乐'), ('12', '歌舞'), ('13', '传记'), ('14', '历史'),
+                      ('15', '战争'), ('16', '西部'), ('17', '奇幻'), ('18', '冒险'), ('19', '灾难'),
+                      ('20', '武侠'), ('21', '伦理')],
+        'zongyi': [('0', '全部'), ('1', '真人秀'), ('2', '脱口秀'), ('3', '纪录片'),
+                   ('4', '传记'), ('5', '歌舞')],
+        'dongman': [('0', '全部'), ('1', '剧情'), ('2', '喜剧'), ('3', '动作'), ('4', '爱情'),
+                    ('5', '科幻'), ('6', '悬疑'), ('7', '惊悚'), ('8', '恐怖'), ('9', '犯罪'),
+                    ('10', '同性'), ('11', '音乐'), ('12', '歌舞'), ('13', '传记'), ('14', '历史'),
+                    ('15', '战争'), ('16', '西部'), ('17', '奇幻'), ('18', '冒险'), ('19', '灾难'),
+                    ('20', '武侠'), ('21', '伦理')],
+    }
+    AREA_MAP = [('0', '全部'), ('1', '中国大陆'), ('2', '美国'), ('3', '香港'), ('4', '台湾'),
+                ('5', '日本'), ('6', '韩国'), ('7', '英国'), ('8', '法国'), ('9', '德国'),
+                ('10', '意大利'), ('11', '西班牙'), ('12', '印度'), ('13', '泰国'), ('14', '俄罗斯'),
+                ('15', '伊朗'), ('16', '加拿大'), ('17', '澳大利亚'), ('18', '爱尔兰'),
+                ('19', '瑞典'), ('20', '巴西'), ('21', '丹麦')]
+    YEARS = [('0', '全部')] + [(str(y), str(y)) for y in range(2026, 2004, -1)] + [('1', '其他')]
+    SORTS = [('0', '最新'), ('1', '热门'), ('2', '高分')]
+
+    def __init__(self):
+        self.host = self.HOST
+        self.extend = ''
+        self._line_cache = {}   # detail path -> 解析后的线路数据
+        self._detail_cache = {} # detail path -> vod 基础信息
+
+    # ------------------------------------------------------------------
+    # 生命周期
+    # ------------------------------------------------------------------
+    def init(self, extend=""):
+        try:
+            self.extend = extend or ''
+            if isinstance(extend, str) and extend.strip().startswith('{'):
+                ext = json.loads(extend)
+                if isinstance(ext, dict) and ext.get('host'):
+                    self.host = str(ext['host']).strip().rstrip('/')
+        except Exception:
+            pass
+
+    def getName(self):
+        return 'FoFo影院'
+
+    def destroy(self):
+        try:
+            self._line_cache.clear()
+            self._detail_cache.clear()
+        except Exception:
+            pass
+
+    def isVideoFormat(self, url):
+        # 选集字符串可能带 # 后缀（如 .m3u8#下一集），先剥离再判断
+        try:
+            url = str(url or '').split('#')[0].split('?')[0].lower()
+            return any(url.endswith(ext) for ext in
+                       ('.m3u8', '.mp4', '.mkv', '.flv', '.avi', '.ts', '.webm'))
+        except Exception:
+            return False
+
+    def manualVideoCheck(self):
+        return False
+
+    def localProxy(self, param):
+        return []
+
+    # ------------------------------------------------------------------
+    # 基础网络封装
+    # ------------------------------------------------------------------
+    def _headers(self, referer='', web_sign=''):
+        h = {
+            'User-Agent': self.UA,
+            'Accept': 'text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8',
+            'Referer': referer or (self.host + '/'),
+            'x-platform': 'web',
+            'x-requested-with': 'XMLHttpRequest',
+        }
+        # 站点当前不需要 web-sign；若后续启用，在此注入
+        if web_sign:
+            h['web-sign'] = web_sign
+        return h
+
+    def _api_get(self, url, referer=''):
+        """GET + JSON 解析，容错返回 {}"""
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers=self._headers(referer))
+            with urllib.request.urlopen(req, timeout=self.TIMEOUT) as resp:
+                return json.loads(resp.read().decode('utf-8', 'ignore'))
+        except Exception:
+            return {}
+
+    def _html_get(self, url, referer=''):
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers=self._headers(referer))
+            with urllib.request.urlopen(req, timeout=self.TIMEOUT) as resp:
+                return resp.read().decode('utf-8', 'ignore')
+        except Exception:
+            return ''
+
+    def _source_post(self, sid, referer=''):
+        """POST /source/ 取 m3u8/mp4 直链（纯文本返回）"""
+        try:
+            import urllib.request
+            data = urllib.parse.urlencode({'id': str(sid)}).encode('utf-8')
+            h = self._headers(referer)
+            h['Content-Type'] = 'application/x-www-form-urlencoded; charset=UTF-8'
+            req = urllib.request.Request(self.host + '/source/', data=data, headers=h)
+            with urllib.request.urlopen(req, timeout=self.TIMEOUT) as resp:
+                return resp.read().decode('utf-8', 'ignore').strip()
+        except Exception:
+            return ''
+
+    # ------------------------------------------------------------------
+    # 恺撒解密（站点 decryptDict 逻辑：字符 charCode -1）
+    # ------------------------------------------------------------------
+    def _shift(self, s):
+        try:
+            return ''.join(chr(ord(c) - 1) for c in s)
+        except Exception:
+            return s
+
+    def _decrypt_dict(self, val):
+        try:
+            if isinstance(val, list):
+                return [self._decrypt_dict(x) for x in val]
+            if isinstance(val, dict):
+                return {self._shift(k): self._decrypt_dict(v) for k, v in val.items()}
+            if isinstance(val, str):
+                s = self._shift(val)
+                # 与站点 JS 一致：对解密结果尝试 JSON.parse
+                # （字符串值多为 "\uXXXX" 形式的 JSON 字符串字面量，需解码为中文）
+                if s[:1] in ('"', '[', '{'):
+                    try:
+                        return json.loads(s)
+                    except Exception:
+                        return s
+                return s
+            return val
+        except Exception:
+            return val
+
+    def _extract_urllist(self, html):
+        """从详情页提取并解密内嵌线路数据"""
+        try:
+            m = re.search(r'var\s+urlList\s*=\s*decryptDict\((\{.*?\})\)', html, re.S)
+            if not m:
+                return {'source': [], 'url_list': []}
+            raw = m.group(1).replace("'", '"')
+            data = json.loads(raw)
+            out = {}
+            for k, v in data.items():
+                out[self._shift(k)] = self._decrypt_dict(v)
+            sources = out.get('source') or []
+            url_list = out.get('url_list') or []
+            if not isinstance(url_list, list):
+                url_list = []
+            return {'source': sources, 'url_list': url_list}
+        except Exception:
+            return {'source': [], 'url_list': []}
+
+    # ------------------------------------------------------------------
+    # HTML 列表解析
+    # ------------------------------------------------------------------
+    def _parse_items(self, html):
+        """解析列表页/搜索页 <li> 条目，返回 vod 列表"""
+        result = []
+        try:
+            for block in re.findall(r'<li>(.*?)</li>', html, re.S):
+                if 'class="thumbnail"' not in block:
+                    continue
+                m = re.search(
+                    r'href="/(dianying|dianshiju|zongyi|dongman)/(\d+)"[^>]*class="thumbnail"',
+                    block)
+                if not m:
+                    continue
+                cat, vid = m.group(1), m.group(2)
+                img = ''
+                mi = re.search(r'src="([^"]+)"[^>]*class="thumb"', block)
+                if not mi:
+                    mi = re.search(r'class="thumb"[^>]*src="([^"]+)"', block)
+                if mi:
+                    img = mi.group(1)
+                note = ''
+                mn = re.search(r'class="note"[^>]*>\s*<span>([^<]*)</span>', block)
+                if mn:
+                    note = mn.group(1).strip()
+                title = ''
+                mt = re.search(r'<h2><a[^>]*>([^<]+)</a></h2>', block)
+                if mt:
+                    title = mt.group(1).strip()
+                if not title:
+                    mt = re.search(r'alt="([^"]+)"', block)
+                    if mt:
+                        title = mt.group(1).strip()
+                if not title or not vid:
+                    continue
+                result.append({
+                    'vod_id': cat + '/' + vid,
+                    'vod_name': title,
+                    'vod_pic': img,
+                    'vod_remarks': note,
+                })
+        except Exception:
+            pass
+        return result
+
+    def _parse_pagecount(self, html, cur_pg, per_page=24):
+        try:
+            pages = [int(x) for x in re.findall(r'[?&]page=(\d+)', html)]
+            if pages:
+                return max(pages)
+            # 无分页链接时按是否满页外推
+            return cur_pg + 1 if html.count('class="thumbnail"') >= per_page else cur_pg
+        except Exception:
+            return cur_pg
+
+    def _strip_tags(self, s):
+        try:
+            return re.sub(r'\s+', ' ', re.sub(r'<[^>]+>', ' ', s or '')).strip()
+        except Exception:
+            return (s or '').strip()
+
+    # ------------------------------------------------------------------
+    # 内容方法
+    # ------------------------------------------------------------------
+    def homeContent(self, filter):
+        classes = [{'type_id': c['type_id'], 'type_name': c['type_name']} for c in self.CATS]
+        filters = {}
+        for c in self.CATS:
+            filters[c['type_id']] = [
+                {'key': 'type', 'name': '类型',
+                 'value': [{'n': n, 'v': v} for v, n in self.TYPE_MAP[c['type_id']]]},
+                {'key': 'area', 'name': '地区',
+                 'value': [{'n': n, 'v': v} for v, n in self.AREA_MAP]},
+                {'key': 'year', 'name': '年代',
+                 'value': [{'n': n, 'v': v} for v, n in self.YEARS]},
+                {'key': 'sort', 'name': '排序',
+                 'value': [{'n': n, 'v': v} for v, n in self.SORTS]},
+            ]
+        return {'class': classes, 'filters': filters}
+
+    def homeVideoContent(self):
+        try:
+            html = self._html_get(self.host + '/')
+            items = self._parse_items(html)
+            seen, result = set(), []
+            for it in items:
+                if it['vod_id'] in seen:
+                    continue
+                seen.add(it['vod_id'])
+                result.append(it)
+            return {'list': result[:30]}
+        except Exception:
+            return {'list': []}
+
+    def _norm_tid(self, tid):
+        try:
+            tid = str(tid or '1').strip()
+            if tid in self.TID_MAP:
+                return self.TID_MAP[tid]
+            if tid in self.TID_MAP.values():
+                return tid
+            names = {c['type_name']: c['type_id'] for c in self.CATS}
+            return names.get(tid, 'dianying')
+        except Exception:
+            return 'dianying'
+
+    def categoryContent(self, tid, pg, filter, extend):
+        pg = int(pg) if str(pg).strip().isdigit() else 1
+        cat = self._norm_tid(tid)
+        ext = {}
+        try:
+            if isinstance(extend, str) and extend.strip():
+                ext = json.loads(extend)
+            elif isinstance(extend, dict):
+                ext = extend
+        except Exception:
+            ext = {}
+        t = str(ext.get('type') or '0')
+        a = str(ext.get('area') or '0')
+        y = str(ext.get('year') or '0')
+        s = str(ext.get('sort') or '0')
+        path = '%s-%s-%s-%s' % (re.sub(r'\D', '', t) or '0',
+                                re.sub(r'\D', '', a) or '0',
+                                re.sub(r'\D', '', y) or '0',
+                                re.sub(r'\D', '', s) or '0')
+        result = {'list': [], 'total': 0, 'page': pg, 'pagecount': pg}
+        try:
+            url = '%s/%s/%s?page=%d' % (self.host, cat, path, pg)
+            html = self._html_get(url)
+            items = self._parse_items(html)
+            # 本地二次过滤：仅保留当前分类条目（防接口混类）
+            items = [it for it in items if it['vod_id'].startswith(cat + '/')]
+            # 过滤后条目 < 8 时补抓后续 2 页
+            extra_pages = []
+            if len(items) < 8:
+                fetch_pg = pg
+                for _ in range(2):
+                    fetch_pg += 1
+                    html2 = self._html_get('%s/%s/%s?page=%d' % (self.host, cat, path, fetch_pg))
+                    items2 = [it for it in self._parse_items(html2)
+                              if it['vod_id'].startswith(cat + '/')]
+                    extra_pages.append(html2)
+                    items.extend(items2)
+                    if len(items) >= 8:
+                        break
+            seen = set()
+            uniq = []
+            for it in items:
+                if it['vod_id'] in seen:
+                    continue
+                seen.add(it['vod_id'])
+                uniq.append(it)
+            pagecount = self._parse_pagecount(html, pg)
+            for h2 in extra_pages:
+                pagecount = max(pagecount, self._parse_pagecount(h2, pg))
+            result = {
+                'list': uniq,
+                'total': max(pagecount, pg) * 24,
+                'page': pg,
+                'pagecount': max(pagecount, pg),
+            }
+        except Exception:
+            pass
+        return result
+
+    def searchContent(self, key, quick, pg="1"):
+        pg = int(pg) if str(pg).strip().isdigit() else 1
+        try:
+            url = '%s/search?q=%s&page=%d' % (
+                self.host, urllib.parse.quote(str(key or '').strip()), pg)
+            html = self._html_get(url)
+            items = self._parse_items(html)
+            # 站点搜索无结果时会回吐推荐列表，必须本地关键词过滤
+            kw = str(key or '').strip().lower()
+            if kw:
+                items = [it for it in items if kw in it['vod_name'].lower()]
+            pagecount = pg + 1 if html.count('class="thumbnail"') >= 24 else pg
+            return {'list': items, 'total': pagecount * 24,
+                    'page': pg, 'pagecount': pagecount}
+        except Exception:
+            return {'list': [], 'total': 0, 'page': pg, 'pagecount': pg}
+
+    def detailContent(self, ids):
+        try:
+            raw = ids[0] if isinstance(ids, list) and ids else str(ids)
+            raw = str(raw).strip().strip('/')
+            paths = []
+            if '/' in raw:
+                paths.append(raw)
+            else:
+                # 旧配置纯数字 id：轮询四个分类定位详情页
+                for cat in ('dianying', 'dianshiju', 'zongyi', 'dongman'):
+                    paths.append(cat + '/' + raw)
+            html, path = '', paths[0]
+            for p in paths:
+                html = self._html_get('%s/%s' % (self.host, p))
+                if html and 'urlList' in html:
+                    path = p
+                    break
+            if not html:
+                return {'list': []}
+            cat = path.split('/')[0]
+            vid = path.split('/')[1] if '/' in path else path
+
+            # ---- 基础信息 ----
+            title, year = '', ''
+            mt = re.search(r'<h1 class="product-title">(.*?)</h1>', html, re.S)
+            if mt:
+                raw_t = mt.group(1)
+                my = re.search(r'<span>\s*\((\d{4})\)\s*</span>', raw_t)
+                if my:
+                    year = my.group(1)
+                title = self._strip_tags(re.sub(r'<span.*?</span>', ' ', raw_t, flags=re.S))
+            mi = re.search(r'class="product-header">\s*<img[^>]*src="([^"]+)"', html)
+            cover = mi.group(1) if mi else ''
+
+            director, actor, vod_class, area, desc = '', '', '', '', ''
+            for label, holder in (('导演', 'director'), ('主演', 'actor'),
+                                  ('类型', 'cls'), ('制片国家/地区', 'area'), ('剧情简介', 'desc')):
+                mm = re.search(r'class="product-excerpt">\s*' + re.escape(label) +
+                               r'：\s*<span>(.*?)</span>', html, re.S)
+                if not mm:
+                    continue
+                val = self._strip_tags(mm.group(1))
+                if holder == 'director':
+                    director = val
+                elif holder == 'actor':
+                    actor = val
+                elif holder == 'cls':
+                    vod_class = val.replace(' ', '')
+                elif holder == 'area':
+                    area = val
+                elif holder == 'desc':
+                    desc = val
+
+            # ---- 线路数据（聚合解密） ----
+            data = self._extract_urllist(html)
+            play_from, play_urls, remarks = self._build_sources(data, path)
+            if not remarks and year:
+                remarks = year
+
+            vod = {
+                'vod_id': path,
+                'vod_name': title or vid,
+                'vod_pic': cover,
+                'type_name': vod_class,
+                'vod_year': year,
+                'vod_area': area,
+                'vod_director': director,
+                'vod_actor': actor,
+                'vod_content': desc,
+                'vod_remarks': remarks,
+                'vod_play_from': play_from,
+                'vod_play_url': play_urls,
+            }
+            self._detail_cache[path] = vod
+            return {'list': [vod]}
+        except Exception:
+            return {'list': []}
+
+    def _build_sources(self, data, path):
+        """
+        组装播放线路：
+        1) 优先取内嵌线路数据（每集 sid 经 POST /source/ 兑换 m3u8/mp4 直链），
+           线路按名称排序，最多 4 条；
+        2) 无任何直链线路时兜底详情页；
+        3) 最后追加一条解析线路（交由壳内 webview 播放详情页）。
+        """
+        try:
+            sources = data.get('source') or []
+            url_list = data.get('url_list') or []
+            lines = []
+            for i, name in enumerate(sources):
+                if i >= len(url_list):
+                    break
+                eps = url_list[i]
+                if not isinstance(eps, list) or not eps:
+                    continue
+                clean = re.sub(r'\(\d+\)\s*$', '', str(name or ('线路%d' % (i + 1)))).strip()
+                lines.append((clean or ('线路%d' % (i + 1)), eps))
+            lines.sort(key=lambda x: x[0])
+            lines = lines[:4]
+
+            play_from, play_urls, remarks = [], [], ''
+            for name, eps in lines:
+                flags = []
+                for ep in eps:
+                    try:
+                        # 解密后键名为 title/sid/name，兼容加密原名 ujumf/tje/obnf
+                        ep_title = str(ep.get('title') or ep.get('ujumf') or '播放').strip()
+                        sid = str(ep.get('sid') or ep.get('tje') or '').strip()
+                    except Exception:
+                        ep_title, sid = '播放', ''
+                    if not sid:
+                        continue
+                    flags.append('%s$%s@%s' % (ep_title, sid, path))
+                if flags:
+                    play_from.append(name)
+                    play_urls.append('#'.join(flags))
+                    if not remarks:
+                        first = eps[0]
+                        try:
+                            remarks = str(first.get('title') or first.get('ujumf') or '').strip()
+                            if len(eps) > 1:
+                                remarks = '全%d集' % len(eps)
+                        except Exception:
+                            remarks = ''
+            if not play_from:
+                play_from.append('网页解析')
+                play_urls.append('立即播放$web@%s' % path)
+            else:
+                play_from.append('网页解析')
+                play_urls.append('立即播放$web@%s' % path)
+            return '$$$'.join(play_from), '$$$'.join(play_urls), remarks
+        except Exception:
+            return '网页解析', '立即播放$web@%s' % path, ''
 
     def playerContent(self, flag, id, vipFlags):
-        raise NotImplementedError
+        play_id = str(id or '').strip()
+        result = {
+            'parse': 1, 'jx': 1, 'url': '',
+            'header': json.dumps({'User-Agent': self.UA, 'Referer': self.host + '/'}),
+        }
+        try:
+            if '@' in play_id:
+                sid, path = play_id.split('@', 1)
+            else:
+                sid, path = play_id, ''
+            detail_url = '%s/%s' % (self.host, path) if path else self.host + '/'
+            # 站外/网页解析线路 → 交壳解析
+            if sid == 'web' or not sid:
+                result['parse'] = 1
+                result['jx'] = 1
+                result['url'] = detail_url
+                return result
+            # 直链：POST /source/ 兑换 m3u8/mp4
+            text = self._source_post(sid, referer=detail_url)
+            text = text.strip().strip('"')
+            if text and self.isVideoFormat(text):
+                result['parse'] = 0
+                result['jx'] = 0
+                result['url'] = text
+                result['header'] = json.dumps({
+                    'User-Agent': self.UA,
+                    'Referer': detail_url,
+                    'x-platform': 'web',
+                    'x-requested-with': 'XMLHttpRequest',
+                })
+                return result
+            # 兑换失败 → 兜底交壳解析详情页
+            result['parse'] = 1
+            result['jx'] = 1
+            result['url'] = detail_url
+        except Exception:
+            try:
+                result['parse'] = 1
+                result['jx'] = 1
+                result['url'] = self.host + '/'
+            except Exception:
+                pass
+        return result
 
 
-# 装载参数一（掩码 + 分段 + 行序打乱）
-_kzp_seg = [
-    (2, 'ebd29d392396cbac'),
-    (0, 'd09702b1d0e3eb5a'),
-    (3, 'dd2238bafb78d8aa'),
-    (1, 'b44c17659220bd3f'),
+# ======================================================================
+# 模块：sz
+# ======================================================================
+# -*- coding: utf-8 -*-
+"""
+================================================================================
+ 小山影视源 · CatVod / Box  Python Spider
+================================================================================
+ 后端   : http://43.248.128.122:578
+ 账号   : sukeke / sukeke.1   (已内置,可在 init 参数中覆盖)
+ 依赖   : requests (无则退回 urllib)
+
+ 已完整验证的链路
+ ----------------------------------------------------------------------------
+  1. 登录       POST /api/v1/user/login      {"Username","Password","device_id"}
+  2. 密钥交换   GET  /api/v1/security/challenge  →  POST /api/v1/security/init
+                → session_id + sign_key
+  3. 列表/搜索  GET  /api/v1/search?wd=*&type=<分类>&page=<页>
+                → data.hits[]   (wd=* 为通配,配合 type 即分类全量)
+  4. 详情       GET  /api/v1/video/detail?id=<vod_id>
+                → data.vod_info.vod_url_with_player[]  每条线路带 tk 票根
+  5. 换票       POST /api/v1/vod/ticket       body {"token": "<tk完整值>"}
+                → data.ticket  (play_ticket, 内含 parse_api / data.url / 有效期)
+  6. 取流       按 parse_api 分三种形态解析:
+                 · 相对路径  /api/v1/vod/parse?code=..&t=..&url=
+                        → 拼 BASE 后 GET,服务端直接吐播放地址
+                 · 外部解析  https://.../json_api.php?key=..&vid={md5}
+                        → {md5} 用 data.url 替换,返回 JSON 取 url
+                 · 外部解析  https://.../api/?key=..&url=
+                        → url= 后拼 data.url,返回 JSON 取 url
+  7. 推荐       GET  /api/v1/video/recommend?id=<vod_id>
+
+ 注意:device_id 必须与账号已绑定的设备一致(每个新 device_id 占一个设备配额,
+      超了会报"设备数量已达上限")。下方已预置可用设备号。
+================================================================================
+"""
+import json
+import time
+import uuid
+import base64
+import hashlib
+import hmac
+import urllib.parse
+import urllib.request          # 原脚本漏了这行：只用 parse 却调 request，壳里必崩
+import os
+import random
+
+# 后端是境内明文 IP，走系统代理反而会被拦，统一用直连 opener
+_DIRECT = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+try:
+    import requests
+except Exception:
+    requests = None
+
+
+try:
+    from base.spider import Spider as BaseSpider
+except Exception:
+    class BaseSpider(object):
+        def init(self, extend=""):
+            pass
+
+        def getName(self):
+            return ""
+
+        def isVideoFormat(self, url):
+            return False
+
+        def manualVideoCheck(self):
+            return False
+
+        def destroy(self):
+            pass
+
+        def localProxy(self, param):
+            return None
+
+
+# 已实测的分类表(type_id -> 名称)。search 接口有严格限流,
+# 分类探测会连发数十次请求必然触发风控,因此默认直接使用本表,不做在线探测。
+KNOWN_TYPES = [
+    (1, "电影"), (2, "连续剧"), (3, "综艺"), (4, "动漫"),
+    (20, "短剧"), (21, "少儿"), (22, "漫剧"), (23, "纪录片"),
 ]
-# 载荷：zlib 压缩 → XOR → base64 → 切块打乱
-_kzp_parts = [
-    (10, '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'),
-    (85, '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'),
-    (93, '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'),
-    (26, '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'),
-    (46, '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'),
-    (92, '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'),
-    (70, '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'),
-    (3, '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'),
-    (5, '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'),
-    (19, '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'),
-    (57, '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'),
-    (17, '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'),
-    (20, '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'),
-    (97, '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'),
-    (89, '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'),
-    (98, 'Rj+YFZzWaPaSyh9oxFDOgfuibWMheFz0xWuyR6uEoxs+q96cl8F5iU9Efj3KTbapEO8PJp+aJEyOW/RMSsSwwt+WkzNQ//elklXODJWhHmA1Bz3DguVFN2kqL7OGIlPXmUmQqUAwN58S6rwWHUqvVzr0OUKqkpePhgEkipktZYfOxQQRQ0BYMTV4x2ujy88gAer4rMPCOsS2EN/Cjll9aKNDtlwy/3cOGqky+ezwS6IMEQHuFhhS0+iuxqavk/6W1vSDuCcf8M5n6/TGDyW/gnTY7lSqczPeRTsHWfZAts92cgwSpcPBiCquqRHuF+ysXSzFmGYKZfGuUZz7E7nD+RZS3SshvKGdILHcdU/ZHtAwnrW0u/9Olim4Cs7jV8vCnib/TrnQZlxylyoWhALE70cvhzRCaSnzc3t7Av8HPDr9q69nD1WAJ47LMlJVtG+fobbpgMtZtzmfJkxWN+2cGsxmfEmoqEEDypjq8CWsviATiKaaAoh7DlVpQ60Faopv+XljVFqMDCmFXA/z+IzdRLwf8anwhCXguZo1aTm+ASwUbdMF90TcOjvvtC8EPO2+8tr+wOUJLcf6j6SWcXMm3Fl6Us4kkdReeT4H5TXbEnLOyqJ3A5HLEfeFzuZtrKKINkvm6ZBsCvIHdFtNgPwtqfeDooD+6KAHTjJSgjgtiv55G7BH84Q0FpzQn9IUZNGhNTU7Z+NxFAT0tL0/EnretqWAuSd/5FDreAZ3NqSLnYNhe2TAN9gIoydjgW7N2ncazDUD+aTPO38YNNnfn6jh23YS+fX9p8vDkpiBfgSpRFSLud1DXFhtr/vIPA9avCwmJX3X/8idwm1RxssgDLlsD4fnbgESRYO//iYOmVu0FcqGgx6Qv0OEI+5BvdgHxc9m5rz1CTKN+FVEKjKLG30wAMQLb75uTajV/pb4T/WlZpd7eEUVwhtwcCplmhyGz5dnBRj8iwqjGoHykMtDft6nnxPLfRWDLi0Y+AU3gBP1dfZZus8mZ8Bb0h87pVATCS/ksZllh/CmsW4ReOGUq5KTttTNQkRDDHheHVe8h83VuSFP7AsQDC6coUKctTGtNi+5roEG9gDofWUdphwcOhwaNvVumSFDnkQEuP2WaYmoxKceUJ2tP/dYPO67KklC2SHav+RKxdGDgrwK7OINo8SZl7TeN6CNBCk72u7D6pY1poSLm2q8aTtpn0hmcZlk2C5UFKmC7ipEWGMhONpl/R8mip+yNvOntqt+fAlPPoBXrmGbCZmZQTkf9ZlFfYDUzXuKmTVoLYWZk2lAc+Cz'),
-    (73, '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'),
-    (21, '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'),
-    (86, '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'),
-    (88, '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'),
-    (75, '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'),
-    (54, 'ra9GAkDaPWTgok6P45jUvojEERKviTPQJpUHTgluS2iWGmkkKhY48B9LJIZxc/AeEAWYh8FSZMR36PWB6akY+34HSEepYQQlMDrHxMTY1yzMcLAwncKD+A1ug1scGYS0FOjzNNJmyUWSN8ssAqlXyveGUnvufuUDlxxIGaKASGJY2waWWag4F8qBoIcpz7qdnhhNCi3Hy6m0lHr0yEDIAJtALPZMzbrhugkBULjHMVJGicdt+k5WkDqYtuc9OWt6NFxDEHBfl8Urr0BLCMeugYPNJu2Z05LclbOrYmMjHbsEOuuRXueob2Yr9bAkELgPkCLOdmzrnbMRV4YD4uGaYw97vuGW17tmLBRG54sKErwRspoNGKSfMgWB+x1gpVqoxhjiu78mdhorqVjzqhASp1nAn7ZN+zzPwYLj4+4WX+zWcSN3vz2xEgsIb3giS+1X1Ljj5DkcvW6ItUkD5RfwUShFlje3j/91MflG5OxwIUOBEj90gejTRRG0idc8mjTOgQ7fciMBqPwkj6t6xFBOMBS30su4kMuyYwFcIapyKvSc864OW5UeiALG9JNTPI8B3zT/6Kc3aSxPXJyy4Pm6iL7Ym+y8qjU2MPD4b4ru18hwIW/xKu9tE82/D5qOHNiUUEgqpAlyZiBE4T3Gyz8pdR/4V4CJMVFtKUI8DQXKuQEit66VOTzgflHoLq/ugG3NeZh3s6gYJNyGzCUoKlrJ7ByHaXiPdijegRN49NIHx8sI+2QpEZF1O7HWLhEqVSC7IlvS6MwN+XGIHFySUgnOkh4TUGogEvKKI1GQaHmt08B2L8lw5Nvo3DP6axK6ViGgu7oh8Xiq7+SkTl38gXd/9cd3d7bNCHX1vb5pCdVBHLgt+hcrw0evGFKuEidDBEPaJ0VKMxQoQg8vN/b9EKN7UFHQi4S746Mul2paJ6Gbn3IjWDKHjeCg71yi9BAOrzK0OMzZCucDfFGMWJJlkhL57oNKhGWn3wdl2DCn2ATH1gmx86kFP00lBo4XCTm4SS4P9H49BHZZI+pDMt399hKWg1tc6Kqg+yGZDZ/17nsKg4Eh1dRex/XbfxoFVoP+fwcP3w370DMshBWWnZVFpx8+U1jo1Zn6rKbSHhoZXwJNCS5LCQw5SaOBe261kuV0XdL3aq/4FGZdNekopDvz14AYDXbXK9YlfhX6sACKirAHDlp/khYE8pK+DcuLyVFDL/Zh4B+kLP+GeeHEwkYkshxKFD8cavxEnIHajqmwaIpi2HADePSRwuIOfuh0JdSXvnzr0uW/6HoKIXQa3r9B+f6g0Tff1kxLLOg9a9Yf3tfqlIuNq3dWror9jrUb4uE5+z6IksSJZiaX9QE1Jdk6d4fOoLZ4tmCaEueKSNWS1nuAe3rLiKr8bXGSFXzmbD+LEOKN46Z7vrtIaOuyfjQPl0iFJaHwFbOM/N37Rod5RSuGhyyUUKNf1nSH9t58GiepnRec0qRLpGF0hC0e9K1ySJW7oPLKB9nJ0DM810jwkeLJpyRVL4iwhdi2pU30PvG9AqbrglOa6sZSVNBUFB7ETZZsPGRLTyWXszuJSuTzIiD7MCg4s3U789QuQSNgNmr3WhAmthLK2urx3eaDNRfnRBnMpp1G03pYeXJ4d4K9hF/fqy1FnyfX/b2yegaaoDZkyMCnuaiLV+ys9s/lfuNA2qjwE3D/+uKM1lo1dSi79uTe1ESel1c5vwdreMmpdflkJVco6zU1CF55KzN7l10E0U/MeLhQxZJaHFz6oyG5mbz6gtLqZu1Cascj5zAPuXwQXrKWE/5FUeXWwbZ9mzUiQ6yZOd5Ra5DwQ77PzJfN9TcxGet6+mWynETXHTGqEIllo/QK0V2hH/ZJnqtyjWMov1n7hrh+MjBGXItqmPz6jZCfqLjb8tQyFfMXE6gv+TKMCwv0uQk+ZDcr9vfvg1INIU2tF8iLsBjZLYNSDWe3sqqwJDI9IJXGvfH3650wMUUy0PAsTGbaEwmxNFogEBVx'),
-    (7, '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'),
-    (95, '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'),
-    (6, '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'),
-    (81, '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'),
-    (40, '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'),
-    (8, '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'),
-    (52, 'uC1NeQgcw2Z0OAvbvBl+/jOWeXUs3KP0eOI1qhWq6hPhQ5C6+Rmlz34CAc/wrtk0dgO3+6/rqIQcyzGcHZprNDqu6O+TKVMxT9pv71jUwa2X4BOWMM8c2vE4idCXXPHf7DcwVUwk4IQQXXvK+//MXaKUCZmeJ/NLcQdyPYZ8rKuinTY2YKTlT4eCYVmygtg5kCeLyJbLq5ws/bn3dvHbJRyU1AdsrhR+llqeUmRcxZyJlzSkH9+dZn1gtlhB3TtQZlTe/vA23MuGehJ2YxKuB+Oq3WTM64Qaqte3ZN7GZTvcnjIDN2JSwtgHaxDXXh83Qpkk2VEEfBlSgg4lxLDZJSiDMgGeMh4nFifvusXRLZDUxmBdUbGMTPyW5XA9uMNZRv319M/pz0CgM6IZGZ+vdZ3JjIx5saThOHgWCHxJaVsI5K7Fqwq19g0AUS7gtw8Xy7h6qekhNG7doHFbwsdc665pT+o9Z6JujLnIh0qhV7/dPTpALTi+sSt1tf/IV1eBtk8+WJBI2sUEOL7shmV1ghtgXbFZbrIGfEcy+RITn4Pkc6NzYUKY+VKnr0m+C/E+4kYiFaur1sP5iJ8Shz4vYjjV0cLHDhQ2GF78438N08bU1rWdcSV5Z/bamjvgiAy5YSDn6ZgbNBe65aJha85R0a+KJGdUFleEG1GQUVPvwXSe+2ZX9RVDSIFsyivQPLL05RIPgSpkkly/T4kVHQBtrrRE2EPGlEFjYbOmauoSKOI0FsIDRdUWORdQeUEM05dkLhkSmJ5+EGwWSWhsGcnIRz8Yvk5/S4TGf2wiLXX9YH18V6jpwdL9yuJll6uIvOKc8dvZNZol8JmUNL7yVP6enecUUtBRf0mLRQ/NcRADbjE6+SK9zkfXfrmI9uUIXAKa9wd/BlIdJjfrrLkm/DzyvK9MzffaTaDiyelb3hFEOZENPrmIdGUGNiXQKYxqxoHYmfGpuo1WuujANtrgtd//pnMGsjOikMurtRcL7H3gDg6rIqwsLBuJoTXH7GrEcsPERrMgb5Zh0Dj6xKAYAJK4Ooq8BTIT0MAR4T+kG9rMqw/UwjOgkmo554NfaqS6r5Wo2CsG8++U/BudfC1gEE6Ha4N/06fPFZJldsd+548GJFqhxGyy+MA4ccJNrWqt9ZYXSiEZ/C0wrA99HqWHFoKdqj7AuvxZ+s5wpLZPmLLfnm4kKtLUYG43b1zeISceKOZGwg+QKuRgn1/9Fb2gfAyyMmTRv9Tt5ja9hGmX/bgIwGuoQ9JNCTLfKbVhEPVMheJ3YyM970iHvinpaatVuleeuAUpw3RLX0/qAdsbWY0AWPbAY2q7V7rRbFeXJOTGIhQ924QHAVkfzY7J1fIRzxyudOvC0zj280pqCCHFQOhJdyl7YoSNRTLrM9eBhqKL7gKEEZtnZZ1vIHLzJba/dsRV2O7MzN9zX36e2yuLHLHZNYj3kmGli8Jz3P5Wmbt5GAVN345JXjFg0QIUQCeb4eK3VgSazydCFblLDje6FMEqr7rGPXhDfuw50E5OqCyITJH5UgWUgSShS4I1P/QD128WrntN/sug+PJ6QVul8TFyj3MxIxetH5BMZ5+WBdJM50h0y6xtMTk9LKcBrcgjHF7hsEYNIaYB1Z9Zz8TbUYjiOO8FS0u93r6OopywGIFF+p6TiYdBQrufxvL8OUcZsmvwBVNKYR1YwO1bnMt36md9+r22dD1fcnEm/s2/pk653ABQHAjYdno1OcDGq54pt0ivUDtMLVXItJjzLiF0W2OMgQBTXoeO/VCPMzMXlbnoL4hs/+ikTWtJbWjXLWd5xWv4/UIYgVKdFd9TzXyYOnsAKcdLriJv8rtjJEMJXqavcQ6VLuUohWIeN+WUpRa/cDXh/HYP2M/KtarFc2lGtyilvV+n8SX8K/p5k8+0OlFVIpjc8SW5uBd97qlDYhyMMvrROGmPKOEWvmV+NjAbYlbWRuRIGZdolls0qPTRr3z63E5/YJVX67ggNGj5aBU1'),
-    (29, '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'),
-    (0, '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'),
-    (27, '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'),
-    (24, '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'),
-    (64, '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'),
-    (22, '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'),
-    (9, 'h+N4DM6uyhicx5zx9fdWs0DwAI2eY/Y4vgZQhyj0Kb6Ty1pA4mAI67T2xxhqSXC/i5D39F2y3oB3G6DjyKf3JSLGTCxgAlDo90lNEnKW9MvFyeh6I09/QL+tWptuXZTsZQ/1SPzL9dJDZeHv7HPvTm1gOUbwHjwLdfdm9H3VcAvW103sWZWqzzlNj2t75XsN+MStHu0KI4/nmolsGFcNmxMxiKbutT/4Z+dUxmkIQxSLblUwPRf+3++QnOWkEvAwCykuz7sb8kDc78ojDPnHPVtBkDX6VyevQO101HKTN+fNid6tScs2mDAZWxBBoDj2LzcQ6ZjQpcGo7l77fsJ2+L2HYf9/qVzfPWkof4yFVG+TZlDe4UmwgnuOHDkwufU+GQaG+aZdpKnsqqG2FmVs4yvaz5SIpW1uYmQLiTvTdr1aOAvVydNC++vwTdsn363smBWRf1k3i5DJCik3zUNlEPDf2Aioufz1k2aOh5FLTENnpspcKb+t1EMT10XoPutgO+BkbljwrnoGyUDrB1b8ZS1JGYdIQWU26SwLWQekS6i6PINDci/r+yRfJX/taNh8EsxN3r7NBLRXxcE55C5E6jPKU1QkQJMDazOrspdA/Q9izDW5pVDiCSkpKBJzL1LAWVqRFIUYAo9+/HG/LvJ7Wk0FJ+jG50q5mgG/LaNKJaU0dxzpsoMKUmiAcAGnAnQ5SZSRVUx1sxosJZogiP9SyTQ6IHdte9+8QNlZvJnHgl6YEIQAQgVYkLc5KbFnJEE+l70pyJtKM9sqJn2zOF7Aq+opHxFUu3JvUxMc3lwi8iD+w83bWJXL4v5S6BMgdrtcLvLhAvDJLuf5p2Ff57lm0Gb+pjC4E2eEG/bzBVN1xZtTmHi8mhN2eyKil7b0oiAYZBAFZPe0mnPQR2ynchnhxb8MlVpwsHwwciNLaLe/1yQXLJCCKbEOiN0sRlo+Pt3qAcnoeaO2UxKoqjKY9hfFZDQgzVCqBzdpHEZ/VM65MLgboB+Mz6fJFjkZkxUa9XVxMzwLH6zNVUfnRjDfCCffh9IEriiz4f5zc3NuZhmO5z8aw0zFp/myMsRg7vA9HMm32iDTWU8hJUq2X7CtJRlxiYwaD1KgIsgnMtAs63zigaztggTucfSxikWGdy/5GA0+QOyitM8I7qWRYYPNaGZt9N61MyHHbrabZXAYg5xxcrWDrWQmLHEVQerALPJZvJGzZ6QAifJ8y93qVX3iuXotONo4ymhwJ5xlu8HOSezF09ULL6DQlEtJQs3xVuRqyxzZ4pos3BsnJJCTKnQQwiCQiqf4WV9L4dX31QCncpN2tPyJHcwe/QE/Hj9ObyYXB7QYOpSWXhBtf9Yhb1Wug93AWVx1nA5JdiItvlrBjvf4TqmYji1TzOb4gHGcz5/ipQB9pAiteqLK2tOzmR7KggNiD8Z8npdLId8Eogp8GCNMfvNClRfqgkqUgY98z9a6sTUg1SHbreUdDRdxgYH4pNIdoBvJyzvFRWw67mDsYeCHvr1pqs0RJd5obYfNsFMyTWLgqySpL/ILy3EKVQhmJoZH3DoNOPnY+uTroreafla8P7Gzf/XpFEqKF/W2E/pAlgu2okkwVv1cRBxWpD4VewqsnlGKWmD+LvIc8XXCTXa5G6YkaoYLioVjBZnxjpZ81p/dCT9sT2mm+tRZfhYm+YbKBPKXiwk7DmFWag6eu87WpROhG4XUWoLraPqUq3DGlMzbevmARfuf/usTeMt3jTd3V8Xgp6H5h+p4dEFv5q8eZKxJTSxO6lyTXlFb2ZaW8fTooH6paDKzN84w+b//wRKyu24HQQd5yoNKtHyoaqLdlxhETlnrnTtURsZue6EYe+HHiySOvZT+1piqG8O5gIO+ClNyFm8qvEJLvbr9x14ur4XjUD1igKZoQwy7dAvIDH6P9vtzUgRNYWkKwIG9gXmUQNaJVvSE48wIxc8XJOp9Enu7slw+//XXpptbMkhNmWLEsdqOs+HJarSZlESJ'),
-    (58, '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'),
-    (65, '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'),
-    (32, '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'),
-    (34, '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'),
-    (78, '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'),
-    (90, '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'),
-    (47, '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'),
-    (13, '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'),
-    (14, 'Mbg+wFnYFkp2vIOx8mmTsIUzKJfGhx39AlUz2ZfUZjRz9mChBj/zm8DJ3WIuJtMq1VYNMynqZhwuq+yUwPlcK8sLl+8c/y5GsAcnhRdS0DSj6mMurlRdXuoQxb6uMPjwLwuvjus5xtD7/HgVNtVow8bk+jR6iB9AOx8j+exV+/qgFfOOlozCQ7bgzY0MPtKbY6TfTrp6PhdzyhAqIPb08iPxOpMNNdcVV72BhOxO3nvy3UiD67/0jBFIsz+nmivEy549w0ubi3PrYtVkw8cf7pvfSV2w6VxWaOrpuYbh/GRGQoUP4B/hHdm4pjoRbeva9G9fHMyjtmBUbG7SDrXIEdK9tdJNqcXRlnrQz+biXoK1+2RIJRdq5v5FznOt28ehxqn2fN9arPW6BFMYa9bpv2c2A/q0l4aorLq0UbBDZnNfZY539cTOoypzSTtE9Q2IeMp9qdsXCs/voZcsIrBNdZBLm4XCM+qrYizMlqmUbaFPqFPAMczq9fKdiB8b7Enzpby7/PYTcXcdFOYwDsULFylQ8XALr86xCoknFn/p6T0T+Qqwh02k0LJMV/iHDvswkGlHcIxGgpLTHTj9OVvjhgiunazgwVert/CJKtaPn1fMbaVmkRUrVSv+ohJrRudHvsXCPgITpT7Z7vCPXGmLXi+XQPuDeol+XXMXW3CEXUWrcHatsFoxvcSTChAIfwM4SNVVBID7Bi6RwYU9qRT3nzL+j3JEyIO9bCKPUzVJ3V9Ah8BXpsirgrpMh7+O6jFN9fGbrx6j5cBTKU2D/+zeZSBbDtBdv7xjwEeH2S9A090YJJyST6+FHEvynF4/AA4z+gXBXF1gYUyug5KIigyWOix/2XxRi/+Y5732OnaBEBUSyY2iLc9HvYwrGjgpGwTHrJALRPsNMyxnupCrbA/xyC8lg1H31VYAFlMnWo6Yo4Ha4mZo/SO5cogrV4j9GWBTe3YyClEgZs9LWKcenJXt3Vr36XVN0eVWQwDIrWcZwOWi3lNa2us6t3CEP3SVKYuMixp67OE5DoY00Vo4INEBNalK+rLY5fdrg5syMhgxD3412i9der2ptxeHEW6+LeSyNo7h7HDvjXbSzqXr6k8/Hr6NILpJDVO5fgdi1wEUDfJtIigHhBO5mUUHTiXKjGD5DyheMhMSy/ziWrs3gnF2acge0tk545oRJC/DXvsgOvDEFmcCna3GQV6SD9Cf6mA0qbWh0uZSlKWqN2wQvS7cCagA8fe+DhHRQopym77um5rITWLb+M6mI9ntq6agbAfFpNlaLuHzQ9DWbnlx99Cb1cm6Vmr5C12cvHA/rdDNJJgnkVZCi4/AL72AFsT96QSTZ4fZj3NTnoJPNya/OsnPh3SENnGbgdnfEV6Ailf7j1HskYyD3RIrNLIFrNKY1maJaTZWwHZYTDvJmJ8b+SMydTV2P6pIcJ5w/ULtVGYvwz+KDyyUpNnfKINo1Rlc+wqn1MIXiSyzrmcrC3an/wlCfnXouzdNi+Dqf6uXGyFMSd+S+40ndVnnsXAFev8qthouMNJWLoLC+Eqi+eQyJbMCPxu50xdRSp/N30iGVrn49J3zY4SjA+ZDEEJ5MN+i3cKXfYQoxpX3ESx7xCybz19QthMpD0udnv66giesW9MiUUI/imWAp2Qa9JN14HT0kK/7DF1Xd6uQQUrnhvDh8ndOsNUWQIpLPwY1vS+Giftf1V5CZLhhWNH1/speD3YjkqYH+9NI2BCl/rGyBnVc9X7QP0Qr1wdJOUVL5E/uwRabTVuV3riOfHpwcvBQ+cuUM4zr3Twz0D9hBzhkRM7m1t8akgodyj5M+V+nzKLXCJetdVsv8m/yAl+FGhZacgo+cmTf2J8KS0+lco6NDGfbGCkiwvXsJRkSOcL0CVcSgsXoLWRk/L7ZVB2txihShk1dZ+sTQVXeVormkMhj/mEzm5vAblNpgTBD6SDnQAIzuvAos37yHZrPryisCiC2UDL4DD2YS9Q6AJKzGRj821hn'),
-    (39, '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'),
-    (33, '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'),
-    (74, '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'),
-    (76, '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'),
-    (15, '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'),
-    (41, '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'),
-    (61, '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'),
-    (16, '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'),
-    (53, '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'),
-    (2, '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'),
-    (25, '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'),
-    (82, 'LQxNqEVVYv41byabR8+NZyMh8s06snVEUu53AtptUM/O1zv2v1254rvHSEVJFtA90R0rusYQkYOyz+y6DKZ5vrwJPmYselTJztln5lGwWGJQGuRm55raP5jOrPK5ELwIWrc/QEoNWh9ZMLHLMflXSRDSdPkKJpoqTfeITvBYH8mS2RoH1myYEBKgEZ1AYrhRyMFBLcVYbS4Q4BflTM8kufNFiHM8L2r35pDSUc+Y1tfA7oqw/7h7CkWddNNRMXBcHNxFEaeP5tfiZbBUsAtSppeKY119ltH7wjudwfq5gwHaUz/tecQs3BRWjPjuBeocFtktLY7bvfHGW/iwSYa+TU9MKjBKQkJw6bx1mGIdBXc32oWhUwOTH+CB+iKSXgeT5I3miFXi4NaQbhzFk+NgVVN4E0N2yc0OyzgnGLbkHMYUn5Rw4YJOa8VnQ3CuIxM1tiIhr5D5yAu4Agmx1Ad5Gm8hdWRR+doow9H89YrG+GB9AEAmAL/n+FSRF7AYgMPpJ6SU+DSa+oM4v2lBKWcasq9l5kYknJUfV9CyXscSqcwEuAI9favgCR2ZXs5XlstIwk64SJjC/KAXNzUtV+Q1g1K7XlYR8Fs7WElP4wxsfMm3APBzR2w0YtWtRUhOOY3keY86fzAMwzpBm6k6DPnOo2QBSMOPAN2O8kWgvtSwRDWAUg6uhzS6a0W24lYWlxiVYG5Cm6JdZFpUt5+Oh9GUIWl5vA/7T6cxVQzaaw84mTeqH7+Wi+xSJJL6txHiLxV4MIhlevwx6YkL4fbunIs5EJpo20Ckq9NPv8gzQkLwkq0+MvWZrQnISYuwU23ZtQFiFkpiKUFsAt0v+7egnDxlzc39XF2b376pP3xoPusnX1QCs/s39Rv+T8atRmo1XrVIUtxDI+1J6OgC4zStZOxaCDQcdUBJYsaHP4tJZXrYvUyhy16UKQ9RWDx4yzk/VUtyqicTLZDX1+yuLOkXGqOheuDtymH/VVSVYiOnBfLF0h0G2CnFbuZ2srkn81AI492VxdcKkBxvfE3mdhpcdDSY9hehQZW28b5JI9sqQ8KXiE/fmo4TDJnRe0siL2+22zPasINDvZ4GdL4tsul7HA/m1pCplWKUu6N/nJ2EVf1hMnwuKC4ptYHhzOSxNKFSfFBah5g5RWqIFzZSqg1z5in10qooU9qj2S4GUUnO8GQwMf3Tz7nFfDmWmvnpG6HUwBUcMW4l5vGib751hAYxd0scxZcsOVTcq6QcLIY2po5bklxv3lfLavFoy+vPtKJ77Nthnz0x6UqNIuBIuvoMEm/A3N03BWRiulmEgq3hyCZMVmNz+QbGxlZsl/czfBdB9hVR6YwwazbvP/vkBq6TTmcGu3mRIekJ9e/R8Zul2tVEPLEWKg91t2S/0tsafbmhproYl1GR9W8aKznNIZyNjr1fi7dz8c1cglXIp6wuSU/gWIhD4CgjYmk9liX7lh4uyGsyuxZmr4ifmxqj/y71AuG/uQkYQ9vyVJTaiZiVm6Bdvq9Fy0gZ/vlrtS80JMOr6LKYQ+tyPPAA32weinmriuyU7Y5XcWwnoj2HgtXjKcaJd9IW1l2BT736v8DCDYu8HIgONtcuDIPE4dVGFYNHYGyhcrESmslKzM/qSII5K3LHs2JqNCWMPdvbPVokw1bxzK5L09FDNlRFrweVetNbf5rUsVpPR8tXrAIXbIR4Dn16+svv6051Y5hedRIOS9C3fuibbJU2w+mnlz5UcVIvzq0mtTKa0NH7ecBDl3hZEcmPetZtGs8n58wuIUzcH73aqwnmI4KOodNthZziLpxuS+qFoNYBWtYUwiTI1oAfJ8QYYMHUpinUbFpxa0Ikn+QjKX2brKEVMGiYO7nZE0c0FXHep45Igx7FpQW2cgGCBxzugCnf3M6TDQr47NOlc/lWUpaiD4x8ir1tEZD/vue2Itf66OJODsGoF1b4CsCOHwb6E82dxfDifc3REegMhthIt4dcg7FIkA0xQ/7eAzQd'),
-    (56, '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'),
-    (50, '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'),
-    (80, '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'),
-    (60, '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'),
-    (4, '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'),
-    (12, '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'),
-    (45, '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'),
-    (72, 'TiViFIuxtx+/hGvm+oWAS0Ugx8xnflbZQJXJ/bA8PqEAvpItu02bQSCLBfPczwt+VFpB2mVJgjmTPLJDi03ugXaq8aQ11DnPj8bggXHMOhbPOjhxLmBjeyKZmuC97vEDkjNITfiMl9FSxgRiAbGKyrAqkCfnkMcuSuZsgoIOPhDdg6maDZyF7qbHjYHr60d4f214qqBK4b0WM0d2KbNbAJxRFoxPpBaW6K0tvTG9FlR6SP81paHnHVv/eFFwNg/iGgTyzvLKfEP7HiKTbtFjabrE8TU7usEflj3OUSII3x9VVR0Kt5TCcpy6uNYOVqGZYMbLFY/HBGng3ArggNosDaNUqFTVc+uxgTlPEw3JyknfrvVXYmG6+SA2bYx2zyHMtueuUCMUnlLg+9jp/G6EnhHVLY3f9Rx4K9OFoyUJ8jsEuPJasUCRW2qimovXGyRRrCDJEjF6sBHt6kencsDkaLwEzPSMLyvjyBvKZSKVWMjYngt1N2RRwAmW42lpRSPBvmD1i+p/CXjU2bp9Pw1FYjpD6kR2pSfvp2oNLE4r/RBxaLWsDSRvYzWB7L2EkBaXd81hqLtMdK7+dT687E0EsVi3pnoVnBoKJ59BNZp91WDpxLGS31VBmH3IRyPcF4MtOHUZubh+cOLPiLPi9ugYT21cVvu2WLu5vlLqxv+um3XgStsrFH8EylhrPNUTgFsyN3P88DKoEIl48nJU126p3spkxkbOzL02TyQd3NEchBVcQKdvz6riCw501uhrxLgRviwtfbq9oXZYMI22i0JXSE6B9Aa4EuZb2mfwclbovEmXcGfYvB1qNV2jySM04hlISDCQEy1bMPks891m/QPQUYQ9rt4JS0ogRp9LwhKRxKp1n3BaH8fnHDe7dt3L8OAhvMQgzc9Yoco4P5xU9jy8gJxwuo5NoGJRCTdD1sT4o1X0d7UH83FHwj8N9iVCAsM6mNJXA4D/TXZkVBKqdcM7MbwFk1S4OJNQ4+LjIDJHUC/pIoaDg+Kv5aexvXQAWfN7F34g+HEky0CujDIf+7HHJETuJHhc5NjwgSmBxevApNFZPm72wTsJf1C66Wc7VflDcq0Gl63G1j2I56lWP64DLmYXryGCgrRyyrpwYG6RkTU3uG48SlqeB2P15JdGgDKubccOJ+Sf86sUcktyDLNXUXEvcZ+0JDiAZqUaPah9E+OUswKmRCif3nKlyMJBHsX1AxclrqhF9EV88SbqaF/fZbswtGmjNn/lVTz+4NOUX6wM2Rf9DblxB5kDd4Pq4bHN4fRAnHC4YuIqRKTxRzlgIgkXM70afyTjic1QTgdGm1bMf+pTurXQtzLUJon82ityPakwqon5LrqW0SIgw2L0/Nah5TFJhW8/mZLtS5sUXF7OFhZmQJrN90qThj2s1OwnQsztVCAH4IO+LlFPG9zWesySJ/vWdsj8urkUmaZ/ZKos91MWzl4ugmze23b/w9ZzBXAU0Aw6Zqeg9VyesBedin+/2gKOgA9v3Y+QQgCdYeGtuX61pI+kK5PPnmm0s+vYZnDsnLHoKihP2+6oJ6ePw+lqxTJnWNUnyPeDM4deq+nj2lgsksvG3rFDCj2sz0gVjDYUQhkoFDTg3vLiEPqtU0lEbAjkjKVUe/6BYYvAKwsJZ33SSy5EJlGbKnDINpZshZa9qr9t7UbSkmiLpbeiwLmWWJp3VD95fddU9unoVF/VbNDa3pTzQS3d44eiLDV4CX/VePkt82hN9Q6Ck7id4ZjT0SRxd4M4eCK4mhSgyjarQhvr9NzfUpU0YJ+bHRDI7E9KM97T0BvAByDpuLtd+GGQGrCLbdQKbfwbrgdCwK3RBqqhQGICOEA3G5kinvGj9vsPSEYFbtmp53tWrovhUkeMqHfxXRmEFxPYl8ZQeTax6OHylN1aH5Oor6YI+CrR3TnOH7a6Bwy9jHYs9k6WUggNnPQgNTCWniO0RYGI3HVBXFQIvxmleXL9QyT5DI6zAmdZCeHI2TZpXm2g'),
-    (68, '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'),
-    (94, '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'),
-    (79, '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'),
-    (96, '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'),
-    (91, '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'),
-    (44, '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'),
-    (36, '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'),
-    (43, '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'),
-    (42, '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'),
-    (49, 'D1VEcMFSanjYGO+F7ZUeeTnYyOpoe9gUtLs/wJ7NNH+oW5QJmgd7XJ0C6NbkhAenmCmAQsgWSS4pFT/0vYWc7TYGiiCzI5fejds5U68hTxSMnVsPTzTuI26oNsCSV9l/eMBbPCg/0uK817ihSla4AGhSdRwjtOOpGhxK5DqBZWIvjMrBYxMexkxbfPd3foUHXQ40j5iMp/Fz4BFZMO2tp47WH64o6RZTnOFn7QNoTSN3lSqbLBAvrJcyQ54HAnZpMPzTTQrWL/LZBZKSixNjwz5uVDT347f2UiDBTzpELsrqziBTDnA/tBoKrqSNNTTQfz1/klwOT1QSdgzJdyAIK8bCSSP4jEHSxWxsy9RModKHK0qLd4WWuQm1nFcY1+jmIpFJpyxR+GPmm770kNgbZEMi+R3SF+3fUgety8g1Spb/X59ubojFR0b3gROrHjaHCKpGUQ/fcglTVqGnOFh5QW0fzQ4ospwxS447dHerBEMc4u0jaemHD1c8nBDFczTn97LWi21OvCptfmRiv+ujmH35hawnun1TiOVrRW3t/+LdqX+/ILYXiJKWb26n3uaizk2dr1ulF1/OvE8g7AuESUiE0D7byTuHYOxNRluxLW0EItl39Ox/NhpSL/HXm8Bo6b0/pGRYiSTZ23gagxkAiBPMmPIs9i2BX2S4gRwGUnj08MsqaUkqMlGJMwWZ2l8PcR71cDHGFA/alnVZGKMSOGcnzwI133OC6FrlD7L0yrQuRAzmjj5la6dTqTDRRHkKjFUiPVSoV3hA7IRPAtXlBw5WkcCKOzbgjggerFdAghS3D1uZmr28KTFYAw3cfvl2TnyUzzrDpMRA1MIg2vuNbp3RlI0+MZs4Sjbz8wwF9vbXwJJLPkGwwz9WP1aq5fsVnCEuaOVkY2pxs6/q+gb3DaEaIFeT9c0wYQPon5jcB+LqtiXzqjc03QWLNnSJBWuvl/tE1d17PXhNdzWdkw2d2GbHKG5QFvipIf6tnBWAfwLV0G58NSzowU3ygs63WP2y2KnToeuaKd3M8xo4+HiBEsdE9DMFJryWu2g2kYLDeONFH4nu5r/6AO4tTTnciKAxOy6NwuAVIPkAS0Tpm4CVN+m7A8Gj1jKkiUY6pwCaM/fOcrql/ruFWQxdoqTXBYv+ueLhkoQZynoPQTrYDC1zFISFksDEiA5GRdkTLVNANo8qLdVZWvk7wWiyYredw9s90Nx+OGhoJe2LeIWMFk2h6nQYC86q1hxf2YOArcgHdeQBjBmAze3hsdDDEVI8Tv0GRe4HRRhhvUh9p9S5vsi5dAuFZ+/Zdf8AhN2wu7Iq8Urv6n04u3LN2nGw0fNi3GRhBe2GzXhA1rxqKE5j6NDlPrPwDvbpQQqhdTWf97NQ8BHHakfD5rnjrwh63YhUq2yOd12NNxz4knB6fssjDU3t2IdzRtG0hIGG5rxzTMYgZ2+JbV3zpuEjb4kbE0fjA0IMiUM+knKWXmBa52XnSMcO03MgKBs8Ua29wAWmWqgM5QCEXu1H5dumo9/NpDKmj6iaSZlFBwmbw6m64+OLUCbQ3TBb85BOkupd+zs9zS1KG0Pioq+mL8MX+MPlOG2RQNWdmmFJ2aW5BLBtqslcv6aE9sHeXzogY6ZxRQH3diwcPh1uELxjQ1yDnp/T5OodPM+694MvoUli09T1g4bnuIuIOShGCD+IUAFJggYoBMVjcfPUooaPLEq7o20zPdkpTgrGaOO6eGeQJD4XGqKsp1RpigJLvvU1BRVYw5f67LuUh/ealY061MDE2mFqGfinBy/9l1cPnTSIMOelIEk1JDMJy1QI+xDUqa0mC7YA5p13XijAplRDwHjCxwUakwJ9Kqc7JmCzTAp2n5J3+jsMH5nWOIHCprpjR9B7r4SgPQuBlYBPxCPWEAH7swZIRXO9nGuVj6zLy3NtOnXt7YyUDZuVJTlwxEj4jfVHp/dd1A1I7aie5hjJMOiRfDBd8E8laoa9sskJ0NcjRaQ0pOaF'),
-    (77, '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'),
-    (37, 'D6nxbV/DmSCWEhPP/xlQuBWXPEjeUlfOC2vK5i38JimsfrUB8Iq9JSwkAvPI1cTrQJwvNX8KHJ/57jb3D+gJZm+Tnc6yFsFRqw9qnBKiPw2os/l+rgHw7H36JCGc6pUiePWoRRTsvNjHBnmVRhyAidZY5du7nwFipyhlQExxDIyiyLYuYe56WAzr5gOlNFvKkdqB5UUSy2BmQ8j9uy5V2poHE24MAcb2sRt/8/gv7Ho50CIjwqoJ/Y8NVQc5Y+KfHyWmanptNouB9b4LFhg/YMkvc3QzRulyv3iGhS8fdxszDL+JB8gNKo0cEF8uUMi9+sE2GJFO6fzg6W0MHqe4Zcubnv/TozC6xRKcuFVZkNpM0Xn07j3EFFOuHwq2T20evhe+sTXOZWpgwE5Rg59HW6UqawI5Vy0SghrU9u34YcT5xg5x0YH0gljIVsRZdMM+UIiSXafvKzAaKBS1sMejJX5ZDidWYP4Nvmi3trUTKNHUFTvLjUWHH7aG+lBHnCjAIW2xK3evO0+ZyMQT6TyMa871SkXn9gdQcZ++tBas/H9+KcxgOWCcK1VDzLdzjuCxZxLtdee6hhKaBPUy3kX37bvrOuIccxcNG+4qTFa4Xy96AGJkAQSQ3L/JlPJDVM/e2eGgRkdp0ZIyJrZA4f5RFYLV9E+DPlCNk6C4vmjnftfdkMBowa0CPiWBJNbyyM2lC4fITp8W8RbSV2wz2FvhuA6JOMhZg4+co1OOmJ/IFys0Tab95+ytJSLkfhGNlhwDvce0HtLlXPLHZqlWbwAXA2jsiVMrrSSJc4pJu5j4zV+aAm+MI8W1xEhmjbl429/PhN4XmxY+JcCeTNs3j+IsNFrfPQT829hz1SrP+LURvOYLlpVycixar5vZ+JB2ingkyt4nG0ePpMx/dUBNZKpzDVRnvuUeGQPOfyZcsyt4MmesEKzFld/dcjwqKnyJ2QH8DXtuOE/J714v3MdFy/qfNQxDHBzFa/slZaVLgKeYylh0xbwLMFVihkBKeLvBMXih9JHtYnfHD3vwU7VR/cvJykRrrtgNaX0BymWEruoMLdSvC0zM2H/3oCobWjxxqc2wZUXuccuUTuWj2ZZGOdN96m4kziQ8xU92i3o4LDyJiU1frulgjOmRjukPY1YdKpT3cyLAvCHLd8OdE7JlSR1Nr/yubunk511qAIk1qAZGA9CMoTkENB9UNj6mz5tOA4G49OXAscmuqRlNfDQ1NTtjO9kzaQTtm3LQWSoVUG21sn0wNkfYZKFBZwY0VyyrTY6alnfS12l44Mp3bpBEqDATHI179wWeW0F2LiZO08+8Fjp54GuTJwQix2O9Xyad7Cg7EV17dWI/f2pyF1Vv9hpSgnyI4zeD/FuH3RoOQkmUbAR+tYNLLYx4ztVVOgm9dVUfv+2M/J2BEGu+zzo4WGCjSC0P7gcwrDp5yRlvu7vnAVJnAoBWHywPVr9QCWaUrSN0Q6EFJPYXnMy62n6C6pc50rEvYYy7Ta8T+lp5A6BU46UMHQRg8EOFgmMsOZIHrMkp1dpqjrJGu3rmQ9CiSe0fCJflQWnkzzLiyzfZpQc/E+7ayRDhz0lrMLvXzTRaMxS54Pu4dHZMx+ijRXooJTxcSwBZXw7ny4RBkNsNKmNPMwpymRGcQ3RYnO99iYCySiLt+0FJ6gP+zhrmO1DxFic5PvadRm28Mx8uP3XNn5fAbPf18unlS1Eam0txO4qJVwyOu/pefpgl9MAbNxAO65NDwNJTy+qx8oJWbmpe1uK4a+2MbBZlG0UfxFTO4l1vLDQFBcFLzrnwWc5NkO1koxtySMindUJB5/WmbfXwo0y+yxmKUHtt1UsZrIhZ45KGJkS90wshMDMskjDuM5iazxo53iIETD6vmcERPKHkwQzXoezzcSInt05x7/pracOw9ou0vRi0hMuyX3YjnPDST4siaRNrD6puyLIz+G7L95kQBwvdmkOyqIWNV0B9Ps16eBMABzpEf5E7K89+BmBg'),
-    (87, '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'),
-    (55, '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'),
-    (11, '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'),
-    (71, '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'),
-    (69, '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'),
-    (1, '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'),
-    (83, '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'),
-    (51, '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'),
-    (84, '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'),
-    (18, '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'),
-    (23, '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'),
-    (35, '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'),
-    (28, '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'),
-    (38, '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'),
-    (59, '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'),
-    (62, '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'),
-    (67, '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'),
-    (66, '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'),
-    (63, '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'),
-    (31, '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'),
-    (48, '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'),
-    (30, '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'),
-]
-# 装载参数二的取用位置（按序尝试）
-_kzp_urls = [
-    'https://gitee.com/tao060702/tvbox/raw/master/assets/pack/20261111.151554.json',
-]
+
+# init 接口的服务端要求字段(只校验存在性,不校验取值)
+_INIT_FILLER = {
+    "sign": "s", "signature": "s", "app_id": "1", "app_key": "1",
+    "app_version": "1.0", "version": "1", "platform": "android",
+    "device": "android", "version_code": 1, "uid": "1",
+    "source_id": "1", "site_id": "1", "type": "1",
+}
 
 
-def _kzp_fetch():
-    """取回装载参数二。"""
-    import ssl as _kzp_ssl
-    import time as _kzp_time
-    import urllib.request as _kzp_ur
+class ShanZhaSpider(BaseSpider):
+    CONFIG = {
+        "base": "http://43.248.128.122:578",
+        "username": "sukeke",
+        "password": "sukeke.1",
+        # 账号 sukeke 已绑定的设备号,换账号请改成自己的
+        "device_id": "de94cd65-a825-4972-adf9-7dbece13e9f1",
+        "timeout": 30,
+        "user_agent": "Mozilla/5.0 (Linux; Android 12) okhttp/3.12.1",
+        "page_size": 20,
+        "auto_fallback": 1,   # 当前线路解析失败时自动降级到其它可用线路
+    }
+
+    def __init__(self):
+        super().__init__()
+        self.cfg = dict(self.CONFIG)
+        self.base = self.CONFIG["base"].rstrip("/")
+        self.device_id = ""
+        self.jwt = ""
+        self.session_id = ""
+        self.sign_key = ""
+        self._types = []
+        self._http = None
+        self._lines = []          # 上次详情里的线路顺序(用于降级)
+        self._tkmap = {}          # tk -> {"name","code","ep"} 索引
+
+    # ================================================================= 基础
+    def getName(self):
+        return "小山"
+
+    def init(self, extend=""):
+        self.cfg = dict(self.CONFIG)
+        if isinstance(extend, dict):
+            self.cfg.update(extend)
+        elif isinstance(extend, str) and extend.strip():
+            try:
+                self.cfg.update(json.loads(extend))
+            except Exception:
+                for kv in str(extend).split(","):
+                    if "=" in kv:
+                        k, v = kv.split("=", 1)
+                        self.cfg[k.strip()] = v.strip()
+
+        self.base = str(self.cfg["base"]).rstrip("/")
+        self.device_id = str(self.cfg.get("device_id") or "").strip()
+        if not self.device_id:
+            self.device_id = uuid.uuid4().hex.upper()
+            self._save_device_id(self.device_id)
+
+        self._http = requests.Session() if requests else None
+        if self._http:
+            self._http.headers.update({"User-Agent": self.cfg.get("user_agent", "okhttp/3.12.1")})
+
+        try:
+            self._ensure_session()
+        except Exception:
+            pass
+
+    def _save_device_id(self, did):
+        for p in ("/sdcard/.xiaoshan_did", "/storage/emulated/0/.xiaoshan_did"):
+            try:
+                with open(p, "w") as f:
+                    f.write(did)
+                return
+            except Exception:
+                continue
+
+    def isVideoFormat(self, url):
+        u = str(url or "").lower()
+        return any(x in u for x in (".m3u8", ".mp4", ".flv", ".ts", "cmecloud", "apdcdn"))
+
+    def manualVideoCheck(self):
+        return False
+
+    def destroy(self):
+        try:
+            if self._http:
+                self._http.close()
+        except Exception:
+            pass
+
+    def localProxy(self, param):
+        return [404, "text/plain", "", None]
+
+    # ================================================================= HTTP
+    def _headers(self, extra=None):
+        h = {"User-Agent": self.cfg.get("user_agent", "okhttp/3.12.1")}
+        if self.jwt:
+            h["Authorization"] = "Bearer " + self.jwt
+        if self.session_id:
+            h["X-Session-Id"] = self.session_id
+        if extra:
+            h.update(extra)
+        return h
+
+    def _get(self, path, params=None, headers=None, timeout=None):
+        url = path if path.startswith("http") else self.base + path
+        t = timeout or self.cfg.get("timeout", 20)
+        try:
+            if self._http:
+                r = self._http.get(url, headers=self._headers(headers), params=params, timeout=t)
+            else:
+                q = ("?" + urllib.parse.urlencode(params)) if params else ""
+                req = urllib.request.Request(url + q, headers=self._headers(headers))
+                r = _DIRECT.open(req, timeout=t)
+                body = r.read().decode("utf-8", "replace")
+                return json.loads(body)
+            return r.json()
+        except Exception as e:
+            return {"code": 0, "msg": "请求失败: %s" % e}
+
+    def _post(self, path, payload, headers=None, timeout=None):
+        url = path if path.startswith("http") else self.base + path
+        t = timeout or self.cfg.get("timeout", 20)
+        hh = self._headers(headers)
+        hh["Content-Type"] = "application/json"
+        try:
+            if self._http:
+                r = self._http.post(url, json=payload, headers=hh, timeout=t)
+            else:
+                data = json.dumps(payload).encode("utf-8")
+                req = urllib.request.Request(url, data=data, headers=hh)
+                r = _DIRECT.open(req, timeout=t)
+                body = r.read().decode("utf-8", "replace")
+                return json.loads(body)
+            return r.json()
+        except Exception as e:
+            return {"code": 0, "msg": "请求失败: %s" % e}
+
+    def _get_text(self, url, headers=None, timeout=None, retry=2):
+        """带 Referer + 重试的 GET(外部解析接口冷启动较慢)"""
+        t = timeout or self.cfg.get("timeout", 30)
+        hh = self._headers(headers)
+        hh.setdefault("Referer", "https://www.google.com/")
+        last = ""
+        for i in range(max(1, retry)):
+            try:
+                if self._http:
+                    r = self._http.get(url, headers=hh, timeout=t)
+                    return r.status_code, r.text
+                req = urllib.request.Request(url, headers=hh)
+                resp = _DIRECT.open(req, timeout=t)
+                return resp.getcode(), resp.read().decode("utf-8", "replace")
+            except Exception as e:
+                last = str(e)
+                if i < retry - 1:
+                    time.sleep(1.2)
+        return 0, last
+
+    # ================================================================= 会话
+    def _login(self):
+        r = self._post("/api/v1/user/login", {
+            "Username": self.cfg.get("username"),
+            "Password": self.cfg.get("password"),
+            "device_id": self.device_id,
+        })
+        if r.get("code") == 1 and isinstance(r.get("data"), dict):
+            t = r["data"].get("token")
+            if t:
+                self.jwt = t
+                return True
+        return False
+
+    def _handshake(self):
+        ch = self._get("/api/v1/security/challenge")
+        if ch.get("code") != 1 or not isinstance(ch.get("data"), dict):
+            return False
+        challenge = ch["data"].get("challenge")
+        cid = ch["data"].get("challenge_id")
+        if not challenge or not cid:
+            return False
+
+        payload = {
+            "challenge": challenge,
+            "challenge_id": cid,
+            "device_id": self.device_id,
+            "token": self.jwt,
+            "client_token": "",
+            "timestamp": int(time.time()),
+            "nonce": uuid.uuid4().hex,
+            "username": self.cfg.get("username"),
+            "password": self.cfg.get("password"),
+        }
+        payload.update(_INIT_FILLER)
+
+        r = self._post("/api/v1/security/init", payload)
+        if r.get("code") == 1 and isinstance(r.get("data"), dict):
+            self.session_id = r["data"].get("session_id") or ""
+            self.sign_key = r["data"].get("sign_key") or ""
+            return bool(self.session_id)
+        return False
+
+    def _ensure_session(self):
+        if not self.jwt and not self._login():
+            return False
+        if not self.session_id and not self._handshake():
+            return False
+        return True
+
+    def _sign_headers(self, path, body=""):
+        """基于 sign_key 的设备签名(服务端 sign_policy=observe,属扩展用途)"""
+        if not self.sign_key:
+            return {}
+        try:
+            key = bytes.fromhex(self.sign_key)
+        except Exception:
+            return {}
+        ts = str(int(time.time() * 1000))
+        nonce = uuid.uuid4().hex
+        msg = (ts + nonce + path + (body or "")).encode("utf-8")
+        sg = hmac.new(key, msg, hashlib.sha256).hexdigest()
+        return {"X-Timestamp": ts, "X-Nonce": nonce, "X-Sign": sg,
+                "X-Device-Sign": sg, "X-Device-Id": self.device_id}
+
+    # ================================================================= 分类
+    def _detect_types(self):
+        """遍历 type 自动发现分类表"""
+        found = []
+        for tid in list(range(1, 31)) + [40, 50, 60, 99]:
+            try:
+                r = self._get("/api/v1/search", params={"wd": "*", "type": tid, "page": 1})
+            except Exception:
+                continue
+            if r.get("code") != 1:
+                continue
+            hits = ((r.get("data") or {}).get("hits")) or []
+            if not hits:
+                continue
+            h0 = hits[0]
+            if h0.get("type_id") and h0.get("type_name"):
+                found.append((int(h0["type_id"]), str(h0["type_name"])))
+        if found:
+            self._types = sorted(set(found))
+        return self._types
+
+    def homeContent(self, filter):
+        self._ensure_session()
+        if not self._types:
+            self._types = list(KNOWN_TYPES)
+        classes = [{"type_id": str(t), "type_name": n} for t, n in self._types]
+        return {"class": classes, "filters": {}}
+
+    def homeVideoContent(self):
+        try:
+            return self.categoryContent(self._types[0][0] if self._types else "1", 1, False, {})
+        except Exception:
+            return {"list": []}
+
+    # ================================================================= 列表
+    def _search(self, wd, page=1, type_id=None):
+        """search 接口限流较严,遇"请求过于频繁"自动退避重试"""
+        params = {"wd": wd, "page": page}
+        if type_id:
+            params["type"] = type_id
+        delays = [0, 2.5, 5, 9, 15]
+        r = {"code": 0}
+        for i, d in enumerate(delays):
+            if d:
+                time.sleep(d)
+            r = self._get("/api/v1/search", params=params)
+            if r.get("code") == 1:
+                break
+            msg = str(r.get("msg") or "")
+            if "频繁" not in msg and "rate" not in msg.lower():
+                break
+        if r.get("code") != 1:
+            return [], 1, 0
+        data = r.get("data") or {}
+        hits = data.get("hits") or []
+        total = int(data.get("total") or 0)
+        pages = int(data.get("total_pages") or 1)
+        return hits, pages, total
+
+    @staticmethod
+    def _item(it):
+        return {
+            "vod_id": str(it.get("vod_id") or ""),
+            "vod_name": str(it.get("vod_name") or ""),
+            "vod_pic": str(it.get("vod_pic") or ""),
+            "vod_remarks": str(it.get("vod_remarks") or ""),
+            "vod_year": str(it.get("vod_year") or ""),
+            "vod_area": str(it.get("vod_area") or ""),
+            "vod_class": str(it.get("vod_class") or ""),
+            "vod_actor": str(it.get("vod_actor") or ""),
+            "vod_director": str(it.get("vod_director") or ""),
+            "vod_content": str(it.get("vod_blurb") or it.get("vod_content") or ""),
+        }
+
+    def categoryContent(self, tid, pg, filter, extend):
+        self._ensure_session()
+        try:
+            pg = int(pg or 1)
+        except Exception:
+            pg = 1
+        hits, pages, total = self._search("*", pg, str(tid))
+        lst = [self._item(it) for it in hits]
+        return {"list": lst, "page": pg, "pagecount": pages,
+                "limit": self.cfg.get("page_size", 20), "total": total}
+
+    def searchContent(self, key, quick, pg="1"):
+        self._ensure_session()
+        try:
+            pg = int(pg or 1)
+        except Exception:
+            pg = 1
+        hits, pages, total = self._search(str(key), pg)
+        lst = [self._item(it) for it in hits]
+        return {"list": lst, "page": pg, "pagecount": pages, "total": total}
+
+    # ================================================================= 详情
+    def detailContent(self, ids):
+        self._ensure_session()
+        if not ids:
+            return {"list": []}
+        vid = str(ids[0]).split(",")[0]
+        path = "/api/v1/video/detail"
+        r = self._get(path, headers=self._sign_headers(path), params={"id": vid})
+        if r.get("code") != 1 or not isinstance(r.get("data"), dict):
+            return {"list": []}
+        vi = r["data"].get("vod_info") or {}
+
+        play_from, play_url, self._lines = [], [], []
+        self._tkmap = {}
+        for idx, line in enumerate(vi.get("vod_url_with_player") or []):
+            name = str(line.get("name") or "")
+            code = str(line.get("code") or "")
+            eps, tks = [], []
+            for ep_i, seg in enumerate(str(line.get("url") or "").split("#")):
+                if not seg:
+                    continue
+                if "$" in seg:
+                    ep_name, tk = seg.split("$", 1)
+                else:
+                    ep_name, tk = seg, ""
+                if not ep_name:
+                    continue
+                # 播放 id: 线路码|tk票根
+                eps.append(ep_name + "$" + code + "|" + tk)
+                tks.append(tk)
+                self._tkmap[tk] = {"name": name, "code": code, "ep": ep_i}
+            if not eps:
+                continue
+            self._lines.append({"index": idx, "name": name, "code": code, "tks": tks})
+            play_from.append(name or code)
+            play_url.append("#".join(eps))
+
+        if not play_url and vi.get("vod_play_url"):
+            play_from = [vi.get("vod_play_from") or "线路"]
+            play_url = [vi.get("vod_play_url")]
+
+        return {"list": [{
+            "vod_id": vid,
+            "vod_name": str(vi.get("vod_name") or ""),
+            "vod_pic": str(vi.get("vod_pic") or ""),
+            "vod_actor": str(vi.get("vod_actor") or ""),
+            "vod_director": str(vi.get("vod_director") or ""),
+            "vod_year": str(vi.get("vod_year") or ""),
+            "vod_area": str(vi.get("vod_area") or ""),
+            "vod_lang": str(vi.get("vod_lang") or ""),
+            "vod_class": str(vi.get("vod_class") or ""),
+            "vod_state": str(vi.get("vod_state") or ""),
+            "vod_total": str(vi.get("vod_total") or ""),
+            "vod_serial": str(vi.get("vod_serial") or ""),
+            "vod_remarks": str(vi.get("vod_remarks") or ""),
+            "vod_content": str(vi.get("vod_content") or vi.get("vod_blurb") or ""),
+            "vod_play_from": "$$$".join(play_from),
+            "vod_play_url": "$$$".join(play_url),
+        }]}
+
+    # ================================================================= 播放
+    def _decode_ticket(self, ticket):
+        """play_ticket 第一段是 base64url 明文 JSON"""
+        try:
+            seg = ticket.split(".")[0]
+            seg += "=" * (-len(seg) % 4)
+            return json.loads(base64.urlsafe_b64decode(seg).decode("utf-8", "replace"))
+        except Exception:
+            return None
+
+    def _ticket(self, tk):
+        """tk -> play_ticket"""
+        r = self._post("/api/v1/vod/ticket", {"token": tk},
+                       headers=self._sign_headers("/api/v1/vod/ticket"))
+        if r.get("code") == 1 and isinstance(r.get("data"), dict):
+            return r["data"].get("ticket")
+        return None
+
+    def _resolve(self, tk):
+        """play_ticket -> 真实播放地址"""
+        ticket = self._ticket(tk)
+        if not ticket:
+            return None, "换票失败"
+        pl = self._decode_ticket(ticket)
+        if not pl:
+            return None, "票据解析失败"
+        d = pl.get("data") or {}
+        api = str(d.get("parse_api") or "").replace("\\u00026", "&")
+        du = str(d.get("url") or "")
+        if not api or not du:
+            return None, "无解析配置"
+
+        # ① 服务端本地解析(相对路径)
+        if api.startswith("/"):
+            full = self.base + api + urllib.parse.quote(du, safe="")
+            code, text = self._get_text(full)
+            j = self._try_json(text)
+            if isinstance(j, dict):
+                if j.get("url"):
+                    return j["url"], ""
+                msg = str(j.get("system") or j.get("msg") or "解析失败")
+                return None, msg
+            if code == 200 and text.startswith("http"):
+                return text.strip(), ""
+            return None, "解析失败(%s)" % code
+
+        # ② 外部解析接口
+        if "{md5}" in api:
+            target = api.replace("{md5}", du)
+        elif "url=" in api:
+            target = api + urllib.parse.quote(du, safe="")
+        else:
+            target = api + du
+        code, text = self._get_text(target)
+        j = self._try_json(text)
+        if isinstance(j, dict):
+            if j.get("url"):
+                return j["url"], ""
+            return None, str(j.get("msg") or "外部解析失败")
+        if code == 200 and text.startswith("http"):
+            return text.strip(), ""
+        return None, "外部解析失败(%s)" % code
+
+    @staticmethod
+    def _try_json(text):
+        try:
+            t = (text or "").strip()
+            if t.startswith("{") or t.startswith("["):
+                return json.loads(t)
+        except Exception:
+            return None
+        return None
+
+    def playerContent(self, flag, id, vipFlags=None):
+        self._ensure_session()
+        if not id:
+            return {"parse": 0, "url": "", "header": {}}
+        code, tk = "", id
+        if "|" in id:
+            code, tk = id.split("|", 1)
+
+        # 1) 优先按当前线路解析
+        url, err = self._resolve(tk)
+
+        # 2) 当前线路失败(付费/失效/超时)→ 自动降级到其它线路的同一集
+        if not url and self.cfg.get("auto_fallback", 1):
+            cur = self._tkmap.get(tk) or {}
+            ep = cur.get("ep", 0)
+            for ln in self._lines:
+                if ln.get("code") == code:
+                    continue
+                tks = ln.get("tks") or []
+                if ep >= len(tks):
+                    continue
+                u2, _e2 = self._resolve(tks[ep])
+                if u2:
+                    url = u2
+                    err = ""
+                    break
+
+        if url:
+            return {"parse": 0, "url": url, "header": {
+                "User-Agent": self.cfg.get("user_agent", "okhttp/3.12.1"),
+                "Referer": "https://www.google.com/",
+            }}
+        return {"parse": 0, "url": "", "header": {}, "msg": err or "播放失败"}
+
+
+if __name__ == "__main__":
+    s = ShanZhaSpider()
+    s.init("")
+    print("name    :", s.getName())
+    print("device  :", s.device_id)
+    print("jwt     :", (s.jwt or "")[:36], "...")
+    print("session :", s.session_id)
+
+    h = s.homeContent(False)
+    print("\n分类    :", [(c["type_id"], c["type_name"]) for c in h.get("class", [])])
+
+    c = s.categoryContent("2", 1, False, {})
+    print("连续剧  :", len(c.get("list", [])), "条 / 共", c.get("total"))
+    if c.get("list"):
+        print("  首条  :", c["list"][0]["vod_name"])
+
+    s2 = s.searchContent("交锋", False)
+    print("搜索交锋:", len(s2.get("list", [])), "条")
+
+    vid = (s2.get("list") or c.get("list") or [{}])[0].get("vod_id")
+    if vid:
+        d = s.detailContent([vid])
+        if d.get("list"):
+            dd = d["list"][0]
+            names = dd["vod_play_from"].split("$$$")
+            eps = dd["vod_play_url"].split("$$$")
+            print("\n详情    :", dd["vod_name"], "| 线路:", names)
+            for i, nm in enumerate(names):
+                ep = eps[i].split("#")[0]
+                p = s.playerContent(nm, ep)
+                u = p.get("url") or ""
+                print("  [%s] → %s" % (nm, (u[:96] + "...") if len(u) > 96 else (u or p.get("msg", ""))))
+
+
+# ======================================================================
+# 模块：gg —— 咕噜咕噜（首页 / 分类主源，T3 私有协议）
+# ======================================================================
+# -*- coding: utf-8 -*-
+"""
+咕噜咕噜 —— TVBox 蜘蛛框架Python 爬虫）。
+
+"""
+
+
+import base64
+import gzip
+import hashlib
+import hmac
+import json
+import re
+import secrets
+import threading
+import time
+import urllib.error
+import urllib.request
+import zlib
+from urllib.parse import quote
+
+try:
+    import requests as _requests
+except Exception:
+    _requests = None
+
+API_URL = "http://103.45.132.22:19987/app/bn/v2"
+HOST = "http://103.45.132.22:19987"
+USER_AGENT = "Dart/3.10 (dart:io)"
+APP_VERSION = "2.2.5"
+BUILD_NUMBER = "20109"
+APP_SIGNATURE = "32E0AB4FF93A29CE0E6F0BFB01F2F1B788E76262731F3F30F509CB822428ED58"
+DEVICE_BUILD = "pangu-build-component-system-513739-s9vkd-rlxnj-p3rhm"
+VERSION_GUARD_MARKERS = ("__v99_", "glgl.tv", "111.170.58.215", "shu.jpg")
+FALLBACK_PARSERS = {
+    28: {"name": "咕噜金牌", "url": "http://111.170.58.215:5499/api.php?id=",
+         "mode": "json", "result_key": "url", "server": False},
+}
+
+
+# ============ protobuf 工具 ============
+
+def _varint(value):
+    if value < 0:
+        raise ValueError("negative protobuf varint")
+    output = bytearray()
+    while value >= 0x80:
+        output.append((value & 0x7F) | 0x80)
+        value >>= 7
+    output.append(value)
+    return bytes(output)
+
+
+def _field_bytes(number, value):
+    if isinstance(value, str):
+        value = value.encode("utf-8")
+    return _varint((number << 3) | 2) + _varint(len(value)) + value
+
+
+def _field_varint(number, value):
+    return _varint(number << 3) + _varint(value)
+
+
+def _read_varint(data, position):
+    value = 0
+    shift = 0
+    while position < len(data) and shift < 70:
+        byte = data[position]
+        position += 1
+        value |= (byte & 0x7F) << shift
+        if byte < 0x80:
+            return value, position
+        shift += 7
+    raise ValueError("invalid protobuf varint")
+
+
+def _parse_fields(data):
+    fields = []
+    position = 0
+    while position < len(data):
+        key, position = _read_varint(data, position)
+        number, wire = key >> 3, key & 7
+        if number == 0:
+            raise ValueError("invalid protobuf field zero")
+        if wire == 0:
+            value, position = _read_varint(data, position)
+        elif wire == 1:
+            value = data[position:position + 8]
+            position += 8
+        elif wire == 2:
+            size, position = _read_varint(data, position)
+            value = data[position:position + size]
+            position += size
+        elif wire == 5:
+            value = data[position:position + 4]
+            position += 4
+        else:
+            raise ValueError("unsupported protobuf wire type %d" % wire)
+        if position > len(data):
+            raise ValueError("truncated protobuf field")
+        fields.append((number, wire, value))
+    return fields
+
+
+def _field_values(data, number, wire=None):
+    return [v for n, w, v in _parse_fields(data)
+            if n == number and (wire is None or w == wire)]
+
+
+def _field_value(data, number, default=None, wire=None):
+    values = _field_values(data, number, wire)
+    return values[-1] if values else default
+
+
+def _text(value, default=""):
+    if not isinstance(value, bytes):
+        return value
+    try:
+        return value.decode("utf-8")
+    except UnicodeDecodeError:
+        return default
+
+
+def _packed_varints(data):
+    values = []
+    position = 0
+    while position < len(data):
+        value, position = _read_varint(data, position)
+        values.append(value)
+    return values
+
+
+def _raw_deflate(data):
+    compressor = zlib.compressobj(level=9, method=zlib.DEFLATED, wbits=-15,
+                                  memLevel=8, strategy=zlib.Z_RLE)
+    return compressor.compress(data) + compressor.flush()
+
+
+# ============ 纯标准库密码学 ============
+
+def g_xtime(a):
+    b = a << 1
+    if b & 0x100:
+        b ^= 0x11B
+    return b & 0xFF
+
+
+def _gf256_mul(a, b):
+    result = 0
+    while b:
+        if b & 1:
+            result ^= a
+        hi = a & 0x80
+        a = (a << 1) & 0xFF
+        if hi:
+            a ^= 0x1B
+        b >>= 1
+    return result
+
+
+def _build_aes_tables():
+    exp = [0] * 256
+    log = [0] * 256
+    x = 1
+    for i in range(255):
+        exp[i] = x
+        log[x] = i
+        x = _gf256_mul(x, 0x03)
+    sbox = [0] * 256
+    inv_sbox = [0] * 256
+    for i in range(256):
+        inv = 0 if i == 0 else exp[(255 - log[i]) % 255]
+        t = inv
+        s = inv
+        for _ in range(4):
+            s = ((s << 1) | (s >> 7)) & 0xFF
+            t ^= s
+        sbox[i] = t ^ 0x63
+        inv_sbox[sbox[i]] = i
+    return bytes(sbox), bytes(inv_sbox)
+
+
+_SBOX, _INV_SBOX = _build_aes_tables()
+
+
+def g_expand_key(key):
+    rcon = 1
+    words = [list(key[i:i + 4]) for i in range(0, 32, 4)]
+    while len(words) < 60:
+        temp = words[-1][:]
+        if len(words) % 8 == 0:
+            temp = temp[1:] + temp[:1]
+            temp = [_SBOX[b] for b in temp]
+            temp[0] ^= rcon
+            rcon = g_xtime(rcon)
+        elif len(words) % 8 == 4:
+            temp = [_SBOX[b] for b in temp]
+        words.append([words[-8][i] ^ temp[i] for i in range(4)])
+    return [sum((words[i:i + 4]), []) for i in range(0, 60, 4)]
+
+
+def g_shift_rows(state, encrypt=True):
+    out = [0] * 16
+    for r in range(4):
+        for c in range(4):
+            out[r + 4 * c] = state[r + 4 * ((c + (r if encrypt else -r)) % 4)]
+    return out
+
+
+def g_mix_columns(state):
+    out = state[:]
+    for c in range(4):
+        a = out[0 + 4 * c]
+        b = out[1 + 4 * c]
+        d = out[2 + 4 * c]
+        e = out[3 + 4 * c]
+        t = a ^ b ^ d ^ e
+        out[0 + 4 * c] = a ^ t ^ g_xtime(a ^ b)
+        out[1 + 4 * c] = b ^ t ^ g_xtime(b ^ d)
+        out[2 + 4 * c] = d ^ t ^ g_xtime(d ^ e)
+        out[3 + 4 * c] = e ^ t ^ g_xtime(e ^ a)
+    return out
+
+
+def g_mul9(x):
+    return g_xtime(g_xtime(g_xtime(x))) ^ x
+
+
+def g_mul11(x):
+    return g_xtime(g_xtime(g_xtime(x))) ^ g_xtime(x) ^ x
+
+
+def g_mul13(x):
+    return g_xtime(g_xtime(g_xtime(x))) ^ g_xtime(g_xtime(x)) ^ x
+
+
+def g_mul14(x):
+    return g_xtime(g_xtime(g_xtime(x))) ^ g_xtime(g_xtime(x)) ^ g_xtime(x)
+
+
+def g_inv_mix_columns(state):
+    out = state[:]
+    for c in range(4):
+        a = out[0 + 4 * c]
+        b = out[1 + 4 * c]
+        d = out[2 + 4 * c]
+        e = out[3 + 4 * c]
+        out[0 + 4 * c] = g_mul14(a) ^ g_mul11(b) ^ g_mul13(d) ^ g_mul9(e)
+        out[1 + 4 * c] = g_mul9(a) ^ g_mul14(b) ^ g_mul11(d) ^ g_mul13(e)
+        out[2 + 4 * c] = g_mul13(a) ^ g_mul9(b) ^ g_mul14(d) ^ g_mul11(e)
+        out[3 + 4 * c] = g_mul11(a) ^ g_mul13(b) ^ g_mul9(d) ^ g_mul14(e)
+    return out
+
+
+def _aes_encrypt_block(block, round_keys):
+    state = [s ^ k for s, k in zip(block, round_keys[0])]
+    for r in range(1, 14):
+        state = [_SBOX[b] for b in state]
+        state = g_shift_rows(state, True)
+        state = g_mix_columns(state)
+        state = [s ^ k for s, k in zip(state, round_keys[r])]
+    state = [_SBOX[b] for b in state]
+    state = g_shift_rows(state, True)
+    return bytes([s ^ k for s, k in zip(state, round_keys[14])])
+
+
+def _aes_decrypt_block(block, round_keys):
+    state = [s ^ k for s, k in zip(block, round_keys[14])]
+    for r in range(13, 0, -1):
+        state = g_shift_rows(state, False)
+        state = [_INV_SBOX[b] for b in state]
+        state = [s ^ k for s, k in zip(state, round_keys[r])]
+        state = g_inv_mix_columns(state)
+    state = g_shift_rows(state, False)
+    state = [_INV_SBOX[b] for b in state]
+    return bytes([s ^ k for s, k in zip(state, round_keys[0])])
+
+
+def _pkcs7_pad(data):
+    size = 16 - (len(data) % 16)
+    return data + bytes([size] * size)
+
+
+def _pkcs7_unpad(data):
+    if not data:
+        raise ValueError("empty plaintext")
+    size = data[-1]
+    if size < 1 or size > 16 or data[-size:] != bytes([size] * size):
+        raise ValueError("invalid PKCS7 padding")
+    return data[:-size]
+
+
+def _aes256_cbc_encrypt(key, iv, data):
+    round_keys = g_expand_key(key)
+    previous = iv
+    out = bytearray()
+    data = _pkcs7_pad(data)
+    for i in range(0, len(data), 16):
+        block = bytes(b ^ p for b, p in zip(data[i:i + 16], previous))
+        enc = _aes_encrypt_block(block, round_keys)
+        out += enc
+        previous = enc
+    return bytes(out)
+
+
+def _aes256_cbc_decrypt(key, iv, data):
+    round_keys = g_expand_key(key)
+    previous = iv
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        block = data[i:i + 16]
+        dec = _aes_decrypt_block(block, round_keys)
+        out += bytes(b ^ p for b, p in zip(dec, previous))
+        previous = block
+    return _pkcs7_unpad(bytes(out))
+
+
+_GCM_REDUCTION = 0xE1000000000000000000000000000000
+
+
+def g_ghash_mul(x, y):
+    z = 0
+    for i in range(128):
+        if (x >> (127 - i)) & 1:
+            z ^= y
+        if y & 1:
+            y = (y >> 1) ^ _GCM_REDUCTION
+        else:
+            y >>= 1
+    return z
+
+
+def g_ghash(h, aad, ciphertext):
+    y = 0
+    for i in range(0, len(aad), 16):
+        block = int.from_bytes(aad[i:i + 16].ljust(16, b"\x00"), "big")
+        y = g_ghash_mul(y ^ block, h)
+    for i in range(0, len(ciphertext), 16):
+        block = int.from_bytes(ciphertext[i:i + 16].ljust(16, b"\x00"), "big")
+        y = g_ghash_mul(y ^ block, h)
+    lengths = (len(aad) * 8).to_bytes(8, "big") + (len(ciphertext) * 8).to_bytes(8, "big")
+    return g_ghash_mul(y ^ int.from_bytes(lengths, "big"), h)
+
+
+def _aes256_gcm_encrypt(key, nonce, data, aad=b""):
+    round_keys = g_expand_key(key)
+    h = int.from_bytes(_aes_encrypt_block(b"\x00" * 16, round_keys), "big")
+    j0 = nonce + b"\x00\x00\x00\x01"
+    counter = int.from_bytes(j0, "big")
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        counter += 1
+        keystream = _aes_encrypt_block(counter.to_bytes(16, "big"), round_keys)
+        chunk = data[i:i + 16]
+        out += bytes(b ^ k for b, k in zip(chunk, keystream))
+    ciphertext = bytes(out)
+    s = g_ghash(h, aad, ciphertext)
+    tag_block = _aes_encrypt_block(j0, round_keys)
+    tag = (s ^ int.from_bytes(tag_block, "big")).to_bytes(16, "big")[:16]
+    return ciphertext, tag
+
+
+def _aes256_gcm_decrypt(key, nonce, data, tag, aad=b""):
+    round_keys = g_expand_key(key)
+    h = int.from_bytes(_aes_encrypt_block(b"\x00" * 16, round_keys), "big")
+    j0 = nonce + b"\x00\x00\x00\x01"
+    s = g_ghash(h, aad, data)
+    tag_block = _aes_encrypt_block(j0, round_keys)
+    expected = (s ^ int.from_bytes(tag_block, "big")).to_bytes(16, "big")[:16]
+    if not hmac.compare_digest(expected, tag):
+        raise ValueError("GCM tag mismatch")
+    counter = int.from_bytes(j0, "big")
+    out = bytearray()
+    for i in range(0, len(data), 16):
+        counter += 1
+        keystream = _aes_encrypt_block(counter.to_bytes(16, "big"), round_keys)
+        chunk = data[i:i + 16]
+        out += bytes(b ^ k for b, k in zip(chunk, keystream))
+    return bytes(out)
+
+
+# P-256 (secp256r1) 椭圆曲线
+
+g_P256_P = 0xFFFFFFFF00000001000000000000000000000000FFFFFFFFFFFFFFFFFFFFFFFF
+g_P256_A = g_P256_P - 3
+_P256_B = 0x5AC635D8AA3A93E7B3EBBD55769886BC651D06B0CC53B0F63BCE3C3E27D2604B
+g_P256_N = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+g_P256_G = (0x6B17D1F2E12C4247F8BCE6E563A440F277037D812DEB33A0F4A13945D898C296,
+           0x4FE342E2FE1A7F9B8EE7EB4A7C0F9E162BCE33576B315ECECBB6406837BF51F5)
+
+
+def _modinv(a, m):
+    if m == 1:
+        return 0
+    t, newt = 0, 1
+    r, newr = m, a % m
+    while newr:
+        q = r // newr
+        t, newt = newt, t - q * newt
+        r, newr = newr, r - q * newr
+    if r != 1:
+        raise ValueError("no modular inverse")
+    return t % m
+
+
+def g_p256_double(point):
+    if point is None:
+        return None
+    x, y = point
+    if y == 0:
+        return None
+    lam = (3 * x * x + g_P256_A) * _modinv(2 * y, g_P256_P) % g_P256_P
+    x3 = (lam * lam - 2 * x) % g_P256_P
+    y3 = (lam * (x - x3) - y) % g_P256_P
+    return (x3, y3)
+
+
+def g_p256_add(p1, p2):
+    if p1 is None:
+        return p2
+    if p2 is None:
+        return p1
+    x1, y1 = p1
+    x2, y2 = p2
+    if x1 == x2:
+        if (y1 + y2) % g_P256_P == 0:
+            return None
+        return g_p256_double(p1)
+    lam = (y2 - y1) * _modinv(x2 - x1, g_P256_P) % g_P256_P
+    x3 = (lam * lam - x1 - x2) % g_P256_P
+    y3 = (lam * (x1 - x3) - y1) % g_P256_P
+    return (x3, y3)
+
+
+def g_p256_mul(k, point):
+    result = None
+    addend = point
+    while k:
+        if k & 1:
+            result = g_p256_add(result, addend)
+        addend = g_p256_double(addend)
+        k >>= 1
+    return result
+
+
+def _p256_ecdh_x(private_d, server_point):
+    shared = g_p256_mul(private_d, server_point)
+    if shared is None:
+        raise ValueError("ECDH point at infinity")
+    return shared[0].to_bytes(32, "big")
+
+
+def _sec1_export_public(point):
+    return b"\x04" + point[0].to_bytes(32, "big") + point[1].to_bytes(32, "big")
+
+
+def _sec1_import_public(data):
+    raw = bytes(data or b"")
+    if len(raw) == 65 and raw[0] == 4:
+        x = int.from_bytes(raw[1:33], "big")
+        y = int.from_bytes(raw[33:65], "big")
+        return (x, y)
+    if len(raw) == 33 and raw[0] in (2, 3):
+        x = int.from_bytes(raw[1:], "big")
+        y2 = (pow(x, 3, g_P256_P) - 3 * x + _P256_B) % g_P256_P
+        y = pow(y2, (g_P256_P + 1) // 4, g_P256_P)
+        if (y * y) % g_P256_P != y2:
+            raise ValueError("point not on curve")
+        if (y & 1) != (raw[0] & 1):
+            y = g_P256_P - y
+        return (x, y)
+    raise ValueError("invalid P-256 SEC1 public key")
+
+
+def _derive_key(session_id, shared_x):
+    prk = hmac.new(session_id.encode("ascii"), shared_x, hashlib.sha256).digest()
+    return hmac.new(prk, b"v2-session\x01", hashlib.sha256).digest()
+
+
+# ============ HTTP（纯 urllib） ============
+
+def _http_post(url, body, headers, timeout=15):
+    request = urllib.request.Request(url, data=body, headers=headers, method="POST")
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        raise RuntimeError("HTTP %s: %s" % (error.code, error.read(200)))
+    except urllib.error.URLError as error:
+        raise RuntimeError("request failed: %s" % (error.reason,))
+    content = response.read()
+    encoding = response.headers.get("Content-Encoding", "")
+    if "gzip" in encoding.lower() or content[:2] == b"\x1f\x8b":
+        try:
+            content = gzip.decompress(content)
+        except Exception:
+            pass
+    return content
+
+
+def _http_get(url, headers, timeout=15):
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        response = urllib.request.urlopen(request, timeout=timeout)
+    except urllib.error.HTTPError as error:
+        return error.code, error.read(200)
+    except urllib.error.URLError as error:
+        raise RuntimeError("request failed: %s" % (error.reason,))
+    content = response.read()
+    encoding = response.headers.get("Content-Encoding", "")
+    if "gzip" in encoding.lower() or content[:2] == b"\x1f\x8b":
+        try:
+            content = gzip.decompress(content)
+        except Exception:
+            pass
+    return response.status, content
+
+
+# ============ 协议客户端 ============
+
+class _GuluProtocol:
+    def __init__(self, timeout=15):
+        self.timeout = timeout
+        self.session_id = ""
+        self.session_key = b""
+        self.device_id = secrets.token_hex(8)
+        self.request_id = 0
+        self.players = {}
+        self.parsers = {}
+        self.last_detail_error = ""
+        self.lock = threading.RLock()
+
+    def _post(self, body, header_name, header_value, extra_headers=None):
+        headers = {
+            "User-Agent": USER_AGENT, header_name: header_value,
+            "Content-Type": "application/x-protobuf", "Accept-Encoding": "gzip",
+            "Content-Length": str(len(body)), "Host": "103.45.132.22:19987",
+        }
+        if extra_headers:
+            headers.update(extra_headers)
+        return _http_post(API_URL, body, headers, self.timeout)
+
+    def handshake(self):
+        private_d = int.from_bytes(secrets.token_bytes(32), "big") % (g_P256_N - 1) + 1
+        public_point = g_p256_mul(private_d, g_P256_G)
+        public_key = _sec1_export_public(public_point)
+        capabilities = _field_varint(1, 1) + _field_varint(2, 0) + _field_varint(3, 1)
+        request = (_field_bytes(1, public_key) + _field_bytes(2, b"1.0.0")
+                   + _field_bytes(3, capabilities))
+        handshake_key = secrets.token_hex(16)
+        iv = secrets.token_bytes(16)
+        encrypted = base64.b64encode(
+            iv + _aes256_cbc_encrypt(handshake_key.encode("ascii"), iv,
+                                     zlib.compress(request, 4)))
+        content = self._post(encrypted, "x-handshake-key", handshake_key)
+        raw = base64.b64decode(content)
+        response_cipher_key = handshake_key.encode("ascii")
+        plain = zlib.decompress(
+            _aes256_cbc_decrypt(response_cipher_key, raw[:16], raw[16:]))
+        session_id = _field_value(plain, 1, wire=2)
+        server_public = _field_value(plain, 2, wire=2)
+        if not session_id or not server_public:
+            raise RuntimeError("invalid handshake response")
+        self.session_id = session_id.decode("ascii")
+        server_point = _sec1_import_public(server_public)
+        shared_x = _p256_ecdh_x(private_d, server_point)
+        self.session_key = _derive_key(self.session_id, shared_x)
+        self.request_id = 0
+
+    def _encrypt(self, data):
+        nonce = secrets.token_bytes(12)
+        ciphertext, tag = _aes256_gcm_encrypt(self.session_key, nonce, _raw_deflate(data))
+        return nonce + ciphertext + tag
+
+    def _decrypt(self, data):
+        if len(data) < 28:
+            raise ValueError("invalid GCM payload")
+        nonce = data[:12]
+        ciphertext = data[12:-16]
+        tag = data[-16:]
+        compressed = _aes256_gcm_decrypt(self.session_key, nonce, ciphertext, tag)
+        return zlib.decompress(compressed, -15)
+
+    def request(self, method, payload=b"", scope=3, extra_headers=None):
+        with self.lock:
+            if not self.session_id:
+                self.handshake()
+            self.request_id += 1
+            request_id = self.request_id
+            core = (_field_varint(1, request_id) + _field_varint(2, scope)
+                    + _field_varint(3, method) + _field_bytes(4, self.device_id)
+                    + _field_bytes(5, b"") + _field_bytes(6, payload)
+                    + _field_varint(7, int(time.time() * 1000)))
+            body = _field_varint(1, request_id) + _field_bytes(2, self._encrypt(core))
+            content = self._post(body, "x-session-id", self.session_id,
+                                 extra_headers=extra_headers)
+            encrypted = _field_value(content, 2, wire=2)
+            if encrypted is None:
+                error = _text(_field_value(content, 3, b"", wire=2))
+                raise RuntimeError(error or "server rejected request")
+            plain = self._decrypt(encrypted)
+            status = _text(_field_value(plain, 3, b"", wire=2))
+            if status and status not in ("ok", "success"):
+                raise RuntimeError(status)
+            return plain
+
+    def boot(self):
+        now_us = int(time.time() * 1_000_000)
+        app = (_field_bytes(1, "咕噜咕噜") + _field_bytes(2, APP_VERSION)
+               + _field_bytes(3, b"com.himrsc.viz") + _field_bytes(4, APP_SIGNATURE)
+               + _field_bytes(5, BUILD_NUMBER) + _field_varint(6, now_us)
+               + _field_varint(7, now_us))
+        device = (_field_bytes(1, self.device_id) + _field_varint(2, 1)
+                  + _field_bytes(3, b"15") + _field_bytes(4, b"Redmi K50 Ultra")
+                  + _field_bytes(5, b"Redmi/diting/diting:15/AQ3A.240912.001/OS2.0.215.0.VOACNXM:user/release-keys")
+                  + _field_bytes(6, b"Redmi") + _field_bytes(7, b"qcom")
+                  + _field_varint(8, 0) + _field_bytes(9, b"unknown")
+                  + _field_bytes(10, DEVICE_BUILD) + _field_varint(11, 0)
+                  + _field_varint(12, 35))
+        payload = (_field_bytes(1, b"v2") + _field_bytes(2, b"android")
+                   + _field_bytes(3, b"gulu") + _field_bytes(4, app)
+                   + _field_bytes(5, device))
+        response = self.request(0, payload, scope=1)
+        config = _field_value(response, 4, b"", wire=2)
+        players = {}
+        for item in _field_values(config, 4, wire=2):
+            code = _text(_field_value(item, 3, b"", wire=2))
+            if not code:
+                continue
+            parser_ids = []
+            for packed in _field_values(item, 8, wire=2):
+                parser_ids.extend(_packed_varints(packed))
+            players[code] = {"id": _field_value(item, 1, 0, wire=0),
+                             "name": _text(_field_value(item, 4, b"", wire=2)),
+                             "parser_ids": parser_ids}
+        parsers = {}
+        for item in _field_values(config, 7, wire=2):
+            parser_id = _field_value(item, 1, 0, wire=0)
+            if parser_id:
+                parsers[parser_id] = {
+                    "name": _text(_field_value(item, 2, b"", wire=2)),
+                    "url": _text(_field_value(item, 3, b"", wire=2)),
+                    "mode": _text(_field_value(item, 4, b"", wire=2)),
+                    "result_key": _text(_field_value(item, 10, b"url", wire=2)),
+                    "server": bool(_field_value(item, 20, 0, wire=0))}
+        self.players = players
+        self.parsers = parsers
+
+    def search(self, keyword, page=1, limit=21, category_id="", genre="", area="",
+               sort="vod_hits_month"):
+        sort = str(sort or "vod_hits_month")
+        filters = _field_bytes(18, sort.encode("utf-8")) + _field_varint(19, 1)
+        category_id = str(category_id or "").strip()
+        if category_id:
+            filters += _field_bytes(3, category_id) + _field_bytes(4, category_id)
+        genre = str(genre or "").strip()
+        if genre:
+            filters += _field_bytes(8, genre)
+        area = str(area or "").strip()
+        if area:
+            filters += _field_bytes(6, area)
+        payload = (_field_bytes(1, keyword) + _field_varint(2, int(page))
+                   + _field_varint(3, int(limit)) + _field_bytes(5, filters))
+        response = self.request(61, payload)
+        data = _field_value(response, 4, b"", wire=2)
+        videos = []
+        for message in _field_values(data, 1, wire=2):
+            videos.append({
+                "vod_id": str(_field_value(message, 1, 0, wire=0)),
+                "vod_name": _text(_field_value(message, 3, b"", wire=2)),
+                "vod_pic": _text(_field_value(message, 6, b"", wire=2)),
+                "vod_remarks": _text(_field_value(message, 11, b"", wire=2)),
+            })
+        page_info = _field_value(data, 2, b"", wire=2)
+        return {"videos": videos,
+                "page": _field_value(page_info, 1, int(page), wire=0),
+                "pagecount": _field_value(page_info, 3, 1, wire=0),
+                "limit": _field_value(page_info, 2, int(limit), wire=0),
+                "total": _field_value(page_info, 4, len(videos), wire=0)}
+
+    def detail(self, vod_id):
+        self.last_detail_error = ""
+        payload = (_field_varint(1, int(vod_id)) + _field_bytes(3, APP_VERSION)
+                   + _field_bytes(4, b"1") + _field_varint(5, 1))
+        response = self.request(62, payload,
+                                extra_headers={"x-player-page-protection": "1"})
+        data = _field_value(response, 4, b"", wire=2)
+        name = _text(_field_value(data, 5, b"", wire=2))
+        guard_text = " ".join(
+            [_text(_field_value(data, field, b"", wire=2)) for field in (5, 13, 21)]
+            + [_text(_field_value(source, 1, b"", wire=2))
+               for source in _field_values(data, 75, wire=2)]).lower()
+        if any(marker in guard_text for marker in VERSION_GUARD_MARKERS):
+            self.last_detail_error = "server_version_guard"
+            return None
+        if not name or name.startswith("最新版本下载地址") or _field_value(data, 1, 0, wire=0) == 0:
+            self.last_detail_error = "invalid_detail"
+            return None
+        sources = []
+        for source in _field_values(data, 75, wire=2):
+            code = _text(_field_value(source, 1, b"", wire=2))
+            if not code or code.startswith("__v99_"):
+                continue
+            config = self.players.get(code, {})
+            episodes = []
+            for episode in _field_values(source, 2, wire=2):
+                episode_id = _text(_field_value(episode, 3, b"", wire=2))
+                if not episode_id:
+                    continue
+                episodes.append({
+                    "index": _field_value(episode, 1, len(episodes) + 1, wire=0),
+                    "id": episode_id,
+                    "name": _text(_field_value(episode, 4, b"", wire=2)) or "第%d集" % (len(episodes) + 1)})
+            if episodes:
+                sources.append({"code": code,
+                                "name": config.get("name", code),
+                                "parser_id": (config.get("parser_ids") or [0])[0],
+                                "episodes": episodes})
+        return {"id": str(_field_value(data, 1, vod_id, wire=0)),
+                "name": name, "pic": _text(_field_value(data, 13, b"", wire=2)),
+                "remarks": _text(_field_value(data, 22, b"", wire=2)),
+                "content": _text(_field_value(data, 21, b"", wire=2)),
+                "area": _text(_field_value(data, 28, b"", wire=2)),
+                "year": _text(_field_value(data, 30, b"", wire=2)),
+                "sources": sources}
+
+    def play(self, parser_id, play_id):
+        payload = _field_varint(1, int(parser_id)) + _field_bytes(2, play_id)
+        response = self.request(69, payload)
+        data = _field_value(response, 4, b"", wire=2)
+        return _text(_field_value(data, 2, b"", wire=2))
+
+    def reset_session(self):
+        self.session_id = ""
+        self.session_key = b""
+        self.request_id = 0
+
+
+# ============ T3 接口 ============
+
+class GuluSpider:
+    """咕噜咕噜"""
+
+    source_name = "gulu"
+    display_name = "咕噜咕噜"
+
+    HOST = HOST
+    UA = USER_AGENT
+
+    _play_order = [
+        "咕噜4K", "菲乐4K", "鲸宝4K", "神话", "臻影4K", "精品2K",
+        "鲸宝2K", "短剧2K", "天堂", "☆讯飞☆", "☆奇趣☆", "☆果汁☆",
+        "☆酷萌☆", "☆哔哩☆", "咖啡", "量子", "非凡", "暴风", "蚂蚁",
+        "小熊", "海外", "花旗",
+    ]
+    _categories = [("1", "电影"), ("2", "电视剧"), ("3", "综艺"),
+                   ("4", "动漫"), ("5", "短剧"), ("60", "直播")]
+
+    # ---- 二级分类（筛选字段经服务器实测：F8=类型，F6=地区，F18=排序） ----
+    _filter_genres = ["动作", "喜剧", "爱情", "科幻", "恐怖", "剧情", "战争", "犯罪",
+                      "悬疑", "动画", "冒险", "奇幻", "惊悚", "家庭"]
+    _filter_areas = ["大陆", "香港", "台湾", "美国", "日本", "韩国", "英国", "法国",
+                     "泰国", "印度"]
+    _filter_sorts = [("月热门", "vod_hits_month"), ("周热门", "vod_hits_week"),
+                     ("日热门", "vod_hits_day"), ("最新", "vod_time"),
+                     ("评分", "vod_score")]
+
+    @classmethod
+    def _filters_for(cls, tid):
+        if str(tid) == "60":
+            return []
+        def _row(key, pairs):
+            return {"key": key, "name": key,
+                    "value": [{"n": "全部", "v": ""}] + [{"n": n, "v": v} for n, v in pairs]}
+        return [
+            _row("类型", [(g, g) for g in cls._filter_genres]),
+            _row("地区", [(a, a) for a in cls._filter_areas]),
+            _row("排序", list(cls._filter_sorts)),
+        ]
+
+    @staticmethod
+    def _extend_value(extend, key):
+        if not extend:
+            return ""
+        if isinstance(extend, str):
+            try:
+                extend = json.loads(extend)
+            except Exception:
+                return ""
+        if isinstance(extend, dict):
+            return str(extend.get(key) or "").strip()
+        return ""
+
+    def __init__(self) -> None:
+        self.protocol = _GuluProtocol()
+        self.last_error = ""
+        # ---- 蜘蛛框架py 模板契约 ----
+        self.header = {
+            "User-Agent": "Mozilla/5.0 (Linux; Android 13; SM-S9080) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+            "Referer": HOST,
+            "Accept-Language": "zh-CN,zh;q=0.9",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        }
+        self.s = self.session = self.sess = _requests.Session() if _requests else None
+
+    def _get(self, url, referer=None):
+        h = dict(self.header)
+        if referer:
+            h["Referer"] = referer
+        if self.s is not None:
+            try:
+                r = self.s.get(url, headers=h, timeout=12, allow_redirects=True)
+                if r.status_code < 400:
+                    return r.text
+            except Exception:
+                pass
+        try:
+            import urllib.request
+            req = urllib.request.Request(url, headers=h)
+            with urllib.request.urlopen(req, timeout=12) as resp:
+                return resp.read().decode("utf-8", "ignore")
+        except Exception:
+            return ""
+
+    def _u(self, u):
+        if not u:
+            return u
+        u = u.strip()
+        if u.startswith("//"):
+            return "https:" + u
+        if u.startswith("http"):
+            return u
+        if u.startswith("/"):
+            m = re.match(r"(https?://[^/]+)", HOST)
+            return (m.group(1) if m else HOST) + u
+        return HOST.rstrip("/") + "/" + u.lstrip("/")
+
+    def isVideoFormat(self, url):
+        if not url:
+            return False
+        u = str(url).lower()
+        return u.endswith((".m3u8", ".mp4", ".flv", ".mkv", ".ts", ".avi")) or "m3u8" in u
+
+    def init(self, extend=""):
+        """drpy 空闲刷新钩子：仅复位会话无关状态，不依赖本方法被执行。"""
+        return None
+
+    def _ensure_boot(self) -> None:
+        try:
+            if not self.protocol.session_id:
+                self.protocol.handshake()
+            if not self.protocol.players:
+                self.protocol.boot()
+        except Exception as e:
+            self.last_error = "%s:%s" % (type(e).__name__, e)
+
+    def _search(self, keyword, page=1, limit=21, category_id="", genre="", area="",
+                sort="vod_hits_month"):
+        self._ensure_boot()
+        try:
+            return self.protocol.search(keyword, page, limit, category_id,
+                                        genre=genre, area=area, sort=sort)
+        except Exception:
+            try:
+                self.protocol.reset_session()
+                self._ensure_boot()
+                return self.protocol.search(keyword, page, limit, category_id,
+                                            genre=genre, area=area, sort=sort)
+            except Exception as e:
+                self.last_error = "%s" % e
+                return {"videos": [], "page": page, "pagecount": 1,
+                        "limit": limit, "total": 0}
+
+    # ---- T3 契约 ----
+
+    def homeContent(self, filter=False):
+        classes = [{"type_id": tid, "type_name": nm} for tid, nm in self._categories]
+        filters = {tid: self._filters_for(tid) for tid, nm in self._categories}
+        cards = []
+        try:
+            result = self._search("", 1, 21)
+            cards = self._cards(result.get("videos", []), 1, 21)[:20]
+        except Exception:
+            pass
+        return {"class": classes, "filters": filters, "list": cards}
+
+    def homeVideoContent(self):
+        return self.homeContent()
+
+    def categoryContent(self, tid, pg="1", filter=True, extend=""):
+        pg = max(1, int(pg or 1))
+        tid = str(tid or "").strip()
+        genre = self._extend_value(extend, "类型")
+        area = self._extend_value(extend, "地区")
+        sort = self._extend_value(extend, "排序") or "vod_hits_month"
+        result = self._search("", pg, 21, tid, genre=genre, area=area, sort=sort)
+        return {"class": [{"type_id": t, "type_name": nm}
+                          for t, nm in self._categories],
+                "filters": {t: self._filters_for(t) for t, nm in self._categories},
+                "list": self._cards(result.get("videos", []), pg, 21),
+                "page": pg, "pagecount": result.get("pagecount", 1),
+                "limit": result.get("limit", 21), "total": result.get("total", 0)}
+
+    def detailContent(self, ids, flags=None):
+        vod_id = self._detail_id(ids)
+        if not vod_id:
+            return {"list": []}
+        self._ensure_boot()
+        try:
+            detail = self.protocol.detail(vod_id)
+        except Exception:
+            self.protocol.reset_session()
+            self._ensure_boot()
+            detail = self.protocol.detail(vod_id)
+        if not detail:
+            return {"list": []}
+
+        play_from, play_blocks = [], []
+        for source in detail["sources"]:
+            episodes = []
+            for ep in source["episodes"]:
+                idx = ep["index"] or len(episodes) + 1
+                encoded = "{}@{}@{}@{}".format(ep["id"], source["parser_id"],
+                                               detail["name"], idx)
+                episodes.append("%s$%s" % (ep["name"], encoded))
+            if episodes:
+                play_from.append(self._clean_name(source["name"]))
+                play_blocks.append("#".join(episodes))
+        paired = list(zip(play_from, play_blocks))
+        paired.sort(key=lambda x: self._rank(x[0]))
+
+        vod = {
+            "vod_id": detail["id"],
+            "vod_name": detail["name"],
+            "vod_pic": detail["pic"],
+            "vod_year": detail["year"],
+            "vod_area": detail["area"],
+            "vod_content": detail["content"],
+            "vod_remarks": detail["remarks"],
+            "vod_play_from": "$$$".join(p[0] for p in paired),
+            "vod_play_url": "$$$".join(p[1] for p in paired),
+        }
+        return {"list": [vod]}
+
+    def searchContent(self, key, quick=False, pg="1"):
+        kw = (key or "").strip()
+        if not kw:
+            return {"list": []}
+        pg = max(1, int(pg or 1))
+        result = self._search(kw, pg, 21)
+        return {"list": self._cards(result.get("videos", []), pg, 21)}
+
+    def playerContent(self, flag, ids, vipFlags=None):
+        # TVBox 传 list（如 ["id@parser@name@1"]），CLI 传 str，统一解包
+        id = ids[0] if isinstance(ids, (list, tuple)) and ids else ids
+        id = str(id or "").strip()
+        header = self._play_header(id)
+        try:
+            raw_id, parser_id, vod_name, episode_index = id.split("@", 3)
+            parser_id = int(parser_id or 0)
+        except ValueError:
+            raw_id, parser_id, vod_name, episode_index = id, 0, "", "1"
+        url = raw_id if (isinstance(raw_id, str) and self._is_playable_url(raw_id)) else ""
+        if not url and parser_id:
+            self._ensure_boot()
+            parser = self.protocol.parsers.get(parser_id, {})
+            if parser and not parser.get("server", True):
+                try:
+                    url = self._external_play(parser_id, raw_id)
+                except Exception:
+                    url = ""
+            if not url:
+                try:
+                    url = self.protocol.play(parser_id, raw_id)
+                except Exception:
+                    try:
+                        self.protocol.reset_session()
+                        self._ensure_boot()
+                        url = self.protocol.play(parser_id, raw_id)
+                    except Exception:
+                        url = ""
+        return {"parse": 0, "url": url or "", "header": json.dumps(header)}
+
+    # ---- 工具 ----
+
+    _PROMO_MARKS = ("glgl.tv", "下载地址", "版本已失效", "shu.jpg")
+
+    @classmethod
+    def _is_promo(cls, name, pic):
+        blob = "%s %s" % (name or "", pic or "")
+        return any(mk in blob for mk in cls._PROMO_MARKS)
+
+    def _cards(self, videos, page, limit):
+        cards = []
+        for v in videos:
+            if not v.get("vod_id"):
+                continue
+            name, pic = v.get("vod_name") or "", v.get("vod_pic") or ""
+            if self._is_promo(name, pic):
+                continue
+            cards.append({"vod_id": str(v["vod_id"]), "vod_name": name,
+                          "vod_pic": pic,
+                          "vod_remarks": v.get("vod_remarks") or ""})
+        return cards
+
+    @staticmethod
+    def _detail_id(ids) -> str:
+        text = str(ids).strip()
+        if text.isdigit():
+            return text
+        m = re.search(r"(?:^|[^0-9])(\d{1,12})(?:$|[^0-9])", text)
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _clean_name(name: str) -> str:
+        if not name:
+            return ""
+        c = re.sub(r'[【\[\(（].*?[】\]）)]', '', name)
+        c = re.sub(r'\s*(?:HD|VIP|备用|推荐|极速|高清|标清|蓝光|超清|试看|抢先|预告|新版|旧版)\s*$',
+                   '', c, flags=re.I)
+        return re.sub(r'\s+', ' ', c).strip()
+
+    @classmethod
+    def _rank(cls, nm: str) -> int:
+        c = cls._clean_name(nm).lower()
+        for i, name in enumerate(cls._play_order):
+            if c == name.lower() or c.startswith(name.lower()) or name.lower() in c:
+                return i
+        up = cls._clean_name(nm).upper()
+        if "4K" in up:
+            return 1000
+        if "2K" in up:
+            return 2000
+        if "☆" in nm:
+            return 3000
+        return 4000
+
+    def _play_header(self, url: str) -> dict:
+        # 多数第三方 CDN 带不带 Referer 都能播；但 picovr / ppvod / quark
+        # 带 Referer 反而 403（实测）。动态：这些域名去 Referer。
+        _no_ref = ("picovr.com", "ppvod", "drive.quark.cn")
+        h = {"User-Agent": USER_AGENT}
+        if not (url and any(d in url for d in _no_ref)):
+            h["Referer"] = self.HOST + "/"
+        return h
+
+    def _is_playable_url(self, value) -> bool:
+        if not isinstance(value, str):
+            return False
+        url = value.strip()
+        if not re.match(r"^https?://", url, re.I):
+            return False
+        return any(m in url.lower() for m in
+                   (".m3u8", ".mp4", ".mkv", ".flv", ".ts", "/m.php", "?data="))
+
+    def _external_play(self, parser_id, play_id) -> str:
+        parser = self.protocol.parsers.get(parser_id, {})
+        api_url = str(parser.get("url") or "").strip()
+        if not api_url:
+            return ""
+        encoded = quote(str(play_id), safe="")
+        target = api_url.replace("{url}", encoded) if "{url}" in api_url else api_url + encoded
+        try:
+            status, body = _http_get(target, {"User-Agent": USER_AGENT}, 15)
+            payload = json.loads(body.decode("utf-8", "replace")) if status == 200 else {}
+        except Exception:
+            payload = {}
+        return self._extract_play_url(payload, parser.get("result_key") or "url")
+
+    def _extract_play_url(self, value, preferred_key="url") -> str:
+        if isinstance(value, str):
+            return value if self._is_playable_url(value) else ""
+        if isinstance(value, dict):
+            for key in (preferred_key, "url", "play_url", "playUrl", "m3u8", "data"):
+                if key in value:
+                    found = self._extract_play_url(value[key], preferred_key)
+                    if found:
+                        return found
+            for item in value.values():
+                found = self._extract_play_url(item, preferred_key)
+                if found:
+                    return found
+        elif isinstance(value, (list, tuple)):
+            for item in value:
+                found = self._extract_play_url(item, preferred_key)
+                if found:
+                    return found
+        return ""
+
+    # ---- drpy 兼容辅助 ----
+
+    def getName(self):
+        return self.display_name
+
+    def getDependence(self):
+        return []
+
+    def localProxy(self, param):
+        u = param.get("url", "") if isinstance(param, dict) else ""
+        if not u:
+            return [403, "text/plain", b"", None]
+        h = dict(self.header)
+        if self.s is not None:
+            try:
+                r = self.s.get(u, headers=h, timeout=15)
+                return [200, r.headers.get("Content-Type", "application/octet-stream"),
+                        r.content, None]
+            except Exception:
+                pass
+        try:
+            import urllib.request
+            req = urllib.request.Request(u, headers=h)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                return [200, resp.headers.get("Content-Type", "application/octet-stream"),
+                        resp.read(), None]
+        except Exception:
+            return [403, "text/plain", b"", None]
+
+    def manualVideoCheck(self):
+        return False
+
+    def action(self, action):
+        return {}
+
+    def destroy(self):
+        return None
+
+
+# ============ 模块级双入口（drpy site 模式 / 旧内核兼容） ============
+
+_SINGLETON = None
+
+
+def _get_singleton():
+    global _SINGLETON
+    if _SINGLETON is None:
+        _SINGLETON = GuluSpider()
+    return _SINGLETON
+
+
+def homeContent(filter=False):
+    return _get_singleton().homeContent(filter)
+
+
+def homeVideoContent():
+    return _get_singleton().homeVideoContent()
+
+
+def categoryContent(tid, pg="1", filter=True, extend=""):
+    return _get_singleton().categoryContent(tid, pg, filter, extend)
+
+
+def detailContent(ids, flags=None):
+    return _get_singleton().detailContent(ids, flags)
+
+
+def searchContent(key, quick=False, pg="1"):
+    return _get_singleton().searchContent(key, quick, pg)
+
+
+def playerContent(flag, ids, vipFlags=None):
+    return _get_singleton().playerContent(flag, ids, vipFlags)
+
+
+# 类名别名（部分内核按小写 spider 约定取类）
+gulu_spider = GuluSpider
+
+
+# ============ 命令行自检 ============
+
+if __name__ == "__main__":
+    import argparse
+    import sys
+
+    parser = argparse.ArgumentParser(description="咕噜咕噜 T3 源自检")
+    sub = parser.add_subparsers(dest="action", required=True)
+
+    sub.add_parser("home")
+    sub.add_parser("homevideos")
+
+    p_search = sub.add_parser("search")
+    p_search.add_argument("keyword")
+    p_search.add_argument("pg", nargs="?", default="1")
+
+    p_cate = sub.add_parser("category")
+    p_cate.add_argument("tid")
+    p_cate.add_argument("pg", nargs="?", default="1")
+
+    p_detail = sub.add_parser("detail")
+    p_detail.add_argument("vod_id")
+
+    p_play = sub.add_parser("play")
+    p_play.add_argument("encoded_id",
+                        help='完整选集 id，形如 "play_id@parser_id@vod名@序号"，'
+                             '也可直接传可播 URL')
+
+    args = parser.parse_args()
+    sp = GuluSpider()
+    try:
+        if args.action == "home":
+            result = sp.homeContent()
+        elif args.action == "homevideos":
+            result = sp.homeVideoContent()
+        elif args.action == "search":
+            result = sp.searchContent(args.keyword, pg=args.pg)
+        elif args.action == "category":
+            result = sp.categoryContent(args.tid, args.pg)
+        elif args.action == "detail":
+            result = sp.detailContent(args.vod_id)
+        elif args.action == "play":
+            result = sp.playerContent("", args.encoded_id)
+        else:
+            result = {}
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    except Exception as error:
+        sys.stderr.write("%s: %s\n" % (type(error).__name__, error))
+        sys.exit(1)
+
+
+# ==================== 云端自更新 ====================
+_KISH_UPD = {}
+
+
+def _kish_self():
+    try:
+        p = globals().get('__file__') or ''
+        return p if p and os.path.isfile(p) else ''
+    except Exception:
+        return ''
+
+
+def _kish_check(url=None):
+    """拉清单 → 比版本 → 整份覆盖自己。失败静默，绝不影响主流程。"""
+    url = (url or UPDATE_URL or '').strip()
+    out = {'ok': False, 'msg': ''}
+    if not url:
+        out['msg'] = 'no url'
+        return out
+    try:
+        sep = '&' if '?' in url else '?'
+        man = {}
+        for hit in ('%s%st=%d' % (url, sep, int(time.time() * 1000)), url):
+            try:
+                req = urllib.request.Request(
+                    hit, headers={'User-Agent': 'kishuto/1.0',
+                                  'Cache-Control': 'no-cache'})
+                with urllib.request.urlopen(req, timeout=8) as r:
+                    body = r.read()
+                got = json.loads(body.decode('utf-8', 'replace'))
+                if isinstance(got, dict):
+                    man = got
+                    break
+            except Exception:
+                continue
+        far = str(man.get('version') or '')
+        if not far:
+            out['msg'] = 'bad manifest'
+            return out
+        out['version'] = far
+        cur = tuple(int(x) for x in re.findall(r'\d+', str(CODE_VERSION)))
+        new = tuple(int(x) for x in re.findall(r'\d+', far))
+        if not new > cur:
+            out['ok'] = True
+            out['msg'] = 'up to date (%s)' % CODE_VERSION
+            return out
+        target = str(man.get('url') or '').strip()
+        base = url.rsplit('/', 1)[0] + '/'
+        if not target:
+            target = base + os.path.basename(_kish_self() or 'Kishuto.py')
+        elif not target.startswith('http'):
+            target = base + target.lstrip('/')
+        req = urllib.request.Request(
+            target, headers={'User-Agent': 'kishuto/1.0',
+                             'Cache-Control': 'no-cache'})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            blob = r.read()
+        if not blob or len(blob) > 6 * 1024 * 1024 or b'class Spider' not in blob:
+            out['msg'] = 'bad payload'
+            return out
+        dest = _kish_self()
+        if not dest:
+            out['msg'] = 'self unknown'
+            return out
+        tmp = dest + '.new'
+        with open(tmp, 'wb') as f:
+            f.write(blob)
+        try:
+            import shutil
+            shutil.copyfile(dest, dest + '.bak')
+        except Exception:
+            pass
+        os.replace(tmp, dest)
+        out['ok'] = True
+        out['updated'] = True
+        out['msg'] = 'updated %s -> %s, restart to apply' % (CODE_VERSION, far)
+        return out
+    except Exception as exc:
+        out['msg'] = '%s: %s' % (type(exc).__name__, exc)
+        return out
+
+
+def _kish_update_async():
+    if _KISH_UPD:
+        return
+    _KISH_UPD['run'] = True
+
+    def run():
+        try:
+            _KISH_UPD.update(_kish_check())
+        except Exception:
+            pass
 
     try:
-        _kzp_ctx = _kzp_ssl._create_unverified_context()
+        threading.Thread(target=run, daemon=True).start()
     except Exception:
-        _kzp_ctx = None
-    _kzp_tick = int(_kzp_time.time())
-    _kzp_err = None
-    for _kzp_u in _kzp_urls:
-        for _kzp_q in ('', '?t=%d' % _kzp_tick):
+        pass
+
+
+# ==================== Kishuto 总门面 ====================
+# ============================================================================
+# 模块：诊断中心（Kishuto Diag）
+#
+# 用标准 py 协议模拟「设置中心」：分类 → 卡片 → 点开执行并显示报告。
+# 不依赖壳的 action 回调，任何支持 py 源的壳都能用。
+# 用法：配置里加第二个站点，api 同一个 py，ext 写 {"mode":"settings"}。
+# ============================================================================
+
+DIAG_BASE = 'https://gitee.com/tao060702/tvbox/raw/master'
+
+
+QR_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+         '(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36')
+
+
+# ---------------------------------------------------------------------------
+# 诊断中心卡片磁贴的本地图片服务：纯标准库 PNG 编码 + 127.0.0.1 HTTP。
+# 不联网、不依赖 PIL / 字体；磁贴由 _diag_card_png() 生成。
+# ---------------------------------------------------------------------------
+
+_QR_SRV = {'port': 0, 'cards': {}}
+
+
+def _qr_png_write(w, h, rows):
+    """rows 是 RGB 像素行（bytearray(w*3)），编码成 PNG 字节。"""
+    import struct
+    import zlib
+
+    def chunk(typ, body):
+        return (struct.pack('>I', len(body)) + typ + body
+                + struct.pack('>I', zlib.crc32(typ + body) & 0xffffffff))
+
+    raw = b''.join(b'\x00' + bytes(r) for r in rows)
+    return (b'\x89PNG\r\n\x1a\n'
+            + chunk(b'IHDR', struct.pack('>IIBBBBB', w, h, 8, 2, 0, 0, 0))
+            + chunk(b'IDAT', zlib.compress(raw, 9))
+            + chunk(b'IEND', b''))
+
+
+def _qr_server():
+    """起一次本地图片服务（端口 39789 起顺延），返回端口号。
+
+    绑定成功后会自发一个探针请求，确认应答确实来自本服务；否则顺延端口。
+    避免 Windows 端口复用时「绑上了、请求却被别的进程接走」导致磁贴 404。
+    """
+    import threading
+    import urllib.request
+    if _QR_SRV['port']:
+        return _QR_SRV['port']
+    try:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+    except Exception:
+        return 0
+    probe = '_kish_probe.png'
+    token = b'\x89PNG\r\n\x1a\nKISH'
+    _QR_SRV['cards'][probe] = token
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            key = self.path.split('?')[0].lstrip('/')
+            blob = _QR_SRV['cards'].get(key)
+            if not blob:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header('Content-Type', 'image/png')
+            self.send_header('Content-Length', str(len(blob)))
+            self.send_header('Cache-Control', 'no-store')
+            self.end_headers()
             try:
-                _kzp_req = _kzp_ur.Request(
-                    _kzp_u + _kzp_q, headers={'User-Agent': 'okhttp/3.12.0'})
-                if _kzp_ctx is None:
-                    _kzp_res = _kzp_ur.urlopen(_kzp_req, timeout=5)
-                else:
-                    _kzp_res = _kzp_ur.urlopen(_kzp_req, timeout=5,
-                                               context=_kzp_ctx)
-                _kzp_doc = _kzp_json.loads(
-                    _kzp_res.read().decode('utf-8', 'replace'))
-                return _kzp_doc['d'][_kzp_doc['n']]
-            except Exception as _kzp_e:
-                _kzp_err = _kzp_e
-    raise RuntimeError('装载失败：配套数据不可达（%s）' % _kzp_err)
+                self.wfile.write(blob)
+            except Exception:
+                pass
+
+        def log_message(self, *args):
+            pass
+
+    for port in range(39789, 39799):
+        srv = None
+        try:
+            srv = ThreadingHTTPServer(('127.0.0.1', port), Handler)
+            srv.daemon_threads = True
+            threading.Thread(target=srv.serve_forever, daemon=True).start()
+            try:
+                with urllib.request.urlopen(
+                        'http://127.0.0.1:%d/%s' % (port, probe),
+                        timeout=1) as resp:
+                    mine = (resp.read() == token)
+            except Exception:
+                mine = False
+            if not mine:
+                try:
+                    srv.shutdown()
+                    srv.server_close()
+                except Exception:
+                    pass
+                continue
+            _QR_SRV['srv'] = srv
+            _QR_SRV['port'] = port
+            return port
+        except Exception:
+            try:
+                if srv:
+                    srv.server_close()
+            except Exception:
+                pass
+            continue
+    _QR_SRV['cards'].pop(probe, None)
+    return 0
 
 
-def _kzp_open(_kzp_h):
-    """掩码十六进制串 → 原始字节。"""
-    return bytes(
-        (int(_kzp_h[_kzp_i:_kzp_i + 2], 16) ^
-         (((_kzp_i >> 1) * 37 + 11) & 255))
-        for _kzp_i in range(0, len(_kzp_h), 2))
+# ---------------------------------------------------------------------------
+# 诊断中心卡片磁贴：纯标准库生成 PNG，走 _qr_server() 的本地图片服务。
+# 不联网、不依赖字体；按分区配色 + 大号编号，避免所有卡片都是灰色占位图。
+# ---------------------------------------------------------------------------
+
+_DIAG_FONT = {
+    '0': ('01110', '10001', '10001', '10001', '10001', '10001', '01110'),
+    '1': ('00100', '01100', '00100', '00100', '00100', '00100', '01110'),
+    '2': ('01110', '10001', '00001', '00011', '00110', '01000', '11111'),
+    '3': ('11110', '00001', '00001', '01110', '00001', '00001', '11110'),
+    '4': ('00010', '00110', '01010', '10010', '11111', '00010', '00010'),
+    '5': ('11111', '10000', '11110', '00001', '00001', '10001', '01110'),
+    '6': ('01110', '10000', '11110', '10001', '10001', '10001', '01110'),
+    '7': ('11111', '00001', '00011', '00110', '01100', '01000', '01000'),
+    '8': ('01110', '10001', '10001', '01110', '10001', '10001', '01110'),
+    '9': ('01110', '10001', '10001', '01111', '00001', '00011', '01100'),
+}
+
+# 分区 -> (顶部色, 底部色, 强调色)
+_DIAG_THEME = {
+    'overview': ((22, 32, 54), (42, 70, 118), (110, 170, 250)),
+    'sources':  ((18, 38, 50), (24, 74, 94), (72, 192, 246)),
+    'cache':    ((38, 24, 32), (82, 40, 60), (244, 120, 182)),
+}
 
 
-_kzp_key = bytes(
-    _kzp_a ^ _kzp_b for _kzp_a, _kzp_b in zip(
-        _kzp_open(''.join(_kzp_s for _kzp_i, _kzp_s
-                          in sorted(_kzp_seg, key=lambda _kzp_t: _kzp_t[0]))),
-        _kzp_open(_kzp_fetch())))
+def _diag_card_png(num, group):
+    """生成 400x600 竖版编号磁贴，返回 PNG 字节。"""
+    W, H, SC = 400, 600, 18
+    top, bot, accent = _DIAG_THEME.get(group, _DIAG_THEME['overview'])
+    rows = []
+    for y in range(H):
+        t = (y * 24 // (H - 1)) / 24.0          # 量化渐变，PNG 体积更小
+        c = bytes(int(top[i] + (bot[i] - top[i]) * t) for i in range(3))
+        rows.append(bytearray(c * W))
+    ab = bytes(accent)
+    for y in range(H):
+        rows[y][0:9 * 3] = ab * 9               # 左侧细色条
+    s = '%02d' % (num % 100)
+    tw = 12 * SC
+    x0, y0 = (W - tw) // 2, (H - 7 * SC) // 2 - 34
+    white = b'\xeb\xf0\xf8'
+    for idx, ch in enumerate(s):
+        for gy, line in enumerate(_DIAG_FONT[ch]):
+            for gx, bit in enumerate(line):
+                if bit != '1':
+                    continue
+                xx = x0 + idx * (7 * SC) + gx * SC
+                yy = y0 + gy * SC
+                block = white * SC
+                for j in range(yy, yy + SC):
+                    rows[j][xx * 3:(xx + SC) * 3] = block
+    by = y0 + 7 * SC + 52
+    for j in range(by, by + 5):
+        bx = (W - 116) // 2
+        rows[j][bx * 3:(bx + 116) * 3] = ab * 116
+    return _qr_png_write(W, H, rows)
 
-_kzp_blob = ''.join(_kzp_p for _kzp_i, _kzp_p
-                    in sorted(_kzp_parts, key=lambda _kzp_t: _kzp_t[0]))
-_kzp_raw = _kzp_b64.b64decode(_kzp_blob)
-_kzp_k = (_kzp_key * (len(_kzp_raw) // len(_kzp_key) + 1))[:len(_kzp_raw)]
-_kzp_plain = _kzp_zlib.decompress(
-    (int.from_bytes(_kzp_raw, 'big') ^
-     int.from_bytes(_kzp_k, 'big')).to_bytes(len(_kzp_raw), 'big'))
 
-# exec 到本模块 globals：Spider / spider 等顶层名字必须落在模块命名空间，
-# 壳是按模块属性取类的。__name__ 兜底成 'kishuto'，避免载荷里的
-# `if __name__ == "__main__"` 在壳的裸 dict 下误触发工装入口。
-_kzp_g = globals()
-_kzp_g.setdefault('__name__', 'kishuto')
-exec(compile(_kzp_plain.decode('utf-8'), '<Kishuto>', 'exec'), _kzp_g)
+class KishDiag(object):
+    """只读诊断：版本 / 配置 / 源探活 / 缓存管理。"""
+
+    NAME = 'Kishuto 诊断'
+    GROUPS = [('overview', '总览'), ('sources', '源状态'), ('cache', '缓存配置')]
+    GROUP_KEYS = ('overview', 'sources', 'cache')
+
+    def __init__(self, sp):
+        self.sp = sp
+
+    # ---------------- 卡片 ----------------
+    @staticmethod
+    def _mk(key, name, remarks=''):
+        return {'vod_id': 'dg|' + key, 'vod_name': name, 'vod_pic': '',
+                'vod_remarks': remarks}
+
+    def homeContent(self, filter=True):
+        return {'class': [{'type_id': k, 'type_name': v} for k, v in self.GROUPS],
+                'filters': {},
+                'list': self.categoryContent(self.GROUPS[0][0], '1', False, {})['list']}
+
+    def homeVideoContent(self):
+        return {'list': self.categoryContent(self.GROUPS[0][0], '1', False, {})['list']}
+
+    def categoryContent(self, tid, pg='1', filter=True, extend=None):
+        tid = str(tid or 'overview')
+        if tid.startswith('dg|'):
+            tid = tid[3:]
+        if tid not in self.GROUP_KEYS:
+            tid = 'overview'
+        sp = self.sp
+        if tid == 'overview':
+            items = [self._mk('ver', '📦 版本与更新', '本地 %s' % CODE_VERSION),
+                     self._mk('cfg', '⚙️ 运行配置', '首页源 %s' % getattr(sp, 'HOME_SOURCE', 'yt')),
+                     self._mk('speed', '⏱ 首屏预算', '其余源等 %.1fs' % sp.FILL_BUDGET),
+                     self._mk('help', '📖 使用说明', '各分区功能速查')]
+        elif tid == 'sources':
+            items = [self._mk('srcall', '🔍 全部探活', '逐个源跑搜索 + 详情')]
+            for tag in sp.ORDER:
+                items.append(self._mk('src:%s' % tag,
+                                      '▸ %s' % sp.LABELS.get(tag, tag),
+                                      '单独探活'))
+        elif tid == 'cache':
+            items = [self._mk('cache', '📊 缓存状态', '内存缓存条数'),
+                     self._mk('cacheclear', '🧹 清空缓存', '点开即执行')]
+        else:
+            items = []
+        # 统一磁贴：本地生成、不联网；ext 加 {"diag_plain":1} 可关掉
+        cfg = getattr(sp, 'cfg', {}) or {}
+        if str(cfg.get('diag_plain') or '') not in ('1', 'true', 'yes'):
+            try:
+                port = _qr_server()
+                cards = _QR_SRV.setdefault('cards', {})
+                for i, it in enumerate(items, 1):
+                    ck = 'c_%s_%02d.png' % (tid, i)
+                    if ck not in cards:
+                        cards[ck] = _diag_card_png(i, tid)
+                    it['vod_pic'] = ('http://127.0.0.1:%d/%s?v=1'
+                                     % (port, ck)) if port else ''
+            except Exception:
+                pass
+        return {'list': items, 'page': 1, 'pagecount': 1, 'limit': 50,
+                'total': len(items)}
+
+    def searchContent(self, key, quick=False, pg='1'):
+        return {'list': []}
+
+    def playerContent(self, flag, pid, vipflags=None):
+        raw = str(pid or '').strip()
+        url = raw if raw.startswith('http') else ''
+        if not url:
+            try:
+                pad = '=' * (-len(raw) % 4)
+                url = base64.urlsafe_b64decode(raw + pad).decode('utf-8', 'replace')
+            except Exception:
+                url = ''
+        if not url.startswith('http'):
+            return {'parse': 0, 'jx': 0, 'url': ''}
+        # 预留：网页类线路交给壳的 webview
+        if '网页' in str(flag or ''):
+            return {'parse': 1, 'jx': 0, 'url': url,
+                    'header': {'User-Agent': QR_UA}}
+        return {'parse': 0, 'jx': 0, 'url': url,
+                'header': {'User-Agent': QR_UA}}
+
+    # ---------------- 执行 ----------------
+    def detailContent(self, ids):
+        raw = ids[0] if isinstance(ids, (list, tuple)) and ids else ids
+        key = str(raw or '')
+        if key.startswith('dg|'):
+            key = key[3:]
+        try:
+            got = self._run(key)
+            title, report = got[0], got[1]
+            pic = got[2] if len(got) > 2 else ''
+        except Exception as exc:
+            title, report, pic = '执行失败', '%s: %s' % (type(exc).__name__, exc), ''
+        froms, urls = '', ''   # 壳的播放器只认视频，图片塞进去必然报错，不挂线路
+        tail = '\n\n── Kishuto 诊断 · %s · %s' % (
+            CODE_VERSION, time.strftime('%H:%M'))
+        vod = {'vod_id': 'dg|' + key, 'vod_name': title, 'vod_pic': pic,
+               'type_name': '诊断', 'vod_remarks': '',
+               'vod_content': str(report).rstrip() + tail,
+               'vod_play_from': froms, 'vod_play_url': urls}
+        return {'list': [vod]}
+
+    def _run(self, key):
+        sp = self.sp
+        if key == 'ver':
+            return self._ver()
+        if key == 'cfg':
+            return self._cfg()
+        if key == 'speed':
+            return ('首屏预算', '详情页等待其余源：%.1f 秒\n'
+                    '攒够 %d 条线路提前收工\n'
+                    '后台补齐上限：%.1f 秒\n'
+                    '搜索预算：%.1f 秒'
+                    % (sp.FILL_BUDGET, sp.FILL_ENOUGH,
+                       sp.TOPUP_BUDGET, sp.SEARCH_BUDGET))
+        if key == 'cache':
+            n = len(_CACHE)
+            return ('缓存状态', '内存缓存 %d 条\n'
+                    '详情缓存 TTL：%d 秒\n搜索缓存 TTL：%d 秒\n'
+                    '首页缓存：%d 秒\n分类缓存：%d 秒'
+                    % (n, sp.CACHE_TTL, getattr(sp, 'SEARCH_TTL', 600),
+                       sp.HOME_TTL, sp.CAT_TTL))
+        if key == 'cacheclear':
+            n = len(_CACHE)
+            try:
+                with _CACHE_LOCK:
+                    _CACHE.clear()
+            except Exception:
+                pass
+            return ('已清空缓存', '清理 %d 条内存缓存。\n'
+                    '（只影响本进程，壳重启后本来也会清空）' % n)
+        if key == 'srcall':
+            rows, t0 = [], time.time()
+            for tag in sp.ORDER:
+                rows.append(self._probe(tag))
+            return ('全部探活', '\n'.join(rows) + '\n\n合计 %.1f 秒' % (time.time() - t0))
+        if key.startswith('src:'):
+            tag = key[4:]
+            return ('%s 探活' % sp.LABELS.get(tag, tag), self._probe(tag))
+        if key == 'help':
+            return ('使用说明',
+                    'Kishuto 诊断中心 · 只读工具页，不播片。\n\n'
+                    '【分区速查】\n'
+                    '  总览        版本 / 运行配置 / 首屏预算\n'
+                    '  源状态      逐个源实跑搜索 + 详情\n'
+                    '  缓存配置    查看 / 清空内存缓存\n\n'
+                    '【外观】\n'
+                    '  卡片磁贴由本地生成，不联网。\n'
+                    '  不想要磁贴：ext 加 {"diag_plain":1}。')
+        return ('未知项', '没有这一项：%s' % key)
+
+    def _ver(self):
+        local = CODE_VERSION
+        try:
+            url = DIAG_BASE + '/update_kishuto.json?t=%d' % int(time.time() * 1000)
+            req = urllib.request.Request(url, headers={'User-Agent': 'kish-diag'})
+            txt = urllib.request.urlopen(req, timeout=15).read().decode('utf-8', 'replace')
+            man = json.loads(txt)
+            online = str(man.get('version') or '')
+            same = (online == local)
+            return ('版本与更新',
+                    '本地版本：%s\n线上版本：%s\n%s\n\n'
+                    '清单大小：%s 字节\n安装地址：%s'
+                    % (local, online or '取不到',
+                       '已是最新' if same else '有新版本（重开壳会自动拉取）',
+                       man.get('size'), man.get('url') or '-'))
+        except Exception as exc:
+            return ('版本与更新', '本地版本：%s\n拉取清单失败：%s' % (local, exc))
+
+    def _cfg(self):
+        sp = self.sp
+        rows = ['首页源：%s' % getattr(sp, 'HOME_SOURCE', 'yt'),
+                '首页分类上限：%d' % sp.HOME_CLASS_MAX,
+                '线路顺序：%s' % ' > '.join(sp.LINE_FIRST),
+                '源顺序：%s' % ' > '.join(sp.LABELS.get(t, t) for t in sp.ORDER),
+                '详情缓存：%d 秒' % sp.CACHE_TTL]
+        ext = sp.cfg or {}
+        if ext:
+            rows.append('ext 已配置项：%s' % ', '.join(sorted(ext)))
+        else:
+            rows.append('ext：未配置')
+        return ('运行配置', '\n'.join(rows))
+
+    def _probe(self, tag):
+        sp = self.sp
+        name = sp.LABELS.get(tag, tag)
+        try:
+            ob = sp._src(tag)
+            if ob is None:
+                return '%-4s 实例为空' % name
+            kw = '芙莉莲' if tag == 'xf' else '庆余年'
+            t = time.time()
+            got = ob.searchContent(kw, False, '1') or {}
+            items = got.get('list') or []
+            t1 = time.time() - t
+            lines = 0
+            if items:
+                d = ob.detailContent([items[0].get('vod_id')]) or {}
+                v = (d.get('list') or [{}])[0]
+                lines = len([x for x in str(v.get('vod_play_from') or '').split('$$$') if x])
+            t2 = time.time() - t
+            flag = '正常' if items else '无结果'
+            return '%-4s %s 搜索 %d 条 %.1fs | 详情 %d 线 %.1fs' % (
+                name, flag, len(items), t1, lines, t2)
+        except Exception as exc:
+            return '%-4s 异常 %s: %s' % (name, type(exc).__name__, str(exc)[:50])
+
+    # ---------------- 兜底：软件内网页登录（纯增量） ----------------
+
+
+# ==================== 枫奇4K 线路源 fq BEGIN ====================
+# -*- coding: utf-8 -*-
+"""枫奇4K —— 只保留「至臻4K」「蓝光2K」两条线路（纯标准库，自包含）
+
+原源（枫叶4K影院 / maihaolian.com）详情页共 4 条线路：
+    至臻4k / 蓝光2k / 自营y / 自营r
+本源只取前两条，播放解析也只保留对应的 JD / co 两个接口。
+
+设计约束（与 Kishuto 聚合一致）：
+  * 纯标准库，不用 requests / bs4，可直接并进 Kishuto.py 的同一命名空间；
+    所有全局名字一律 fq_ / FQ_ 前缀，避免覆盖其它模块。
+  * init() 绝不联网；只有实际请求撞上「系统安全验证」时才惰性过验证码。
+  * 验证码识别为纯 Python PNG 解码 + 模板匹配（模板来自原源）。
+"""
+import datetime
+import html
+import json
+import re
+import struct
+import threading
+import time
+import zlib
+from http import cookiejar as _fq_cj
+import urllib.parse
+import urllib.request
+import urllib.error
+
+try:
+    from base.spider import Spider as _FQBase
+except Exception:
+    class _FQBase(object):
+        def getCache(self, key):
+            return ''
+
+        def setCache(self, key, value):
+            return None
+
+        def log(self, msg):
+            return None
+
+FQ_CAP_TPL = {
+    0: [0.9045, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045, 0.9045, 0.9045, -1.1055, -1.1055, 0.9045, 0.9045, 0.9045],
+    1: [1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, -0.5504, -1.1933, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, -1.1933, -1.1933, -1.1933, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, 1.0567, 1.0567, 0.0924, -1.1933, -1.1933, 0.0924, 1.0567, 1.0567, -1.1933, -1.1933, -1.1933, -1.1933, -1.1933, -1.1933, -1.1933, -1.1933],
+    2: [0.8165, 0.8165, -1.2247, -1.2247, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, 0.8165, 0.8165, 0.8165, 0.8165, 0.8165, -1.2247, -1.2247, -1.2247, -1.2247, -1.2247, -1.2247, -1.2247, -1.2247],
+    3: [0.7954, -1.2572, -1.2572, -1.2572, -1.2572, -1.2572, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, -1.2572, -1.2572, 0.7954, 0.7954, 0.7954, -1.2572, -1.2572, 0.7954, 0.7954, -1.2572, -1.2572, -1.2572, -1.2572, -1.2572, 0.7954, 0.7954],
+    4: [0.8819, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, -1.1339, -1.1339, -1.1339, -1.1339, -1.1339, -1.1339, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, 0.8819, -1.1339, -1.1339, 0.8819],
+    5: [-1.078, -1.078, -1.078, -1.078, -1.078, -1.078, -1.078, 0.9276, -1.078, -1.078, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, -1.078, -1.078, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, -1.078, -1.078, 0.9276, -1.078, -1.078, -1.078, 0.9276, 0.9276, -1.078, -1.078, -1.078, 0.9276, 0.9276, -1.078, -1.078, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, -1.078, -1.078, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, 0.9276, -1.078, -1.078, -1.078, -1.078, 0.9276, 0.9276, 0.9276, 0.9276, -1.078, -1.078, 0.9276, -1.078, -1.078, 0.9276, 0.9276, -1.078, -1.078, 0.9276, 0.9276, 0.9276, -1.078, -1.078, -1.078, -1.078, 0.9276, 0.9276],
+    6: [0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753],
+    7: [-1.4412, -1.4412, -1.4412, -1.4412, -1.4412, -1.4412, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, -1.4412, -1.4412, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939, 0.6939],
+    8: [1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0, -1.0, 1.0, 1.0, -1.0, -1.0, 1.0, 1.0, 1.0, -1.0, -1.0, -1.0, -1.0, 1.0, 1.0],
+    9: [0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, 0.9753, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, -1.0253, -1.0253, 0.9753, 0.9753, 0.9753, -1.0253, -1.0253, -1.0253, -1.0253, 0.9753, 0.9753],
+}
+
+
+def fq_decode_png(data):
+    if data[:8] != b'\x89PNG\r\n\x1a\n': raise ValueError('not png')
+    pos, width, height, idat = 8, None, None, b''
+    while pos < len(data):
+        ln, typ, chunk = struct.unpack('>I', data[pos:pos+4])[0], data[pos+4:pos+8], data[pos+8:pos+8+struct.unpack('>I', data[pos:pos+4])[0]]
+        pos += 12 + ln
+        if typ == b'IHDR': width, height, bit_depth, color_type = struct.unpack('>IIBB', chunk[:10])
+        elif typ == b'IDAT': idat += chunk
+        elif typ == b'IEND': break
+    if color_type not in (0, 2, 3, 4, 6): raise ValueError('color type')
+    channels, stride, raw = {0:1, 2:3, 3:1, 4:2, 6:4}[color_type], width * {0:1, 2:3, 3:1, 4:2, 6:4}[color_type], zlib.decompress(idat)
+    prev, gray, p = bytearray(stride), [], 0
+    for y in range(height):
+        ft, line, p = raw[p], bytearray(raw[p+1:p+1+stride]), p + 1 + stride
+        if ft == 1:
+            for i in range(channels, stride): line[i] = (line[i] + line[i-channels]) & 0xff
+        elif ft == 2:
+            for i in range(stride): line[i] = (line[i] + prev[i]) & 0xff
+        elif ft == 3:
+            for i in range(stride): line[i] = (line[i] + (((line[i-channels] if i >= channels else 0) + prev[i]) >> 1)) & 0xff
+        elif ft == 4:
+            for i in range(stride):
+                a, b, c = line[i-channels] if i >= channels else 0, prev[i], prev[i-channels] if i >= channels else 0
+                pp = a + b - c; pa, pb, pc = abs(pp-a), abs(pp-b), abs(pp-c)
+                line[i] = (line[i] + (a if (pa <= pb and pa <= pc) else (b if pb <= pc else c))) & 0xff
+        if color_type in (2, 6): step = 3 if color_type == 2 else 4; rows = [int(line[x*step]*0.299 + line[x*step+1]*0.587 + line[x*step+2]*0.114) for x in range(width)]
+        elif color_type == 4: rows = [line[x*2] for x in range(width)]
+        else: rows = list(line[:width])
+        gray.append(rows); prev = line
+    return width, height, gray
+
+def fq_cap_resize(block, tw=8, th=10):
+    bh, bw = len(block), len(block[0])
+    flat = []
+    for ty in range(th):
+        yf = ty * (bh - 1) / (th - 1)
+        y0 = int(yf); y1 = min(y0 + 1, bh - 1); fy = yf - y0
+        for tx in range(tw):
+            xf = tx * (bw - 1) / (tw - 1)
+            x0 = int(xf); x1 = min(x0 + 1, bw - 1); fx = xf - x0
+            v = (block[y0][x0] * (1 - fx) + block[y0][x1] * fx) * (1 - fy) + (block[y1][x0] * (1 - fx) + block[y1][x1] * fx) * fy
+            flat.append(v)
+    return flat
+
+
+def fq_cap_norm(vals):
+    n = len(vals)
+    m = sum(vals) / n
+    var = sum((v - m) ** 2 for v in vals) / n
+    sd = var ** 0.5 if var > 0 else 1.0
+    return [(v - m) / sd for v in vals]
+
+
+def fq_recognize_captcha(data):
+    """识别 4 位数字验证码：
+    - 纯 Python PNG 解码（fq_decode_png）
+    - 自适应阈值二值化 → 列投影切 4 段
+    - 每字符灰度块双线性缩放 8x10 → 零均值单位方差归一化
+    - 与 FQ_CAP_TPL（按真实验证码样本训练的归一化模板）做余弦相关取 argmax
+    - 任一字符置信度 < 0.85 判为失败（返回 None，由调用方换图重试）
+    模板于 2026-10 针对 maihaolian.com/zzztool.com 现行验证码字体重新拟合。
+    """
+    try:
+        W, H, gray = fq_decode_png(data)
+    except Exception:
+        return None
+    avg = sum(sum(r) for r in gray) / (W * H) if W * H else 128
+    thr = min(max(avg * 0.8, 80), 170)
+    bw = [[1 if gray[y][x] < thr else 0 for x in range(W)] for y in range(H)]
+    col_sums = [sum(bw[y][x] for y in range(H)) for x in range(W)]
+    segs, inseg, start = [], False, 0
+    for x in range(W):
+        if col_sums[x] > 0 and not inseg:
+            start, inseg = x, True
+        elif col_sums[x] == 0 and inseg:
+            if x - start >= 3:
+                segs.append((start, x - 1))
+            inseg = False
+    if inseg and (W - start >= 3):
+        segs.append((start, W - 1))
+    if len(segs) != 4:
+        return None
+    result = ''
+    for s, e in segs:
+        rows = [y for y in range(H) if any(gray[y][x] < thr for x in range(s, e + 1))]
+        if not rows:
+            return None
+        block = [[gray[y][x] for x in range(s, e + 1)] for y in range(rows[0], rows[-1] + 1)]
+        vec = fq_cap_norm(fq_cap_resize(block))
+        best_d, best_s = None, -1e9
+        for d in range(10):
+            sc = sum(a * b for a, b in zip(vec, FQ_CAP_TPL[d])) / len(vec)
+            if sc > best_s:
+                best_d, best_s = d, sc
+        if best_s < 0.85:
+            return None
+        result += str(best_d)
+    return result
+
+FQ_SITE = 'https://maihaolian.com'
+FQ_UA = ('Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 '
+         'Chrome/150.0.0.0 Mobile')
+FQ_HDRS = {
+    'User-Agent': FQ_UA,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Upgrade-Insecure-Requests': '1',
+    'Referer': FQ_SITE + '/',
+}
+# 只认这两条线路；(页面上的原始名, 输出显示名)，顺序即默认选线顺序
+FQ_LINES = (('至臻4k', '至臻4K'), ('蓝光2k', '蓝光2K'))
+FQ_PARSE = {
+    'JD': 'https://fgsrg.hzqingshan.com',
+    'co': 'https://zzrs.mfdyvip.com',
+}
+FQ_RE_PLAYER = re.compile(r'var\s+player_aaaa[\s\S]*?"url"\s*:\s*"([^"]+)"')
+FQ_RE_URL_VAR = re.compile(r'url\s*[:=]\s*["\'](http[^"\']+)["\']')
+FQ_RE_TOKEN = re.compile(r'data-te="([^"]+)"')
+FQ_RE_CARD = re.compile(
+    r'<a[^>]*class="[^"]*public-list-exp[^"]*"[^>]*>(.*?)</a>', re.S)
+FQ_RE_HREF = re.compile(r'href="([^"]+)"')
+FQ_RE_TITLE = re.compile(r'title="([^"]*)"')
+FQ_RE_PIC = re.compile(
+    r'<img[^>]*?\b(?:data-src|src)="([^"]+)"', re.S)
+FQ_RE_ALT = re.compile(r'<img[^>]*?\balt="([^"]*)"', re.S)
+FQ_RE_PRT = re.compile(r'class="[^"]*public-prt-g[^"]*"[^>]*>([^<]*)<')
+FQ_RE_FT2 = re.compile(r'<i class="ft2">([^<]*)</i>')
+FQ_RE_FT2B = re.compile(
+    r'class="[^"]*public-list-prb[^"]*"[^>]*>\s*([^<]+)<')
+FQ_RE_SLIDE = re.compile(r'<a\s+class="swiper-slide"[^>]*>(.*?)</a>', re.S)
+FQ_RE_EP = re.compile(r'<a[^>]*href="([^"]+)"[^>]*>([^<]*)</a>')
+FQ_RE_PAGE_TIP = re.compile(r'\d+/(\d+)页')
+FQ_RE_SPACE = re.compile(r'\s+')
+
+FQ_JAR = _fq_cj.CookieJar()
+FQ_OPENER = urllib.request.build_opener(
+    urllib.request.HTTPCookieProcessor(FQ_JAR))
+FQ_LOCK = threading.Lock()
+FQ_VERIFIED = {'at': 0.0}
+FQ_CACHE = {}
+FQ_LINE_SID = {}       # 片 id -> {线路名: 播放页 sid}，用于同集回落
+
+
+def fq_clean(text):
+    """线路/片名清洗：去掉会破坏 TVBox 分隔符的字符。"""
+    s = html.unescape(str(text or ''))
+    return FQ_RE_SPACE.sub(' ', s.replace('$', '').replace('#', '')
+                          .replace('|', '')).strip()
+
+
+def fq_abs(url):
+    u = str(url or '').strip()
+    if u.startswith('http'):
+        return u
+    return FQ_SITE + (u if u.startswith('/') else '/' + u)
+
+
+def fq_raw(url, data=None, referer=None, ctype=None, timeout=12):
+    """统一请求层；返回 bytes。"""
+    h = dict(FQ_HDRS)
+    h['Referer'] = referer or (FQ_SITE + '/')
+    if data is not None and ctype:
+        h['Content-Type'] = ctype
+    req = urllib.request.Request(url, data=data, headers=h)
+    with FQ_OPENER.open(req, timeout=timeout) as resp:
+        return resp.read()
+
+
+def fq_verify():
+    """惰性过「系统安全验证」：识别 4 位数字验证码并提交，最多 4 次。"""
+    with FQ_LOCK:
+        if time.time() - FQ_VERIFIED['at'] < 30:
+            return True
+        for i in range(4):
+            try:
+                cap = fq_raw(FQ_SITE + '/captcha.php?type=code&r=0.%d'
+                             % (12345 + i), timeout=10)
+                code = fq_recognize_captcha(cap)
+                if not code:
+                    continue
+                body = urllib.parse.urlencode({'check': code}).encode()
+                txt = fq_raw(FQ_SITE + '/captcha.php?type=verify', data=body,
+                             ctype='application/x-www-form-urlencoded',
+                             timeout=10).decode('utf-8', 'replace')
+                if '"code":1' in txt.replace(' ', ''):
+                    FQ_VERIFIED['at'] = time.time()
+                    return True
+            except Exception:
+                pass
+        return False
+
+
+def fq_get(url, data=None, referer=None, ctype=None, timeout=12, retry=True):
+    """返回页面文本；撞上验证页时自动过一次验证码再重试。"""
+    try:
+        raw = fq_raw(url, data=data, referer=referer, ctype=ctype,
+                     timeout=timeout)
+        txt = raw.decode('utf-8', 'replace')
+        if retry and '系统安全验证' in txt:
+            if fq_verify():
+                raw = fq_raw(url, data=data, referer=referer, ctype=ctype,
+                             timeout=timeout)
+                txt = raw.decode('utf-8', 'replace')
+        return txt
+    except Exception:
+        return ''
+
+
+def fq_parse_list(txt):
+    """首页 / 分类 / 搜索共用的卡片解析（maihaolian 模板）。"""
+    out = []
+    for m in FQ_RE_CARD.finditer(txt):
+        tag = m.group(0)
+        inner = m.group(1)
+        hr = FQ_RE_HREF.search(tag)
+        if not hr:
+            continue
+        ti = FQ_RE_TITLE.search(tag)
+        alt = FQ_RE_ALT.search(inner)
+        pic = FQ_RE_PIC.search(inner)
+        prt = FQ_RE_PRT.search(inner)
+        ft2 = FQ_RE_FT2.search(inner) or FQ_RE_FT2B.search(inner)
+        # 首页卡片把片名放 title；搜索页放 img 的 alt
+        name = fq_clean((ti.group(1) if ti else '') or
+                        (alt.group(1) if alt else ''))
+        if not name:
+            continue
+        out.append({
+            'vod_id': hr.group(1),
+            'vod_name': name,
+            'vod_pic': html.unescape(pic.group(1)) if pic else '',
+            'vod_remarks': fq_clean(ft2.group(1)) if ft2 else '',
+            'vod_year': ('「%s」' % fq_clean(prt.group(1))) if prt else '',
+        })
+    return out
+
+
+def fq_page_count(txt):
+    m = FQ_RE_PAGE_TIP.search(txt)
+    return int(m.group(1)) if m else 1
+
+
+def fq_sid_of(eps):
+    """从选集链接 /play/<片id>-<线路sid>-<集号>.html 里取线路 sid。"""
+    for _, href in eps[:3]:
+        m = re.search(r'/play/\d+-(\d+)-\d+\.html', href)
+        if m:
+            return m.group(1)
+    return ''
+
+
+def fq_fallback_url(pid):
+    """某条线路的解析站返回失败时，换另一条线路的同集播放页。"""
+    m = re.search(r'/play/(\d+)-(\d+)-(\d+)\.html', str(pid))
+    if not m:
+        return ''
+    vid, sid, ep = m.groups()
+    sids = FQ_LINE_SID.get(vid) or {}
+    other = ''
+    for name in ('蓝光2K', '至臻4K'):
+        if sids.get(name) and sids[name] != sid:
+            other = sids[name]
+            break
+    return '/play/%s-%s-%s.html' % (vid, other, ep) if other else ''
+
+
+def fq_detail_data(vid):
+    """详情页：只保留「至臻4K」「蓝光2K」两条线路。"""
+    url = fq_abs(vid)
+    txt = fq_get(url, timeout=12)
+    if not txt or '系统安全验证' in txt:
+        return {}
+    names = []
+    for s in FQ_RE_SLIDE.findall(txt):
+        s = re.sub(r'<i[^>]*>.*?</i>', '', s, flags=re.S)
+        s = re.sub(r'<span[^>]*>.*?</span>', '', s, flags=re.S)
+        s = re.sub(r'<[^>]+>', '', s)
+        names.append(fq_clean(s.replace('&nbsp;', ' ')))
+    # 按 anthology-list-box 切块，每块对应一条线路
+    segs = re.split(r'<div class="anthology-list-box', txt)[1:]
+    panels = []
+    for seg in segs:
+        eps = [(fq_clean(n), h) for h, n in FQ_RE_EP.findall(seg)
+               if '/play/' in h]
+        panels.append(list(reversed(eps))[:300])   # 页面是 40→1，翻成正序
+
+    lines = []
+    for i, nm in enumerate(names):
+        key = nm.lower().replace(' ', '')
+        for raw_name, disp in FQ_LINES:
+            if key == raw_name.lower() and i < len(panels) and panels[i]:
+                lines.append((disp, panels[i]))
+                break
+    order = [d for _, d in FQ_LINES]
+    lines.sort(key=lambda x: order.index(x[0]) if x[0] in order else 99)
+    if not lines:
+        return {}
+
+    # 记下两条线路各自的播放页 sid，解析站失效时可同集回落
+    num = re.search(r'/(\d+)\.html', str(vid))
+    if num:
+        FQ_LINE_SID[num.group(1)] = dict(
+            (n, fq_sid_of(eps)) for n, eps in lines)
+
+    title = re.search(r'class="slide-info-title[^"]*"[^>]*>([^<]+)<', txt)
+    pic_m = re.search(r'class="detail-pic"[\s\S]{0,600}?<img[^>]*?data-src="([^"]+)"',
+                      txt)
+    intro = re.search(r'id="height_limit"[^>]*>([\s\S]{0,1200}?)</div>', txt)
+    actor = ''
+    for info in re.findall(r'class="slide-info"[^>]*>([\s\S]{0,400}?)</div>', txt):
+        if '演员' in info:
+            actor = fq_clean(re.sub(r'<[^>]+>', ' ', info))
+            break
+
+    def strip_tags(s):
+        return fq_clean(re.sub(r'<[^>]+>', ' ', s or ''))
+
+    vod = {
+        'vod_id': vid,
+        'vod_name': fq_clean(title.group(1)) if title else '',
+        'vod_pic': html.unescape(pic_m.group(1)) if pic_m else '',
+        'vod_content': strip_tags(intro.group(1)) if intro else '',
+        'vod_actor': actor,
+        'vod_remarks': lines[0][0] + ' / ' + lines[-1][0],
+        'vod_play_from': '$$$'.join(n for n, _ in lines),
+        'vod_play_url': '$$$'.join(
+            '#'.join('%s$%s' % (n, h) for n, h in eps) for _, eps in lines),
+    }
+    return vod
+
+
+def fq_parse_play(play_key):
+    """JD-xxx / co_xxx → 解析站的 m3u8 直链。"""
+    key = re.split(r'[-_]', play_key)[0] if play_key else ''
+    base = FQ_PARSE.get(key)
+    if not base:
+        return ''
+    target = base + '/player/?url=' + play_key
+    # 这个接口强制要求来源站 Referer，否则会被导到百度页面
+    txt = fq_get(target, referer=FQ_SITE + '/', timeout=12)
+    tok = FQ_RE_TOKEN.search(txt)
+    if not tok:
+        return ''
+    body = urllib.parse.urlencode(
+        {'url': play_key, 'token': tok.group(1)}).encode()
+    res = fq_get(base + '/player/mplayer.php', data=body, referer=target,
+                 ctype='application/x-www-form-urlencoded; charset=UTF-8',
+                 timeout=12, retry=False)
+    try:
+        u = str((json.loads(res) or {}).get('url') or '')
+    except Exception:
+        return ''
+    if not u:
+        return ''
+    return (base + u) if u.startswith('/playproxy.php') else u
+
+
+def fq_player_data(pid, fallback=True):
+    url = fq_abs(pid)
+    txt = fq_get(url, timeout=12)
+    if not txt:
+        return {'parse': 0, 'jx': 0, 'url': ''}
+    m = FQ_RE_PLAYER.search(txt)
+    u = m.group(1).replace('\\/', '/') if m else ''
+    if not u:
+        m2 = FQ_RE_URL_VAR.search(txt)
+        u = m2.group(1) if m2 else ''
+    if not u:
+        u = url
+    header = 'User-Agent: %s\r\nReferer: %s/' % (FQ_UA, FQ_SITE)
+    if u.startswith('http') and ('m3u' in u or '.mp4' in u):
+        return {'parse': 0, 'jx': 0, 'url': u, 'header': header}
+    real = fq_parse_play(u) or u
+    if not real.startswith('http') and fallback:
+        alt = fq_fallback_url(pid)
+        if alt and alt != str(pid):
+            alt_res = fq_player_data(alt, fallback=False)
+            if str(alt_res.get('url') or '').startswith('http'):
+                alt_res['fq_note'] = '原线路解析站不可用，已回落另一条线路同集'
+                return alt_res
+    return {'parse': 0 if ('m3u' in real or '.mp4' in real) else 1,
+            'jx': 0, 'url': real, 'header': header}
+
+
+class FengqiSpider(_FQBase):
+    """枫奇4K（至臻4K / 蓝光2K）——可作为独立源，也可挂进 Kishuto。"""
+
+    def getName(self):
+        return '枫奇4K'
+
+    def init(self, extend=''):
+        # 性能铁律：init 不联网，验证码只在首个真实请求被拦截时触发。
+        try:
+            if isinstance(extend, str) and extend.strip().startswith('{'):
+                cfg = json.loads(extend)
+                if isinstance(cfg, dict) and cfg.get('fq_site'):
+                    FQ_HDRS['Referer'] = str(cfg['fq_site']).rstrip('/') + '/'
+        except Exception:
+            pass
+        return None
+
+    def destroy(self):
+        return None
+
+    def homeContent(self, filter=False):
+        classes = [
+            {'type_id': '1', 'type_name': '电影'},
+            {'type_id': '2', 'type_name': '电视剧'},
+            {'type_id': '3', 'type_name': '综艺'},
+            {'type_id': '4', 'type_name': '动漫'},
+            {'type_id': '5', 'type_name': '短剧'},
+        ]
+        return {'parse': 0, 'jx': 0, 'class': classes, 'filters': {}}
+
+    def homeVideoContent(self):
+        return self.categoryContent('', 1, False, {})
+
+    def categoryContent(self, tid, pg='1', filter=True, extend=None):
+        page = int(pg) if str(pg).isdigit() else 1
+        t = str(tid or '')
+        if t.startswith('/label/'):
+            url = FQ_SITE + t + '/page/%d.html' % page
+        elif t and t.isdigit():
+            url = '%s/cupfox-list/%s----------%d---.html' % (FQ_SITE, t, page)
+        else:
+            url = FQ_SITE + '/'
+        txt = fq_get(url, timeout=12)
+        items = fq_parse_list(txt) if txt else []
+        return {'parse': 0, 'jx': 0, 'list': items, 'page': page,
+                'pagecount': fq_page_count(txt) if txt else 1,
+                'limit': 30, 'total': len(items)}
+
+    def searchContent(self, key, quick=False, pg='1'):
+        if int(pg) >= 2:
+            return {'parse': 0, 'jx': 0, 'list': [], 'pagecount': 1}
+        kw = str(key or '').strip()
+        if not kw:
+            return {'parse': 0, 'jx': 0, 'list': []}
+        ck = 'fq:s:' + kw
+        hit = FQ_CACHE.get(ck)
+        if hit and time.time() - hit[0] < 300:
+            return hit[1]
+        url = (FQ_SITE + '/cupfox-search/-------------.html?wd='
+               + urllib.parse.quote(kw))
+        txt = fq_get(url, timeout=10)
+        items = fq_parse_list(txt) if txt else []
+        res = {'parse': 0, 'jx': 0, 'list': items, 'pagecount': 1}
+        FQ_CACHE[ck] = (time.time(), res)
+        return res
+
+    def detailContent(self, ids):
+        vid = str(ids[0] if isinstance(ids, (list, tuple)) and ids else ids)
+        vod = fq_detail_data(vid)
+        return {'parse': 0, 'jx': 0, 'list': [vod] if vod else []}
+
+    def playerContent(self, flag, id, vipFlags=None):
+        return fq_player_data(str(id))
+
+# ==================== 枫奇4K 线路源 fq END ====================
+
+# ==================== 橘汁新网关线路源 jn BEGIN ====================
+# -*- coding: utf-8 -*-
+# 橘汁视频 · 新网关版 TVBox / AVBox spider（Python / drpy）
+# ============================================================================
+# 【这是全新写的一份，不是对旧文件的修补】
+#
+# 旧版「橘汁视频（新）.py」走的是 https://gdsaj.hzhcbkj.cn（旧网关）。
+# 旧网关的 JD4K 解析通道已经失效，videoUsableUrl 会返回
+#   「解析视频地址失败 / 你触发了防盗」，导致 JD4K 线路播不了。
+# 本文件改走 sun.json 里「橘汁 • APP」(csp_AppDrama) 配置指向的新网关
+#   http://juziapp.hzhcbkj.cn
+# 并按该插件的协议重新实现：publicParams 走 AES-CBC 加密成 paramsData、
+# 参数走 dataKey 的 AES-ECB、签名用 zone 下发的二级公钥。
+#
+# 实测（2026-11-08）：新网关下 4 条 4K 线路全部可兑换出播放直链，包括
+#   JD4K-可下载 / VIP4K / 自建4K-3 / 自建4K-4
+#
+# 用法：直接当普通 py 源导入 TVBox / AVBox 即可，无需其它文件。
+#   - init(extend) 可传 JSON 覆盖配置，例如：
+#       {"host":"http://juziapp.hzhcbkj.cn", "only4k":true}
+#   - 类常量 ONLY_4K = True 时，详情页只保留线路名含 4K 的线路。
+#   - 默认 host 会先尝试从 site 拉取最新 domain，失败则用内置值。
+#
+# 依赖：零第三方库。有 pycryptodome 时自动使用，没有则用内置纯 Python
+#       AES / RSA 实现（首页推荐需要 AES 解密，已一并实现）。
+#
+# 说明：仅做协议兼容性实现，用于让已有本地配置正常工作；不涉及
+#       学习进度、鉴权绕过或任何平台检测逻辑。请遵守平台规则合规使用。
+# ============================================================================
+
+import json
+import re
+import ssl
+import time
+import base64
+import string
+import random
+import uuid
+import os
+import threading
+import urllib.request
+import urllib.parse
+
+import collections
+try:
+    from base.spider import Spider as jzn__Base
+except Exception:
+    class jzn__Base:
+        pass
+
+# ---------------------------------------------------------------- 加密层
+# AVBox 1.3.0 的 pip 只带 lxml/requests/pyquery，没有 pycryptodome。
+# 原文件在模块顶层 `from Crypto...` 直接把整个源卡在导入阶段。
+# 现在：能用 Crypto 就用（行为与原来完全一致），没有就用内置纯 Python 实现。
+try:
+    from Crypto.PublicKey import RSA as jzn__CryptoRSA
+    from Crypto.Cipher import jzn_PKCS1_v1_5 as jzn__CryptoPKCS1
+    from Crypto.Cipher import jzn_AES as jzn__CryptoAES
+    jzn__HAVE_CRYPTO = True
+except Exception:
+    jzn__HAVE_CRYPTO = False
+
+
+def jzn__pad(data, block=16):
+    """PKCS#7 填充（与 Crypto.Util.Padding.pad 一致）"""
+    n = block - (len(data) % block)
+    return data + bytes([n]) * n
+
+
+def jzn__unpad(data, block=16):
+    n = data[-1]
+    if 0 < n <= block and len(data) >= n:
+        return data[:-n]
+    return data
+
+
+def jzn__gf_tables():
+    alog = [0] * 256
+    log = [0] * 256
+    x = 1
+    for i in range(255):
+        alog[i] = x
+        log[x] = i
+        h = ((x << 1) ^ (0x1B if (x & 0x80) else 0)) & 0xFF
+        x = h ^ x
+    return alog, log
+
+
+def jzn__mk_sbox():
+    alog, log = jzn__gf_tables()
+    sbox = [0] * 256
+    for i in range(256):
+        if i == 0:
+            s = 0
+        else:
+            s = alog[(255 - log[i]) % 255]
+        r = s
+        for _ in range(4):
+            s = ((s << 1) | (s >> 7)) & 0xFF
+            r ^= s
+        sbox[i] = r ^ 0x63
+    return sbox
+
+
+jzn__SBOX = jzn__mk_sbox()
+
+
+def jzn__xtime(a):
+    return ((a << 1) ^ 0x1B) & 0xFF if (a & 0x80) else (a << 1) & 0xFF
+
+
+def jzn__mul(a, b):
+    r = 0
+    while b:
+        if b & 1:
+            r ^= a
+        a = jzn__xtime(a)
+        b >>= 1
+    return r
+
+
+def jzn__key_expansion(key):
+    nk = len(key) // 4
+    nr = nk + 6
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    rcon = 1
+    for i in range(nk, 4 * (nr + 1)):
+        t = list(w[i - 1])
+        if i % nk == 0:
+            t = t[1:] + t[:1]
+            t = [jzn__SBOX[b] for b in t]
+            t[0] ^= rcon
+            rcon = jzn__xtime(rcon)
+        elif nk > 6 and i % nk == 4:
+            t = [jzn__SBOX[b] for b in t]
+        w.append([w[i - nk][j] ^ t[j] for j in range(4)])
+    return w, nr
+
+
+def jzn__add_round_key(state, w, rnd):
+    for c in range(4):
+        kw = w[4 * rnd + c]
+        for r in range(4):
+            state[r + 4 * c] ^= kw[r]
+
+
+def jzn__sub_bytes(state):
+    for i in range(16):
+        state[i] = jzn__SBOX[state[i]]
+
+
+def jzn__shift_rows(state):
+    # AES 行移位：第 r 行循环左移 r 位（state 为列主序 flat 索引 r + 4c）
+    for r in range(1, 4):
+        row = [state[r + 4 * c] for c in range(4)]
+        for c in range(4):
+            state[r + 4 * c] = row[(c + r) % 4]
+
+
+def jzn__mix_columns(state):
+    for c in range(4):
+        a = [state[r + 4 * c] for r in range(4)]
+        state[0 + 4 * c] = jzn__mul(a[0], 2) ^ jzn__mul(a[1], 3) ^ a[2] ^ a[3]
+        state[1 + 4 * c] = a[0] ^ jzn__mul(a[1], 2) ^ jzn__mul(a[2], 3) ^ a[3]
+        state[2 + 4 * c] = a[0] ^ a[1] ^ jzn__mul(a[2], 2) ^ jzn__mul(a[3], 3)
+        state[3 + 4 * c] = jzn__mul(a[0], 3) ^ a[1] ^ a[2] ^ jzn__mul(a[3], 2)
+
+
+def jzn__aes_encrypt_block(block, w, nr):
+    state = list(block)
+    jzn__add_round_key(state, w, 0)
+    for rnd in range(1, nr):
+        jzn__sub_bytes(state)
+        jzn__shift_rows(state)
+        jzn__mix_columns(state)
+        jzn__add_round_key(state, w, rnd)
+    jzn__sub_bytes(state)
+    jzn__shift_rows(state)
+    jzn__add_round_key(state, w, nr)
+    return bytes(state)
+
+
+class jzn__PureAES:
+    MODE_ECB = 1
+    MODE_CBC = 2
+
+    @classmethod
+    def new(cls, key, mode, iv=None):
+        return cls(key, mode, iv)
+
+    def __init__(self, key, mode, iv=None):
+        if len(key) not in (16, 24, 32):
+            raise ValueError('invalid AES key size')
+        self.key = bytes(key)
+        self.mode = mode
+        self.iv = bytes(iv) if iv else b'\x00' * 16
+        self._w, self._nr = jzn__key_expansion(self.key)
+
+    def encrypt(self, data):
+        out = bytearray()
+        prev = self.iv
+        for i in range(0, len(data), 16):
+            blk = data[i:i + 16]
+            if self.mode == jzn__PureAES.MODE_CBC:
+                blk = bytes(a ^ b for a, b in zip(blk, prev))
+            enc = jzn__aes_encrypt_block(blk, self._w, self._nr)
+            out += enc
+            prev = enc
+        return bytes(out)
+
+
+def jzn__der_read(buf, i):
+    tag = buf[i]
+    i += 1
+    ln = buf[i]
+    i += 1
+    if ln & 0x80:
+        n = ln & 0x7F
+        ln = int.from_bytes(buf[i:i + n], 'big')
+        i += n
+    return tag, buf[i:i + ln], i + ln
+
+
+def jzn__rsa_pub_from_der(der):
+    """解析 DER：支持 SubjectPublicKeyInfo 与裸 RSAPublicKey"""
+    tag, seq, _ = jzn__der_read(der, 0)
+    if tag != 0x30:
+        raise ValueError('bad rsa key')
+    i = 0
+    t1, first, i = jzn__der_read(seq, i)
+    if i >= len(seq):
+        raise ValueError('bad rsa key')
+    t2, second, _ = jzn__der_read(seq, i)
+    if t2 == 0x03:
+        inner = second[1:]
+        _, rs, _ = jzn__der_read(inner, 0)
+    elif t2 == 0x30:
+        rs = second
+    else:
+        raise ValueError('bad rsa key')
+    j = 0
+    _, nb, j = jzn__der_read(rs, j)
+    _, eb, _ = jzn__der_read(rs, j)
+    return int.from_bytes(nb, 'big'), int.from_bytes(eb, 'big')
+
+
+class jzn__PurePKCS1:
+    def __init__(self, key):
+        self.n, self.e = key
+
+    def encrypt(self, msg):
+        k = (self.n.bit_length() + 7) // 8
+        if len(msg) > k - 11:
+            raise ValueError('data too long for RSA')
+        ps = bytearray()
+        while len(ps) < k - len(msg) - 3:
+            b = os.urandom(1)
+            if b != b'\x00':
+                ps += b
+        em = b'\x00\x02' + bytes(ps) + b'\x00' + msg
+        c = pow(int.from_bytes(em, 'big'), self.e, self.n)
+        return c.to_bytes(k, 'big')
+
+
+if jzn__HAVE_CRYPTO:
+    jzn_AES = jzn__CryptoAES
+    jzn_PKCS1_v1_5 = jzn__CryptoPKCS1
+
+    def jzn__rsa_public(der_b64):
+        return jzn__CryptoPKCS1.new(jzn__CryptoRSA.import_key(base64.b64decode(der_b64)))
+else:
+    jzn_AES = jzn__PureAES
+    jzn_PKCS1_v1_5 = jzn__PurePKCS1
+
+    def jzn__rsa_public(der_b64):
+        return jzn__PurePKCS1(jzn__rsa_pub_from_der(base64.b64decode(der_b64)))
+
+# ---------------------------------------------------------------- AES 解密补充
+# 内置的纯 Python AES 只有 encrypt；首页推荐数据(tag/list)是双层 AES-ECB
+# 加密，这里补上逆变换，保证无 pycryptodome 的环境也能出首页。
+jzn__INV_SBOX = [0] * 256
+for _i, _v in enumerate(jzn__SBOX):
+    jzn__INV_SBOX[_v] = _i
+
+
+def jzn__inv_sub_bytes(state):
+    for i in range(16):
+        state[i] = jzn__INV_SBOX[state[i]]
+
+
+def jzn__inv_shift_rows(state):
+    for r in range(1, 4):
+        row = [state[r + 4 * c] for c in range(4)]
+        for c in range(4):
+            state[r + 4 * c] = row[(c - r) % 4]
+
+
+def jzn__inv_mix_columns(state):
+    for c in range(4):
+        a = [state[r + 4 * c] for r in range(4)]
+        state[0 + 4 * c] = jzn__mul(a[0], 14) ^ jzn__mul(a[1], 11) ^ jzn__mul(a[2], 13) ^ jzn__mul(a[3], 9)
+        state[1 + 4 * c] = jzn__mul(a[0], 9) ^ jzn__mul(a[1], 14) ^ jzn__mul(a[2], 11) ^ jzn__mul(a[3], 13)
+        state[2 + 4 * c] = jzn__mul(a[0], 13) ^ jzn__mul(a[1], 9) ^ jzn__mul(a[2], 14) ^ jzn__mul(a[3], 11)
+        state[3 + 4 * c] = jzn__mul(a[0], 11) ^ jzn__mul(a[1], 13) ^ jzn__mul(a[2], 9) ^ jzn__mul(a[3], 14)
+
+
+def jzn__aes_decrypt_block(block, w, nr):
+    state = list(block)
+    jzn__add_round_key(state, w, nr)
+    for rnd in range(nr - 1, 0, -1):
+        jzn__inv_shift_rows(state)
+        jzn__inv_sub_bytes(state)
+        jzn__add_round_key(state, w, rnd)
+        jzn__inv_mix_columns(state)
+    jzn__inv_shift_rows(state)
+    jzn__inv_sub_bytes(state)
+    jzn__add_round_key(state, w, 0)
+    return bytes(state)
+
+
+def jzn__pureaes_decrypt(self, data):
+    out = bytearray()
+    prev = self.iv
+    for i in range(0, len(data), 16):
+        blk = data[i:i + 16]
+        dec = jzn__aes_decrypt_block(blk, self._w, self._nr)
+        if self.mode == jzn__PureAES.MODE_CBC:
+            dec = bytes(a ^ b for a, b in zip(dec, prev))
+            prev = blk
+        out += dec
+    return bytes(out)
+
+
+jzn__PureAES.decrypt = jzn__pureaes_decrypt
+
+
+# ---------------------------------------------------------------- 新协议常量
+jzn_UA = 'okhttp/3.12.1'
+jzn_NATIVE_K = 'ed5fdsgucxumegqa'   # publicParams 的 AES-CBC key / iv
+
+jzn_PUB_DEFAULT = ('MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCr8SzZhjYy+rsya1K09t8d2K50pWFoBkgUqMpKOiW'
+               '+3IEVKd4eTdvg9RSOjQ82kypL6R9BnsmrS1V8s4PVDwjQbUtYhTPPC9Hz16qY7rpD6m0d2vr09/UpW'
+               'Q5uOy9PR0QTrsioveZ+DIe9jc3C+zBCu/kZSY/R8stwJoiitki3gwIDAQAB')
+
+jzn_VIDEO_RE = re.compile(r'(?i)\.(mp4|m3u8|flv|mkv|avi|ts|mov|mpd|m4a|wmv)(\?.*)?$')
+
+
+def jzn__key_bytes(k):
+    return k.encode() if isinstance(k, str) else k
+
+
+def jzn__ecb_enc(s, key):
+    return base64.b64encode(
+        jzn_AES.new(jzn__key_bytes(key), jzn_AES.MODE_ECB).encrypt(jzn__pad(s.encode(), 16))).decode()
+
+
+def jzn__ecb_dec(s, key):
+    ct = base64.b64decode(s)
+    if jzn__HAVE_CRYPTO:
+        plain = jzn_AES.new(jzn__key_bytes(key), jzn_AES.MODE_ECB).decrypt(ct)
+    else:
+        plain = jzn__PureAES(jzn__key_bytes(key), jzn__PureAES.MODE_ECB).decrypt(ct)
+    return jzn__unpad(plain).decode('utf-8', 'replace')
+
+
+def jzn__cbc_enc(s, key, iv=None):
+    iv = jzn__key_bytes(iv or key)
+    return jzn_AES.new(jzn__key_bytes(key), jzn_AES.MODE_CBC, iv).encrypt(
+        jzn__pad(s.encode(), 16)).hex()
+
+
+def jzn__rsa_sign(data, pub):
+    return base64.b64encode(jzn__rsa_public(pub).encrypt(data.encode())).decode()
+
+
+def jzn__pb_data(raw):
+    """取 ApiResult.data (field 3)"""
+    for fn, wt, v in jzn__pb(raw):
+        if fn == 3 and wt == 2:
+            return v
+    return b''
+
+
+def jzn__pb_code(raw):
+    for fn, wt, v in jzn__pb(raw):
+        if fn == 1 and wt == 0:
+            return v
+    return -1
+
+# ---------------------------------------------------------------- protobuf 工具
+def jzn__varint(n):
+    b = b''
+    while True:
+        x = n & 0x7f
+        n >>= 7
+        if n:
+            b += bytes([x | 0x80])
+        else:
+            return b + bytes([x])
+
+
+def jzn__f(num, wire, payload):
+    t = jzn__varint((num << 3) | wire)
+    if wire == 2:
+        return t + jzn__varint(len(payload)) + payload
+    return t + payload
+
+
+def jzn__pb(buf):
+    # 正确的 protobuf 解析：字段号 > 15 时 tag 是多字节 varint，
+    # 只读一个字节会造成整体错位（老版本源文件就是因此只能按原始字节扫描）
+    out = []
+    i = 0
+    n = len(buf)
+    while i < n:
+        tag = 0
+        sh = 0
+        while i < n:
+            x = buf[i]; i += 1
+            tag |= (x & 0x7f) << sh; sh += 7
+            if not x & 0x80:
+                break
+        fn, wt = tag >> 3, tag & 7
+        if fn == 0:
+            break
+        if wt == 0:
+            v = 0; sh = 0
+            while i < n:
+                x = buf[i]; i += 1
+                v |= (x & 0x7f) << sh; sh += 7
+                if not x & 0x80:
+                    break
+            out.append((fn, wt, v))
+        elif wt == 2:
+            ln = 0; sh = 0
+            while i < n:
+                x = buf[i]; i += 1
+                ln |= (x & 0x7f) << sh; sh += 7
+                if not x & 0x80:
+                    break
+            out.append((fn, wt, buf[i:i + ln])); i += ln
+        elif wt == 5:
+            out.append((fn, wt, buf[i:i + 4])); i += 4
+        elif wt == 1:
+            out.append((fn, wt, buf[i:i + 8])); i += 8
+        else:
+            i += 1
+    return out
+
+
+def jzn__rnd(k):
+    CH = string.ascii_letters + string.digits
+    return ''.join(random.sample(list(CH), k - 1)) + '='
+
+# ---------------------------------------------------------------- 内置分类兜底
+# 新网关不提供 /api/v3/drama/getCategory（返回 400 No static resource），
+# 与官方插件一致：接口拿不到时使用内置分类表。
+jzn_CATEGORIES = [{'id': 20, 'name': '电影', 'converUrl': '{"class":"喜剧,爱情,恐怖,动作,科幻,剧情,战争,警匪,犯罪,动画,奇幻,武侠,冒险,枪战,恐怖,悬疑,惊悚,经典,青春,文艺,微电影,古装,历史,运动,农村,儿童,网络电影","area":"大陆,香港,台湾,美国,法国,英国,日本,韩国,德国,泰国,印度,意大利,西班牙,加拿大,其他","lang":"国语,英语,粤语,闽南语,韩语,日语,法语,德语,其它","year":"2026,2025,2024,2023,2022,2021,2020,2019,2018,2017,2016,2015,2014,2013,2012,2011,2010","extend_sort":"最新,最热,好评"}', 'typeMid': 1, 'typeSort': 2, 'typePid': 0}, {'id': 21, 'name': '剧集', 'converUrl': '{"class":"古装,战争,青春,偶像,喜剧,家庭,犯罪,动作,奇幻,剧情,历史,经典,乡村,情景,商战,网剧,其他","area":"内地,韩国,香港,台湾,日本,美国,泰国,英国,新加坡,其他","lang":"国语,英语,粤语,闽南语,韩语,日语,其它","year":"2026,2025,2024,2023,2022,2021,2020,2019,2018,2017,2016,2015,2014,2013,2012,2011,2010,2009,2008,2007,2006,2005,2004,2003,2002,2001,2000","extend_sort":"最新,最热,好评"}', 'typeMid': 1, 'typeSort': 1, 'typePid': 0}, {'id': 22, 'name': '综艺', 'converUrl': '{"class":"选秀,情感,访谈,播报,旅游,音乐,美食,纪实,曲艺,生活,游戏互动,财经,求职","area":"内地,港台,日韩,欧美","lang":"国语,英语,粤语,闽南语,韩语,日语,其它","year":"2026,2025,2024,2023,2022,2021,2020,2019,2018,2017,2016,2015,2014,2013,2012,2011,2010","extend_sort":"最新,最热,好评"}', 'typeMid': 1, 'typeSort': 3, 'typePid': 0}, {'id': 23, 'name': '动漫', 'converUrl': '{"year":"2026,2025,2024,2023,2022,2021,2020,2019,2018,2017,2016","extend_sort":"最新,最热,好评"}', 'typeMid': 1, 'typeSort': 6, 'typePid': 0}, {'id': 24, 'name': '短剧', 'converUrl': '{"class":"重生民国,穿越年代,现代言情,反转爽文,女恋总裁,闪婚离婚,都市脑洞,古装仙侠,其它","year":"2026,2025,2024,2023,2022,2021,2020,2019,2018,2017,2016","extend_sort":"最新,最热,好评"}', 'typeMid': 1, 'typeSort': 4, 'typePid': 0}, {'id': 26, 'name': '漫剧', 'converUrl': '{}', 'typeMid': 1, 'typeSort': 5, 'typePid': 0}]
+
+
+# ---------------------------------------------------------------- Spider
+class JZNewRaw(jzn__Base):
+    HOST_NAME = '橘汁-新网关'
+
+    # 默认配置：来自 sun.json 里「橘汁 • APP」(csp_AppDrama) 的 ext
+    DEFAULT = {
+        'host': 'http://juziapp.hzhcbkj.cn',
+        'site': 'https://123-1349250429.cos.ap-shanghai.myqcloud.com/app.txt',
+        'publicKey': jzn_PUB_DEFAULT,
+        'dataKey': 'ZU1DSFFWNENKMDYXVUQRN0ZJDUC4PQ==',
+        'dataIv': 'OC1A06E197EF10CF3F6058CA7A803B5E',
+        'pkg': 'com.asjdhjhd.mgd.p3',
+        'appName': '橘汁',
+        'version': '3.0.7.0',
+        'decrypt': '1',
+    }
+
+    ONLY_4K = False        # True = 详情页只保留线路名含 4K 的线路
+    TIMEOUT = 15
+    CACHE_LIMIT = 128
+
+    # ------------------------------------------------------------ 生命周期
+    def __init__(self, *args, **kwargs):
+        try:
+            super().__init__(*args, **kwargs)
+        except Exception:
+            pass
+        self.cfg = dict(self.DEFAULT)
+        self.host = self.cfg['host']
+        self.udid = uuid.uuid4().hex.upper()
+        self.sec = ''              # zone 下发的二级公钥
+        self._ready = False
+        self._site_done = False
+        self._cats = None
+        self._detail_cache = {}
+        self._home_cache = None      # (timestamp, list)，纯 Python 解密较慢，缓存 60s
+        self._lock = threading.Lock()
+
+    def getName(self):
+        return self.HOST_NAME
+
+    def init(self, extend=""):
+        # 不联网：AVBox 在导入阶段可能调用 init，网络失败会卡住整个源
+        try:
+            if isinstance(extend, str) and extend.strip().startswith('{'):
+                ext = json.loads(extend)
+                if isinstance(ext, dict):
+                    for k, v in ext.items():
+                        if k in self.DEFAULT and v not in (None, ''):
+                            self.cfg[k] = str(v)
+                    if ext.get('host'):
+                        self.host = self.cfg['host'].rstrip('/')
+                        self._site_done = True   # 手动指定就不再拉 site
+                    if str(ext.get('only4k', '')).lower() in ('1', 'true', 'yes'):
+                        self.ONLY_4K = True
+        except Exception:
+            pass
+        self._ready = False
+        self.sec = ''
+        self._site_done = bool(self.cfg.get('host')) and self._site_done
+        try:
+            self._detail_cache.clear()
+            self._home_cache = None
+        except Exception:
+            pass
+
+    def destroy(self):
+        try:
+            self._detail_cache.clear()
+            self._home_cache = None
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ 会话 / 网络
+    def _http(self, url, data=None, headers=None, timeout=None):
+        req = urllib.request.Request(url, data=data, headers=headers or {})
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, timeout=timeout or self.TIMEOUT, context=ctx) as r:
+            return r.read()
+
+    def _get(self, path, headers, timeout=None):
+        try:
+            return self._http(self.host + path, None, headers, timeout)
+        except Exception:
+            return b''
+
+    def _ensure(self):
+        """懒加载：拉最新 domain + 取二级公钥，失败可重试"""
+        if self._ready:
+            return True
+        with self._lock:
+            if self._ready:
+                return True
+            if not self._site_done:
+                self._site_done = True
+                site = self.cfg.get('site', '')
+                if site:
+                    try:
+                        raw = self._http(site, None, {'User-Agent': jzn_UA}, 8)
+                        domain = (json.loads(raw.decode('utf-8', 'ignore')) or {}).get('domain', '')
+                        if domain.startswith('http'):
+                            self.host = domain.rstrip('/')
+                    except Exception:
+                        pass
+            sec = self._zone()
+            if sec:
+                self.sec = sec
+                self._ready = True
+        return self._ready
+
+    def _zone(self):
+        ts = int(time.time() * 1000)
+        r = jzn__rnd(16)
+        sign = jzn__rsa_sign(str(ts) + r, self.cfg['publicKey'])
+        # 关键：field 3 与 field 4 必须是同一个随机串，服务端拿 field 4
+        # 参与 RSA 校验；field 2 是 sign，field 5 是干扰串。
+        body = (jzn__f(1, 0, jzn__varint(ts)) + jzn__f(2, 2, sign.encode()) +
+                jzn__f(3, 2, r.encode()) + jzn__f(4, 2, r.encode()) +
+                jzn__f(5, 2, jzn__rnd(16).encode()))
+        try:
+            raw = self._http(self.host + '/api/v5/find/app/zone', body,
+                             self._c_head(self.cfg['publicKey']))
+        except Exception:
+            return ''
+        data = jzn__pb_data(raw)
+        if not data:
+            return ''
+        strs = {fn: v.decode('utf-8', 'replace') for fn, wt, v in jzn__pb(data) if wt == 2}
+        # 公钥分片在 field 2/3/4/5，field 1 是干扰串
+        return ''.join(strs.get(k, '') for k in (2, 3, 4, 5))
+
+    # ------------------------------------------------------------ 请求构造
+    def _d_obj(self):
+        return {"country": "CN", "vName": self.cfg['version'],
+                "cpuId": "MT6893Z%2FCZA", "young": 0, "facturer": "OnePlus",
+                "pkg": self.cfg['pkg'], "uuid": self.udid,
+                "resolution": "1080x2272", "mac": "02%3A00%3A00%3A00%3A00%3A00",
+                "abid": "397", "model": "PJX110", "plat": "android",
+                "udid": self.udid, "dpi": "440", "net": "1", "lang": "zh",
+                "brand": "OnePlus", "density": "2.75",
+                "appName": self.cfg['appName'], "cpu": "arm64-v8a",
+                "chid": "10000", "carrier": "%E8%81%94%E9%80%9A",
+                "_vOsCode": "36", "vOs": "16", "v": 1, "tenantId": "",
+                "vApp": self.cfg['version'].replace('.', ''),
+                "device": 0, "androidID": self.udid}
+
+    def _c_head(self, sec):
+        """protobuf 接口头：publicParams 为 AES-CBC 加密后的 paramsData"""
+        d = self._d_obj()
+        ts = int(time.time() * 1000)
+        f = jzn__rnd(16)
+        d['sig'] = jzn__rsa_sign(str(ts) + f + d['vApp'], sec)
+        b = jzn__ecb_enc(str(ts) + f, self.cfg['dataIv'])
+        d.update({'random_str': f, 'timestamp': ts, 'sig2': b[:8], 'sig3': b[8:]})
+        p = jzn__cbc_enc(json.dumps(d, separators=(',', ':'), ensure_ascii=False), jzn_NATIVE_K)
+        return {'User-Agent': jzn_UA, 'Accept': 'application/x-protobuf',
+                'Content-Type': 'application/x-protobuf',
+                'Cache-Control': 'no-cache',
+                'publicParams': json.dumps({'paramsData': p}, separators=(',', ':'))}
+
+    def _e_head(self):
+        """JSON 接口头：只加密 d()，不带 sig"""
+        p = jzn__cbc_enc(json.dumps(self._d_obj(), separators=(',', ':'),
+                                ensure_ascii=False), jzn_NATIVE_K)
+        return {'User-Agent': jzn_UA, 'Accept': 'application/json',
+                'Content-Type': 'application/json; charset=utf-8',
+                'publicParams': json.dumps({'paramsData': p}, separators=(',', ':'))}
+
+    def _g_body(self, mp):
+        """SecureRequest：参数按 dataKey 做 AES-ECB 后分片"""
+        ts = int(time.time() * 1000)
+        f8, f20 = jzn__rnd(8), jzn__rnd(20)
+        sb = '&'.join('%s=%s' % (k, v) for k, v in mp.items() if v not in (None, ''))
+        s3 = f8 + jzn__ecb_enc(sb + str(ts), self.cfg['dataKey'])
+        return (jzn__f(1, 2, s3[:20].encode()) + jzn__f(2, 2, s3[20:].encode()) +
+                jzn__f(3, 2, f20.encode()) + jzn__f(4, 0, jzn__varint(ts)) +
+                jzn__f(5, 2, f8.encode()))
+
+    def _post(self, path, mp):
+        if not self._ensure():
+            return b''
+        for attempt in (0, 1):
+            try:
+                raw = self._http(self.host + path, self._g_body(mp),
+                                 self._c_head(self.sec or self.cfg['publicKey']))
+            except Exception:
+                return b''
+            code = jzn__pb_code(raw)
+            if code == 200:
+                return jzn__pb_data(raw)
+            if code in (100001, 100002, 100003) and attempt == 0:
+                self._ready, self.sec = False, ''
+                if not self._ensure():
+                    return b''
+                continue
+            return b''
+        return b''
+
+    # ------------------------------------------------------------ 列表解析
+    @staticmethod
+    def _pic(cov):
+        if not cov:
+            return ''
+        m = re.search(r'https?://[^\x00-\x20"\\]+', cov)
+        return m.group(0) if m else ''
+
+    @classmethod
+    def _parse_list(cls, data):
+        out = []
+        if not data:
+            return out
+        for fn, wt, v in jzn__pb(data):
+            if fn != 1 or wt != 2 or not isinstance(v, bytes) or len(v) < 8:
+                continue
+            d = {}
+            for f2, w2, x in jzn__pb(v):
+                if w2 == 2 and isinstance(x, bytes):
+                    d[f2] = x.decode('utf-8', 'replace')
+                elif w2 == 0:
+                    d[f2] = x
+            if not isinstance(d.get(3), int) or not d.get(5):
+                continue
+            out.append({'vod_id': str(d[3]), 'vod_name': d.get(5, ''),
+                        'vod_pic': cls._pic(d.get(2, '')),
+                        'vod_remarks': d.get(13, '') or ''})
+        return out
+
+    def _cache_put(self, cache, key, value):
+        try:
+            if len(cache) >= self.CACHE_LIMIT:
+                cache.clear()
+            cache[key] = value
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------ 首页 / 分类
+    def _categories(self):
+        if self._cats:
+            return self._cats
+        raw = self._get('/api/v3/drama/getCategory?orderBy=type_id', self._e_head())
+        try:
+            d = (json.loads(raw.decode('utf-8', 'ignore')) or {}).get('data')
+            if isinstance(d, list) and d:
+                self._cats = d
+                return d
+        except Exception:
+            pass
+        self._cats = jzn_CATEGORIES
+        return self._cats
+
+    def homeContent(self, filter):
+        try:
+            cats = self._categories()
+            classes = [{'type_id': str(c['id']), 'type_name': c['name']}
+                       for c in cats if c.get('name') != '公告']
+            labels = [('class', '类型'), ('area', '地区'), ('lang', '语言'),
+                      ('year', '年份'), ('extend_sort', '排序')]
+            filters = {}
+            for c in cats:
+                try:
+                    cv = json.loads(c.get('converUrl') or '{}')
+                except Exception:
+                    cv = {}
+                fl = []
+                for k, label in labels:
+                    v = cv.get(k)
+                    if v:
+                        fl.append({'key': k, 'name': label,
+                                   'value': [{'n': x, 'v': x} for x in v.split(',') if x]})
+                if fl:
+                    filters[str(c['id'])] = fl
+            return {'class': classes, 'filters': filters}
+        except Exception:
+            return {'class': [], 'filters': {}}
+
+    def homeVideoContent(self):
+        if self._home_cache and time.time() - self._home_cache[0] < 60:
+            return {'list': self._home_cache[1]}
+        try:
+            raw = self._get('/api/ex/v3/security/tag/list', self._e_head())
+            j = json.loads(raw.decode('utf-8', 'ignore'))
+            ds = j.get('data') or ''
+            if self.cfg.get('decrypt', '1') != '0' and ds:
+                ds = jzn__ecb_dec(ds, self.cfg['dataKey'])
+                ds = jzn__ecb_dec(ds, self.cfg['dataIv'])
+            arr = json.loads(ds) if ds else []
+            seen, out = set(), []
+            for block in arr:
+                for sec in (block.get('sections') or []):
+                    for v in (sec.get('vodList') or []):
+                        vid = str(v.get('id', ''))
+                        if not vid or vid in seen:
+                            continue
+                        seen.add(vid)
+                        out.append({'vod_id': vid, 'vod_name': v.get('name', ''),
+                                    'vod_pic': (v.get('coverImage') or {}).get('path', '') or '',
+                                    'vod_remarks': v.get('remark', '') or ''})
+            self._home_cache = (time.time(), out)
+            return {'list': out}
+        except Exception:
+            return {'list': []}
+
+    def categoryContent(self, tid, pg, filter, extend):
+        try:
+            mp = {'pagesize': '21', 'typeId1': str(tid), 'page': str(pg or 1),
+                  'vodOrderBy': '最新'}
+            ext = extend if isinstance(extend, dict) else {}
+            for k, dst in (('extend_sort', 'vodOrderBy'), ('area', 'vodArea'),
+                           ('lang', 'vodLang'), ('class', 'vodClass'),
+                           ('year', 'vodYear')):
+                if ext.get(k):
+                    mp[dst] = str(ext[k])
+            lst = self._parse_list(self._post('/api/proto/v5/drama/category', mp))
+            page = int(pg or 1)
+            return {'list': lst, 'page': page,
+                    'pagecount': page + 1 if len(lst) >= 21 else page,
+                    'limit': 21, 'total': len(lst)}
+        except Exception:
+            return {'list': []}
+
+    def searchContent(self, key, quick, pg="1"):
+        try:
+            data = self._post('/api/proto/v5/drama/search',
+                              {'searchKeys': str(key), 'page': str(pg or 1),
+                               'pagesize': '21'})
+            return {'list': self._parse_list(data)}
+        except Exception:
+            return {'list': []}
+
+    # ------------------------------------------------------------ 详情
+    def detailContent(self, ids):
+        try:
+            raw = ids[0] if isinstance(ids, (list, tuple)) and ids else str(ids)
+            vid = str(raw).strip().strip('/')
+            if vid in self._detail_cache:
+                return {'list': [self._detail_cache[vid]]}
+            data = self._post('/api/proto/v5/drama/getDetail', {'id': vid})
+            if not data:
+                return {'list': []}
+            dd = jzn__pb(data)
+            meta = {}
+            for fn, wt, v in dd:
+                if wt == 2 and isinstance(v, bytes):
+                    meta[fn] = v.decode('utf-8', 'replace')
+                elif wt == 0:
+                    meta[fn] = v
+
+            lines = collections.OrderedDict()
+            for fn, wt, v in dd:
+                if fn != 29 or wt != 2:
+                    continue
+                e = {}
+                for f2, w2, x in jzn__pb(v):
+                    if w2 == 2 and isinstance(x, bytes):
+                        e[f2] = x.decode('utf-8', 'replace')
+                    elif w2 == 0:
+                        e[f2] = x
+                cn = e.get(10) or e.get(9) or '橘汁'
+                src, path = e.get(9, ''), e.get(4, '')
+                title = e.get(3) or e.get(2) or '正片'
+                if not path:
+                    continue
+                if not jzn_VIDEO_RE.search(path):
+                    path = base64.b64encode(json.dumps(
+                        {'vodPlayFrom': src, 'playUrl': path},
+                        separators=(',', ':'), ensure_ascii=False).encode()).decode()
+                lines.setdefault(cn, []).append(title + '$' + path)
+
+            if self.ONLY_4K:
+                k4 = [k for k in lines if '4K' in k.upper()]
+                if k4:
+                    lines = collections.OrderedDict((k, lines[k]) for k in k4)
+
+            intro = re.sub(r'<[^>]+>', '', meta.get(6) or meta.get(7) or '').strip()
+            vod = {
+                'vod_id': vid,
+                'vod_name': meta.get(9, '') or '',
+                'vod_pic': self._pic(meta.get(2, '')),
+                'vod_remarks': meta.get(26, '') or '',
+                'vod_year': str(meta.get(18, '') or ''),
+                'vod_area': meta.get(1, '') or '',
+                'vod_actor': meta.get(25, '') or '',
+                'vod_director': meta.get(12, '') or '',
+                'vod_content': intro,
+                'vod_play_from': '$$$'.join(lines.keys()),
+                'vod_play_url': '$$$'.join('#'.join(v) for v in lines.values()),
+            }
+            self._cache_put(self._detail_cache, vid, vod)
+            return {'list': [vod]}
+        except Exception:
+            return {'list': []}
+
+    # ------------------------------------------------------------ 播放
+    def playerContent(self, flag, id, vipFlags=None):
+        try:
+            pid = str(id).strip()
+            if jzn_VIDEO_RE.search(pid):
+                return {'parse': 0, 'url': pid, 'header': {}}
+            try:
+                j = json.loads(base64.b64decode(pid).decode('utf-8', 'replace'))
+            except Exception:
+                return {'parse': 0, 'url': pid, 'header': {}}
+            mp = {'vodPlayFrom': j.get('vodPlayFrom', ''),
+                  'playUrl': j.get('playUrl', '')}
+            data = self._post('/api/proto/v5/videoUsableUrl', mp)
+            url = ''
+            if data:
+                for fn, wt, v in jzn__pb(data):
+                    if fn == 1 and wt == 2:
+                        url = v.decode('utf-8', 'replace')
+                        break
+            if not url.startswith('http'):
+                return {'parse': 0, 'url': '', 'header': {}}
+            return {'parse': 0, 'url': url, 'header': {}}
+        except Exception:
+            return {'parse': 0, 'url': '', 'header': {}}
+
+    def liveContent(self, params):
+        return {'list': []}
+
+# ---- 门面适配 jn：新网关源只挂线路，不建独立站点 ----
+class JZNewSpider(_BaseSpider):
+    NAME = '橘汁新网关'
+
+    def __init__(self):
+        self.ob = None
+
+    def init(self, extend=''):
+        if self.ob is None:
+            self.ob = JZNewRaw()
+        try:
+            self.ob.init('')
+        except Exception:
+            pass
+        return None
+
+    def destroy(self):
+        try:
+            self.ob.destroy()
+        except Exception:
+            pass
+
+    @staticmethod
+    def _quick(fn, wait, fallback):
+        box = {}
+
+        def run():
+            try:
+                box['r'] = fn()
+            except Exception:
+                box['r'] = fallback
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        th.join(wait)
+        return box.get('r', fallback)
+
+    def homeContent(self, filter=True):
+        return {'class': [], 'list': []}
+
+    def categoryContent(self, tid, pg='1', filter=True, extend=None):
+        return {'list': [], 'page': 1, 'pagecount': 1, 'total': 0}
+
+    def searchContent(self, key, quick=False, pg='1'):
+        kw = str(key or '').strip()
+        if not kw:
+            return {'list': []}
+        got = self._quick(
+            lambda: self.ob.searchContent(kw, quick, str(pg or 1)),
+            3.2, {'list': []})
+        return got if isinstance(got, dict) else {'list': []}
+
+    def detailContent(self, ids):
+        vid = ids[0] if isinstance(ids, (list, tuple)) and ids else ids
+        got = self._quick(lambda: self.ob.detailContent([str(vid)]), 3.2,
+                          {'list': []})
+        v = ((got or {}).get('list') or [{}])[0] if isinstance(got, dict) else {}
+        if not isinstance(v, dict) or not str(v.get('vod_play_from') or ''):
+            return {'list': []}
+        return {'list': [dict(v)]}
+
+    def playerContent(self, flag, id, vipFlags=None):
+        got = self._quick(lambda: self.ob.playerContent(flag, id, vipFlags),
+                          8.0, {'parse': 0, 'url': '', 'header': {}})
+        return got if isinstance(got, dict) else {
+            'parse': 0, 'url': '', 'header': {}}
+# ==================== 橘汁新网关线路源 jn END ====================
+
+# ==================== 四源4K专线线路源 sk BEGIN ====================
+# -*- coding: utf-8 -*-
+# ============================================================================
+# 四源 4K 专线 · 天堂 / 布布 / 华谊 / 苹果  (TVBox / AVBox / drpy 通用)
+# ============================================================================
+# 数据来源：https://9877.kstore.space/sun.json 解密后的 sites 配置
+#   - 天堂 • APP  (csp_AppDrama)  pkg com.dytiantang.one
+#   - 布布 • APP  (csp_YunDuo)    host 323433ssdfd.top
+#   - 华谊 • APP  (csp_AppDrama)  pkg com.lxf.sncgtzxyx
+#   - 苹果 • APP  (csp_AppDrama)  pkg com.juechufsh.android.xpg1
+#
+# 本文件做的事：把四个 APP 源各自实现一遍，并且**详情页只保留 4K 线路**
+# （线路名含 4K 的才显示；若该片一条 4K 都没有，则原样保留全部线路）。
+#
+# 实测（2026-11-08）：
+#   天堂：超级无敌4K / 高清4K / 高清蓝光4K / 4k专线2️⃣   → 全部可解直链
+#   华谊：蓝光4K                                        → 可解直链
+#   苹果：超级无敌4K / 高清4K / 高清蓝光4K / 4k专线2️⃣   → 全部可解直链
+#   布布：CO4K                                          → 服务端返回
+#         PLATFORM_NOT_ALLOWED（该线路只对 APP 客户端开放，Web 通道锁死），
+#         代码里保留该线路并做了「自动回退到同片 1080P 线路」的兜底。
+#
+# 补充（用 ffprobe 逐条探过分辨率）：
+#   天堂「超级无敌4K」1280x538、「高清4K」1716x720、「独家4K」1920x806
+#   也就是说这些“4K”只是线路名，没有一条是真 4K（3840x2160）。
+#   布布聚合源里「站外-极速」反而是 1920x1080，是全站画质最高的一条。
+#
+# 用法：一个 py 文件，配 4 个 site，ext 里用 src 指定源。
+#   api 填 py 文件本身（本地文件名或 http 地址都行），ext 是传给 init() 的
+#   参数，两者互不影响：
+#   {"key":"天堂4K","name":"天堂 • 4K","type":3,
+#    "api":"http://你的地址/四源4K专线.py","ext":"{\"src\":\"天堂\"}"}
+#   同理 {"src":"布布"} / {"src":"华谊"} / {"src":"苹果"}
+#   不传 ext 时默认“天堂”。
+#
+# 可选 ext 字段（覆盖内置配置）：
+#   {"src":"华谊","host":"http://x.x.x.x:18004","only4k":false}
+#
+# 依赖：零第三方库。有 pycryptodome 时用 C 实现，没有则走内置纯 Python
+#       AES / RSA（首页推荐需要 AES 解密，已一并实现）。
+# ============================================================================
+
+import json
+import re
+import ssl
+import time
+import base64
+import string
+import random
+import uuid
+import os
+import threading
+import urllib.request
+import urllib.parse
+
+import collections
+try:
+    from base.spider import Spider as _Base
+except Exception:
+    class _Base:
+        pass
+
+# ---------------------------------------------------------------- 加密层
+# AVBox 1.3.0 的 pip 只带 lxml/requests/pyquery，没有 pycryptodome。
+# 原文件在模块顶层 `from Crypto...` 直接把整个源卡在导入阶段。
+# 现在：能用 Crypto 就用（行为与原来完全一致），没有就用内置纯 Python 实现。
+try:
+    from Crypto.PublicKey import RSA as _CryptoRSA
+    from Crypto.Cipher import PKCS1_v1_5 as _CryptoPKCS1
+    from Crypto.Cipher import AES as _CryptoAES
+    sk4__HAVE_CRYPTO = True
+except Exception:
+    sk4__HAVE_CRYPTO = False
+
+
+def sk4__pad(data, block=16):
+    """PKCS#7 填充（与 Crypto.Util.Padding.pad 一致）"""
+    n = block - (len(data) % block)
+    return data + bytes([n]) * n
+
+
+def sk4__unpad(data, block=16):
+    n = data[-1]
+    if 0 < n <= block and len(data) >= n:
+        return data[:-n]
+    return data
+
+
+def sk4__gf_tables():
+    alog = [0] * 256
+    log = [0] * 256
+    x = 1
+    for i in range(255):
+        alog[i] = x
+        log[x] = i
+        h = ((x << 1) ^ (0x1B if (x & 0x80) else 0)) & 0xFF
+        x = h ^ x
+    return alog, log
+
+
+def sk4__mk_sbox():
+    alog, log = sk4__gf_tables()
+    sbox = [0] * 256
+    for i in range(256):
+        if i == 0:
+            s = 0
+        else:
+            s = alog[(255 - log[i]) % 255]
+        r = s
+        for _ in range(4):
+            s = ((s << 1) | (s >> 7)) & 0xFF
+            r ^= s
+        sbox[i] = r ^ 0x63
+    return sbox
+
+
+sk4__SBOX = sk4__mk_sbox()
+
+
+def sk4__xtime(a):
+    return ((a << 1) ^ 0x1B) & 0xFF if (a & 0x80) else (a << 1) & 0xFF
+
+
+def sk4__mul(a, b):
+    r = 0
+    while b:
+        if b & 1:
+            r ^= a
+        a = sk4__xtime(a)
+        b >>= 1
+    return r
+
+
+def sk4__key_expansion(key):
+    nk = len(key) // 4
+    nr = nk + 6
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    rcon = 1
+    for i in range(nk, 4 * (nr + 1)):
+        t = list(w[i - 1])
+        if i % nk == 0:
+            t = t[1:] + t[:1]
+            t = [sk4__SBOX[b] for b in t]
+            t[0] ^= rcon
+            rcon = sk4__xtime(rcon)
+        elif nk > 6 and i % nk == 4:
+            t = [sk4__SBOX[b] for b in t]
+        w.append([w[i - nk][j] ^ t[j] for j in range(4)])
+    return w, nr
+
+
+def sk4__add_round_key(state, w, rnd):
+    for c in range(4):
+        kw = w[4 * rnd + c]
+        for r in range(4):
+            state[r + 4 * c] ^= kw[r]
+
+
+def sk4__sub_bytes(state):
+    for i in range(16):
+        state[i] = sk4__SBOX[state[i]]
+
+
+def sk4__shift_rows(state):
+    # AES 行移位：第 r 行循环左移 r 位（state 为列主序 flat 索引 r + 4c）
+    for r in range(1, 4):
+        row = [state[r + 4 * c] for c in range(4)]
+        for c in range(4):
+            state[r + 4 * c] = row[(c + r) % 4]
+
+
+def sk4__mix_columns(state):
+    for c in range(4):
+        a = [state[r + 4 * c] for r in range(4)]
+        state[0 + 4 * c] = sk4__mul(a[0], 2) ^ sk4__mul(a[1], 3) ^ a[2] ^ a[3]
+        state[1 + 4 * c] = a[0] ^ sk4__mul(a[1], 2) ^ sk4__mul(a[2], 3) ^ a[3]
+        state[2 + 4 * c] = a[0] ^ a[1] ^ sk4__mul(a[2], 2) ^ sk4__mul(a[3], 3)
+        state[3 + 4 * c] = sk4__mul(a[0], 3) ^ a[1] ^ a[2] ^ sk4__mul(a[3], 2)
+
+
+def sk4__aes_encrypt_block(block, w, nr):
+    state = list(block)
+    sk4__add_round_key(state, w, 0)
+    for rnd in range(1, nr):
+        sk4__sub_bytes(state)
+        sk4__shift_rows(state)
+        sk4__mix_columns(state)
+        sk4__add_round_key(state, w, rnd)
+    sk4__sub_bytes(state)
+    sk4__shift_rows(state)
+    sk4__add_round_key(state, w, nr)
+    return bytes(state)
+
+
+class sk4__PureAES:
+    MODE_ECB = 1
+    MODE_CBC = 2
+
+    @classmethod
+    def new(cls, key, mode, iv=None):
+        return cls(key, mode, iv)
+
+    def __init__(self, key, mode, iv=None):
+        if len(key) not in (16, 24, 32):
+            raise ValueError('invalid AES key size')
+        self.key = bytes(key)
+        self.mode = mode
+        self.iv = bytes(iv) if iv else b'\x00' * 16
+        self._w, self._nr = sk4__key_expansion(self.key)
+
+    def encrypt(self, data):
+        out = bytearray()
+        prev = self.iv
+        for i in range(0, len(data), 16):
+            blk = data[i:i + 16]
+            if self.mode == sk4__PureAES.MODE_CBC:
+                blk = bytes(a ^ b for a, b in zip(blk, prev))
+            enc = sk4__aes_encrypt_block(blk, self._w, self._nr)
+            out += enc
+            prev = enc
+        return bytes(out)
+
+
+def sk4__der_read(buf, i):
+    tag = buf[i]
+    i += 1
+    ln = buf[i]
+    i += 1
+    if ln & 0x80:
+        n = ln & 0x7F
+        ln = int.from_bytes(buf[i:i + n], 'big')
+        i += n
+    return tag, buf[i:i + ln], i + ln
+
+
+def sk4__rsa_pub_from_der(der):
+    """解析 DER：支持 SubjectPublicKeyInfo 与裸 RSAPublicKey"""
+    tag, seq, _ = sk4__der_read(der, 0)
+    if tag != 0x30:
+        raise ValueError('bad rsa key')
+    i = 0
+    t1, first, i = sk4__der_read(seq, i)
+    if i >= len(seq):
+        raise ValueError('bad rsa key')
+    t2, second, _ = sk4__der_read(seq, i)
+    if t2 == 0x03:
+        inner = second[1:]
+        _, rs, _ = sk4__der_read(inner, 0)
+    elif t2 == 0x30:
+        rs = second
+    else:
+        raise ValueError('bad rsa key')
+    j = 0
+    _, nb, j = sk4__der_read(rs, j)
+    _, eb, _ = sk4__der_read(rs, j)
+    return int.from_bytes(nb, 'big'), int.from_bytes(eb, 'big')
+
+
+class sk4__PurePKCS1:
+    def __init__(self, key):
+        self.n, self.e = key
+
+    def encrypt(self, msg):
+        k = (self.n.bit_length() + 7) // 8
+        if len(msg) > k - 11:
+            raise ValueError('data too long for RSA')
+        ps = bytearray()
+        while len(ps) < k - len(msg) - 3:
+            b = os.urandom(1)
+            if b != b'\x00':
+                ps += b
+        em = b'\x00\x02' + bytes(ps) + b'\x00' + msg
+        c = pow(int.from_bytes(em, 'big'), self.e, self.n)
+        return c.to_bytes(k, 'big')
+
+
+if sk4__HAVE_CRYPTO:
+    sk4_AES = _CryptoAES
+    sk4_PKCS1_v1_5 = _CryptoPKCS1
+
+    def sk4__rsa_public(der_b64):
+        return _CryptoPKCS1.new(_CryptoRSA.import_key(base64.b64decode(der_b64)))
+else:
+    sk4_AES = sk4__PureAES
+    sk4_PKCS1_v1_5 = sk4__PurePKCS1
+
+    def sk4__rsa_public(der_b64):
+        return sk4__PurePKCS1(sk4__rsa_pub_from_der(base64.b64decode(der_b64)))
+
+# ---------------------------------------------------------------- AES 解密补充
+# 内置的纯 Python AES 只有 encrypt；首页推荐数据(tag/list)是双层 AES-ECB
+# 加密，这里补上逆变换，保证无 pycryptodome 的环境也能出首页。
+sk4__INV_SBOX = [0] * 256
+for _i, _v in enumerate(sk4__SBOX):
+    sk4__INV_SBOX[_v] = _i
+
+
+def sk4__inv_sub_bytes(state):
+    for i in range(16):
+        state[i] = sk4__INV_SBOX[state[i]]
+
+
+def sk4__inv_shift_rows(state):
+    for r in range(1, 4):
+        row = [state[r + 4 * c] for c in range(4)]
+        for c in range(4):
+            state[r + 4 * c] = row[(c - r) % 4]
+
+
+def sk4__inv_mix_columns(state):
+    for c in range(4):
+        a = [state[r + 4 * c] for r in range(4)]
+        state[0 + 4 * c] = sk4__mul(a[0], 14) ^ sk4__mul(a[1], 11) ^ sk4__mul(a[2], 13) ^ sk4__mul(a[3], 9)
+        state[1 + 4 * c] = sk4__mul(a[0], 9) ^ sk4__mul(a[1], 14) ^ sk4__mul(a[2], 11) ^ sk4__mul(a[3], 13)
+        state[2 + 4 * c] = sk4__mul(a[0], 13) ^ sk4__mul(a[1], 9) ^ sk4__mul(a[2], 14) ^ sk4__mul(a[3], 11)
+        state[3 + 4 * c] = sk4__mul(a[0], 11) ^ sk4__mul(a[1], 13) ^ sk4__mul(a[2], 9) ^ sk4__mul(a[3], 14)
+
+
+def sk4__aes_decrypt_block(block, w, nr):
+    state = list(block)
+    sk4__add_round_key(state, w, nr)
+    for rnd in range(nr - 1, 0, -1):
+        sk4__inv_shift_rows(state)
+        sk4__inv_sub_bytes(state)
+        sk4__add_round_key(state, w, rnd)
+        sk4__inv_mix_columns(state)
+    sk4__inv_shift_rows(state)
+    sk4__inv_sub_bytes(state)
+    sk4__add_round_key(state, w, 0)
+    return bytes(state)
+
+
+def sk4__pureaes_decrypt(self, data):
+    out = bytearray()
+    prev = self.iv
+    for i in range(0, len(data), 16):
+        blk = data[i:i + 16]
+        dec = sk4__aes_decrypt_block(blk, self._w, self._nr)
+        if self.mode == sk4__PureAES.MODE_CBC:
+            dec = bytes(a ^ b for a, b in zip(dec, prev))
+            prev = blk
+        out += dec
+    return bytes(out)
+
+
+sk4__PureAES.decrypt = sk4__pureaes_decrypt
+
+
+# ---------------------------------------------------------------- 新协议常量
+sk4_UA = 'okhttp/3.12.1'
+sk4_NATIVE_K = 'ed5fdsgucxumegqa'   # publicParams 的 AES-CBC key / iv
+
+sk4_PUB_DEFAULT = ('MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCr8SzZhjYy+rsya1K09t8d2K50pWFoBkgUqMpKOiW'
+               '+3IEVKd4eTdvg9RSOjQ82kypL6R9BnsmrS1V8s4PVDwjQbUtYhTPPC9Hz16qY7rpD6m0d2vr09/UpW'
+               'Q5uOy9PR0QTrsioveZ+DIe9jc3C+zBCu/kZSY/R8stwJoiitki3gwIDAQAB')
+
+sk4_VIDEO_RE = re.compile(r'(?i)\.(mp4|m3u8|flv|mkv|avi|ts|mov|mpd|m4a|wmv)(\?.*)?$')
+
+
+def sk4__key_bytes(k):
+    return k.encode() if isinstance(k, str) else k
+
+
+def sk4__ecb_enc(s, key):
+    return base64.b64encode(
+        sk4_AES.new(sk4__key_bytes(key), sk4_AES.MODE_ECB).encrypt(sk4__pad(s.encode(), 16))).decode()
+
+
+def sk4__ecb_dec(s, key):
+    ct = base64.b64decode(s)
+    if sk4__HAVE_CRYPTO:
+        plain = sk4_AES.new(sk4__key_bytes(key), sk4_AES.MODE_ECB).decrypt(ct)
+    else:
+        plain = sk4__PureAES(sk4__key_bytes(key), sk4__PureAES.MODE_ECB).decrypt(ct)
+    return sk4__unpad(plain).decode('utf-8', 'replace')
+
+
+def sk4__cbc_enc(s, key, iv=None):
+    iv = sk4__key_bytes(iv or key)
+    return sk4_AES.new(sk4__key_bytes(key), sk4_AES.MODE_CBC, iv).encrypt(
+        sk4__pad(s.encode(), 16)).hex()
+
+
+def sk4__rsa_sign(data, pub):
+    return base64.b64encode(sk4__rsa_public(pub).encrypt(data.encode())).decode()
+
+
+def sk4__pb_data(raw):
+    """取 ApiResult.data (field 3)"""
+    for fn, wt, v in sk4__pb(raw):
+        if fn == 3 and wt == 2:
+            return v
+    return b''
+
+
+def sk4__pb_code(raw):
+    for fn, wt, v in sk4__pb(raw):
+        if fn == 1 and wt == 0:
+            return v
+    return -1
+
+# ---------------------------------------------------------------- protobuf 工具
+def sk4__varint(n):
+    b = b''
+    while True:
+        x = n & 0x7f
+        n >>= 7
+        if n:
+            b += bytes([x | 0x80])
+        else:
+            return b + bytes([x])
+
+
+def sk4__f(num, wire, payload):
+    t = sk4__varint((num << 3) | wire)
+    if wire == 2:
+        return t + sk4__varint(len(payload)) + payload
+    return t + payload
+
+
+def sk4__pb(buf):
+    # 正确的 protobuf 解析：字段号 > 15 时 tag 是多字节 varint，
+    # 只读一个字节会造成整体错位（老版本源文件就是因此只能按原始字节扫描）
+    out = []
+    i = 0
+    n = len(buf)
+    while i < n:
+        tag = 0
+        sh = 0
+        while i < n:
+            x = buf[i]; i += 1
+            tag |= (x & 0x7f) << sh; sh += 7
+            if not x & 0x80:
+                break
+        fn, wt = tag >> 3, tag & 7
+        if fn == 0:
+            break
+        if wt == 0:
+            v = 0; sh = 0
+            while i < n:
+                x = buf[i]; i += 1
+                v |= (x & 0x7f) << sh; sh += 7
+                if not x & 0x80:
+                    break
+            out.append((fn, wt, v))
+        elif wt == 2:
+            ln = 0; sh = 0
+            while i < n:
+                x = buf[i]; i += 1
+                ln |= (x & 0x7f) << sh; sh += 7
+                if not x & 0x80:
+                    break
+            out.append((fn, wt, buf[i:i + ln])); i += ln
+        elif wt == 5:
+            out.append((fn, wt, buf[i:i + 4])); i += 4
+        elif wt == 1:
+            out.append((fn, wt, buf[i:i + 8])); i += 8
+        else:
+            i += 1
+    return out
+
+
+def sk4__rnd(k):
+    CH = string.ascii_letters + string.digits
+    return ''.join(random.sample(list(CH), k - 1)) + '='
+
+# ---------------------------------------------------------------- 内置分类兜底
+# 新网关不提供 /api/v3/drama/getCategory（返回 400 No static resource），
+# 与官方插件一致：接口拿不到时使用内置分类表。
+sk4_CATEGORIES = [{'id': 20, 'name': '电影', 'converUrl': '{"class":"喜剧,爱情,恐怖,动作,科幻,剧情,战争,警匪,犯罪,动画,奇幻,武侠,冒险,枪战,恐怖,悬疑,惊悚,经典,青春,文艺,微电影,古装,历史,运动,农村,儿童,网络电影","area":"大陆,香港,台湾,美国,法国,英国,日本,韩国,德国,泰国,印度,意大利,西班牙,加拿大,其他","lang":"国语,英语,粤语,闽南语,韩语,日语,法语,德语,其它","year":"2026,2025,2024,2023,2022,2021,2020,2019,2018,2017,2016,2015,2014,2013,2012,2011,2010","extend_sort":"最新,最热,好评"}', 'typeMid': 1, 'typeSort': 2, 'typePid': 0}, {'id': 21, 'name': '剧集', 'converUrl': '{"class":"古装,战争,青春,偶像,喜剧,家庭,犯罪,动作,奇幻,剧情,历史,经典,乡村,情景,商战,网剧,其他","area":"内地,韩国,香港,台湾,日本,美国,泰国,英国,新加坡,其他","lang":"国语,英语,粤语,闽南语,韩语,日语,其它","year":"2026,2025,2024,2023,2022,2021,2020,2019,2018,2017,2016,2015,2014,2013,2012,2011,2010,2009,2008,2007,2006,2005,2004,2003,2002,2001,2000","extend_sort":"最新,最热,好评"}', 'typeMid': 1, 'typeSort': 1, 'typePid': 0}, {'id': 22, 'name': '综艺', 'converUrl': '{"class":"选秀,情感,访谈,播报,旅游,音乐,美食,纪实,曲艺,生活,游戏互动,财经,求职","area":"内地,港台,日韩,欧美","lang":"国语,英语,粤语,闽南语,韩语,日语,其它","year":"2026,2025,2024,2023,2022,2021,2020,2019,2018,2017,2016,2015,2014,2013,2012,2011,2010","extend_sort":"最新,最热,好评"}', 'typeMid': 1, 'typeSort': 3, 'typePid': 0}, {'id': 23, 'name': '动漫', 'converUrl': '{"year":"2026,2025,2024,2023,2022,2021,2020,2019,2018,2017,2016","extend_sort":"最新,最热,好评"}', 'typeMid': 1, 'typeSort': 6, 'typePid': 0}, {'id': 24, 'name': '短剧', 'converUrl': '{"class":"重生民国,穿越年代,现代言情,反转爽文,女恋总裁,闪婚离婚,都市脑洞,古装仙侠,其它","year":"2026,2025,2024,2023,2022,2021,2020,2019,2018,2017,2016","extend_sort":"最新,最热,好评"}', 'typeMid': 1, 'typeSort': 4, 'typePid': 0}, {'id': 26, 'name': '漫剧', 'converUrl': '{}', 'typeMid': 1, 'typeSort': 5, 'typePid': 0}]
+
+import hashlib
+
+
+# ============================================================ 源定义
+# 公钥说明：sun.json 里「天堂 / 苹果」的 publicKey 字段已过期（用它调
+# zone 会返回 100002 RSA 校验失败），实测两家现在都改用与华谊相同的那把
+# 公钥，这里统一填可用值。
+sk4_PUB_KEY = ('MIGfMA0GCSqGSIb3DQEBAQUAA4GNADCBiQKBgQCr8SzZhjYy+rsya1K09t8d2K50pWFoBkgUqMpKOiW'
+           '+3IEVKd4eTdvg9RSOjQ82kypL6R9BnsmrS1V8s4PVDwjQbUtYhTPPC9Hz16qY7rpD6m0d2vr09/UpW'
+           'Q5uOy9PR0QTrsioveZ+DIe9jc3C+zBCu/kZSY/R8stwJoiitki3gwIDAQAB')
+
+sk4_DATA_IV = 'OC1A06E197EF10CF3F6058CA7A803B5E'
+
+sk4_APP_SOURCES = {
+    '天堂': {
+        'host': 'http://122.228.193.211:18008',
+        'site': 'https://dyttandroid04-1372779881.cos.ap-shanghai.myqcloud.com/app_dyttandroid.txt',
+        'publicKey': sk4_PUB_KEY,
+        'dataKey': 'D2KREWRIBVNAUJJYEDL4VFHOY2Q0PQ==',
+        'dataIv': sk4_DATA_IV,
+        'pkg': 'com.dytiantang.one',
+        'appName': '电影天堂',
+        'version': '3.0.0.7',
+        'decrypt': '0',
+    },
+    '华谊': {
+        'host': 'http://43.240.158.154:18004',
+        'site': 'https://1851089669.cdn.123clouddisk.com/1851089669/44107727',
+        'publicKey': sk4_PUB_KEY,
+        'dataKey': 'V04XQZNYRWN6T0JODZFIAG5CTZB3PT0=',
+        'dataIv': sk4_DATA_IV,
+        'pkg': 'com.lxf.sncgtzxyx',
+        'appName': '华谊',
+        'version': '6.0.0.1',
+        'decrypt': '0',
+    },
+    '苹果': {
+        'host': 'http://122.228.193.211:18008',
+        'site': 'https://xpgandroid03-1372779881.cos.ap-beijing.myqcloud.com/app_xpg_android.txt',
+        'publicKey': sk4_PUB_KEY,
+        'dataKey': 'S0VNDTJHOFHHCNMRAW5IV2TOS2PBPQ==',
+        'dataIv': sk4_DATA_IV,
+        'pkg': 'com.juechufsh.android.xpg1',
+        'appName': '小苹果',
+        'version': '1.0.0.3',
+        'decrypt': '0',
+    },
+}
+
+sk4_BUBU_DEFAULT = {
+    'host': 'https://323433ssdfd.top',
+    'aid': 'com.web.player',
+    'x_client': '8f3d2a1c7b6e5d4c9a0b1f2e3d4c5b6a',
+    'web_sign': 'ddtvf65f3a83d6d9ad6f',
+    'finger': 'WF-2c064bc5b3400788f31b848849bc3a60f835423ba2dfe69d7ea93974c216e4f2',
+    'sk': 'WEB-50a8e9c84a1dc05669a692ded99a2dac46527229e607a7be15db88dbc59059d1',
+}
+
+sk4_SRC_ALIAS = {'步步': '布布', '电影天堂': '天堂', '小苹果': '苹果'}
+sk4_SRC_ORDER = ('天堂', '布布', '华谊', '苹果')
+
+
+def sk4__is4k(name):
+    return '4K' in (name or '').upper()
+
+
+# ============================================================ 引擎 A：AppDrama 系
+class sk4__AppEngine(object):
+    """天堂 / 华谊 / 苹果 —— 同一套 AppDrama 协议（protobuf + AES + RSA）"""
+
+    ONLY_4K = True
+    TIMEOUT = 15
+    CACHE_LIMIT = 128
+    sk4_UA = sk4_UA
+
+    def __init__(self, cfg):
+        self.cfg = dict(cfg)
+        self.host = (self.cfg.get('host') or '').rstrip('/')
+        self.udid = uuid.uuid4().hex.upper()
+        self.sec = ''
+        self._ready = False
+        self._site_done = False
+        self._cats = None
+        self._detail_cache = {}
+        self._home_cache = None
+        self._lock = threading.Lock()
+
+    def setup(self, ext):
+        if not isinstance(ext, dict):
+            return
+        for k in ('host', 'site', 'publicKey', 'dataKey', 'dataIv', 'pkg',
+                  'appName', 'version', 'decrypt'):
+            v = ext.get(k)
+            if v not in (None, ''):
+                self.cfg[k] = str(v)
+        if ext.get('host'):
+            self.host = self.cfg['host'].rstrip('/')
+            self._site_done = True
+        if str(ext.get('only4k', '')).lower() in ('1', 'true', 'yes'):
+            self.ONLY_4K = True
+        self._ready = False
+        self.sec = ''
+
+    # -------------------------------------------------- 网络
+    def _http(self, url, data=None, headers=None, timeout=None):
+        req = urllib.request.Request(url, data=data, headers=headers or {})
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, timeout=timeout or self.TIMEOUT,
+                                    context=ctx) as r:
+            return r.read()
+
+    def _get(self, path, headers, timeout=None):
+        try:
+            return self._http(self.host + path, None, headers, timeout)
+        except Exception:
+            return b''
+
+    def _ensure(self):
+        if self._ready:
+            return True
+        with self._lock:
+            if self._ready:
+                return True
+            if not self._site_done:
+                self._site_done = True
+                site = self.cfg.get('site', '')
+                if site:
+                    try:
+                        raw = self._http(site, None, {'User-Agent': self.sk4_UA}, 8)
+                        domain = (json.loads(raw.decode('utf-8', 'ignore'))
+                                  or {}).get('domain', '')
+                        if domain.startswith('http'):
+                            self.host = domain.rstrip('/')
+                    except Exception:
+                        pass
+            sec = self._zone()
+            if sec:
+                self.sec = sec
+                self._ready = True
+        return self._ready
+
+    def _zone(self):
+        ts = int(time.time() * 1000)
+        r = sk4__rnd(16)
+        sign = sk4__rsa_sign(str(ts) + r, self.cfg['publicKey'])
+        body = (sk4__f(1, 0, sk4__varint(ts)) + sk4__f(2, 2, sign.encode()) +
+                sk4__f(3, 2, r.encode()) + sk4__f(4, 2, r.encode()) +
+                sk4__f(5, 2, sk4__rnd(16).encode()))
+        try:
+            raw = self._http(self.host + '/api/v5/find/app/zone', body,
+                             self._c_head(self.cfg['publicKey']))
+        except Exception:
+            return ''
+        data = sk4__pb_data(raw)
+        if not data:
+            return ''
+        strs = {fn: v.decode('utf-8', 'replace') for fn, wt, v in sk4__pb(data)
+                if wt == 2}
+        # 分片位置有两种版本：新版 f1 是公钥开头，老版 f2 才是开头。
+        for order in ((1, 3, 4, 5), (2, 3, 4, 5)):
+            key = ''.join(strs.get(k, '') for k in order)
+            if key.startswith('MIGf') and len(key) % 4 == 0 and len(key) > 100:
+                return key
+        return ''
+
+    def _d_obj(self):
+        return {"country": "CN", "vName": self.cfg['version'],
+                "cpuId": "MT6893Z%2FCZA", "young": 0, "facturer": "OnePlus",
+                "pkg": self.cfg['pkg'], "uuid": self.udid,
+                "resolution": "1080x2272", "mac": "02%3A00%3A00%3A00%3A00%3A00",
+                "abid": "397", "model": "PJX110", "plat": "android",
+                "udid": self.udid, "dpi": "440", "net": "1", "lang": "zh",
+                "brand": "OnePlus", "density": "2.75",
+                "appName": self.cfg['appName'], "cpu": "arm64-v8a",
+                "chid": "10000", "carrier": "%E8%81%94%E9%80%9A",
+                "_vOsCode": "36", "vOs": "16", "v": 1, "tenantId": "",
+                "vApp": self.cfg['version'].replace('.', ''),
+                "device": 0, "androidID": self.udid}
+
+    def _c_head(self, sec):
+        d = self._d_obj()
+        ts = int(time.time() * 1000)
+        f = sk4__rnd(16)
+        d['sig'] = sk4__rsa_sign(str(ts) + f + d['vApp'], sec)
+        b = sk4__ecb_enc(str(ts) + f, self.cfg['dataIv'])
+        d.update({'random_str': f, 'timestamp': ts, 'sig2': b[:8], 'sig3': b[8:]})
+        p = sk4__cbc_enc(json.dumps(d, separators=(',', ':'), ensure_ascii=False),
+                     sk4_NATIVE_K)
+        return {'User-Agent': self.sk4_UA, 'Accept': 'application/x-protobuf',
+                'Content-Type': 'application/x-protobuf',
+                'Cache-Control': 'no-cache',
+                'publicParams': json.dumps({'paramsData': p},
+                                           separators=(',', ':'))}
+
+    def _e_head(self):
+        p = sk4__cbc_enc(json.dumps(self._d_obj(), separators=(',', ':'),
+                                ensure_ascii=False), sk4_NATIVE_K)
+        return {'User-Agent': self.sk4_UA, 'Accept': 'application/json',
+                'Content-Type': 'application/json; charset=utf-8',
+                'publicParams': json.dumps({'paramsData': p},
+                                           separators=(',', ':'))}
+
+    def _g_body(self, mp):
+        ts = int(time.time() * 1000)
+        f8, f20 = sk4__rnd(8), sk4__rnd(20)
+        sb = '&'.join('%s=%s' % (k, v) for k, v in mp.items()
+                      if v not in (None, ''))
+        s3 = f8 + sk4__ecb_enc(sb + str(ts), self.cfg['dataKey'])
+        return (sk4__f(1, 2, s3[:20].encode()) + sk4__f(2, 2, s3[20:].encode()) +
+                sk4__f(3, 2, f20.encode()) + sk4__f(4, 0, sk4__varint(ts)) +
+                sk4__f(5, 2, f8.encode()))
+
+    def _post(self, path, mp):
+        if not self._ensure():
+            return b''
+        for attempt in (0, 1):
+            try:
+                raw = self._http(self.host + path, self._g_body(mp),
+                                 self._c_head(self.sec or self.cfg['publicKey']))
+            except Exception:
+                return b''
+            code = sk4__pb_code(raw)
+            if code == 200:
+                return sk4__pb_data(raw)
+            if code in (100001, 100002, 100003) and attempt == 0:
+                self._ready, self.sec = False, ''
+                if not self._ensure():
+                    return b''
+                continue
+            return b''
+        return b''
+
+    # -------------------------------------------------- 解析
+    @staticmethod
+    def _pic(cov):
+        if not cov:
+            return ''
+        m = re.search(r'https?://[^\x00-\x20"\\]+', cov)
+        return m.group(0) if m else ''
+
+    @classmethod
+    def _parse_list(cls, data):
+        out = []
+        if not data:
+            return out
+        for fn, wt, v in sk4__pb(data):
+            if fn != 1 or wt != 2 or not isinstance(v, bytes) or len(v) < 8:
+                continue
+            d = {}
+            for f2, w2, x in sk4__pb(v):
+                if w2 == 2 and isinstance(x, bytes):
+                    d[f2] = x.decode('utf-8', 'replace')
+                elif w2 == 0:
+                    d[f2] = x
+            if not isinstance(d.get(3), int) or not d.get(5):
+                continue
+            out.append({'vod_id': str(d[3]), 'vod_name': d.get(5, ''),
+                        'vod_pic': cls._pic(d.get(2, '')),
+                        'vod_remarks': d.get(13, '') or ''})
+        return out
+
+    def _cache_put(self, cache, key, value):
+        try:
+            if len(cache) >= self.CACHE_LIMIT:
+                cache.clear()
+            cache[key] = value
+        except Exception:
+            pass
+
+    # -------------------------------------------------- 首页 / 分类
+    def _categories(self):
+        if self._cats:
+            return self._cats
+        raw = self._get('/api/v3/drama/getCategory?orderBy=type_id',
+                        self._e_head())
+        try:
+            d = (json.loads(raw.decode('utf-8', 'ignore')) or {}).get('data')
+            if isinstance(d, list) and d:
+                self._cats = d
+                return d
+        except Exception:
+            pass
+        self._cats = sk4_CATEGORIES
+        return self._cats
+
+    def homeContent(self, filter):
+        try:
+            cats = self._categories()
+            # 直播 / CCTV / 卫视 这些是直播源，点播详情拉不出片单，直接隐藏
+            bad = ('直播', 'CCTV', '卫视', '广播', '听书', 'FM', '音乐', '4K专区')
+            classes = [{'type_id': str(c['id']), 'type_name': c['name']}
+                       for c in cats
+                       if c.get('name') and c.get('name') != '公告'
+                       and not any(b in c['name'] for b in bad)]
+            labels = [('class', '类型'), ('area', '地区'), ('lang', '语言'),
+                      ('year', '年份'), ('extend_sort', '排序')]
+            filters = {}
+            for c in cats:
+                try:
+                    cv = json.loads(c.get('converUrl') or '{}')
+                except Exception:
+                    cv = {}
+                fl = []
+                for k, label in labels:
+                    v = cv.get(k)
+                    if v:
+                        fl.append({'key': k, 'name': label,
+                                   'value': [{'n': x, 'v': x}
+                                             for x in v.split(',') if x]})
+                if fl:
+                    filters[str(c['id'])] = fl
+            return {'class': classes, 'filters': filters}
+        except Exception:
+            return {'class': [], 'filters': {}}
+
+    def homeVideoContent(self):
+        if self._home_cache and time.time() - self._home_cache[0] < 60:
+            return {'list': self._home_cache[1]}
+        try:
+            raw = self._get('/api/ex/v3/security/tag/list', self._e_head())
+            j = json.loads(raw.decode('utf-8', 'ignore'))
+            ds = j.get('data') or []
+            # decrypt=1 的源两次 ECB 解密后才是 JSON；decrypt=0 直接给数组
+            if isinstance(ds, str):
+                if self.cfg.get('decrypt', '1') != '0' and ds:
+                    ds = sk4__ecb_dec(ds, self.cfg['dataKey'])
+                    ds = sk4__ecb_dec(ds, self.cfg['dataIv'])
+                arr = json.loads(ds) if ds else []
+            else:
+                arr = ds if isinstance(ds, list) else []
+            seen, out = set(), []
+            for block in arr:
+                for sec in (block.get('sections') or []):
+                    for v in (sec.get('vodList') or []):
+                        vid = str(v.get('id', ''))
+                        if not vid or vid in seen:
+                            continue
+                        seen.add(vid)
+                        out.append({'vod_id': vid,
+                                    'vod_name': v.get('name', ''),
+                                    'vod_pic': (v.get('coverImage') or {}).get('path', '') or '',
+                                    'vod_remarks': v.get('remark', '') or ''})
+            self._home_cache = (time.time(), out)
+            return {'list': out}
+        except Exception:
+            return {'list': []}
+
+    def categoryContent(self, tid, pg, filter, extend):
+        try:
+            mp = {'pagesize': '21', 'typeId1': str(tid), 'page': str(pg or 1),
+                  'vodOrderBy': '最新'}
+            ext = extend if isinstance(extend, dict) else {}
+            for k, dst in (('extend_sort', 'vodOrderBy'), ('area', 'vodArea'),
+                           ('lang', 'vodLang'), ('class', 'vodClass'),
+                           ('year', 'vodYear')):
+                if ext.get(k):
+                    mp[dst] = str(ext[k])
+            lst = self._parse_list(
+                self._post('/api/proto/v5/drama/category', mp))
+            page = int(pg or 1)
+            return {'list': lst, 'page': page,
+                    'pagecount': page + 1 if len(lst) >= 21 else page,
+                    'limit': 21, 'total': len(lst)}
+        except Exception:
+            return {'list': []}
+
+    def searchContent(self, key, quick, pg="1"):
+        try:
+            data = self._post('/api/proto/v5/drama/search',
+                              {'searchKeys': str(key), 'page': str(pg or 1),
+                               'pagesize': '21'})
+            return {'list': self._parse_list(data)}
+        except Exception:
+            return {'list': []}
+
+    # -------------------------------------------------- 详情
+    def detailContent(self, ids):
+        try:
+            raw = ids[0] if isinstance(ids, (list, tuple)) and ids else str(ids)
+            vid = str(raw).strip().strip('/')
+            if vid in self._detail_cache:
+                return {'list': [self._detail_cache[vid]]}
+            data = self._post('/api/proto/v5/drama/getDetail', {'id': vid})
+            if not data:
+                return {'list': []}
+            dd = sk4__pb(data)
+            meta = {}
+            for fn, wt, v in dd:
+                if wt == 2 and isinstance(v, bytes):
+                    meta[fn] = v.decode('utf-8', 'replace')
+                elif wt == 0:
+                    meta[fn] = v
+
+            lines = collections.OrderedDict()
+            for fn, wt, v in dd:
+                if fn != 29 or wt != 2:
+                    continue
+                e = {}
+                for f2, w2, x in sk4__pb(v):
+                    if w2 == 2 and isinstance(x, bytes):
+                        e[f2] = x.decode('utf-8', 'replace')
+                    elif w2 == 0:
+                        e[f2] = x
+                cn = e.get(10) or e.get(9) or 'APP'
+                src, path = e.get(9, ''), e.get(4, '')
+                title = e.get(3) or e.get(2) or '正片'
+                if not path:
+                    continue
+                if not sk4_VIDEO_RE.search(path):
+                    path = base64.b64encode(json.dumps(
+                        {'vodPlayFrom': src, 'playUrl': path},
+                        separators=(',', ':'), ensure_ascii=False).encode()).decode()
+                lines.setdefault(cn, []).append(title + '$' + path)
+
+            if self.ONLY_4K:
+                k4 = [k for k in lines if sk4__is4k(k)]
+                if k4:
+                    lines = collections.OrderedDict((k, lines[k]) for k in k4)
+
+            intro = re.sub(r'<[^>]+>', '', meta.get(6) or meta.get(7) or '').strip()
+            vod = {
+                'vod_id': vid,
+                'vod_name': meta.get(9, '') or '',
+                'vod_pic': self._pic(meta.get(2, '')),
+                'vod_remarks': meta.get(26, '') or '',
+                'vod_year': str(meta.get(18, '') or ''),
+                'vod_area': meta.get(1, '') or '',
+                'vod_actor': meta.get(25, '') or '',
+                'vod_director': meta.get(12, '') or '',
+                'vod_content': intro,
+                'vod_play_from': '$$$'.join(lines.keys()),
+                'vod_play_url': '$$$'.join('#'.join(v) for v in lines.values()),
+            }
+            self._cache_put(self._detail_cache, vid, vod)
+            return {'list': [vod]}
+        except Exception:
+            return {'list': []}
+
+    # -------------------------------------------------- 播放
+    def playerContent(self, flag, id, vipFlags=None):
+        try:
+            pid = str(id).strip()
+            if sk4_VIDEO_RE.search(pid):
+                return {'parse': 0, 'url': pid, 'header': {}}
+            try:
+                j = json.loads(base64.b64decode(pid).decode('utf-8', 'replace'))
+            except Exception:
+                return {'parse': 0, 'url': pid, 'header': {}}
+            data = self._post('/api/proto/v5/videoUsableUrl',
+                              {'vodPlayFrom': j.get('vodPlayFrom', ''),
+                               'playUrl': j.get('playUrl', '')})
+            url = ''
+            if data:
+                for fn, wt, v in sk4__pb(data):
+                    if fn == 1 and wt == 2:
+                        url = v.decode('utf-8', 'replace')
+                        break
+            if not url.startswith('http'):
+                return {'parse': 0, 'url': '', 'header': {}}
+            return {'parse': 0, 'url': url, 'header': {'User-Agent': self.sk4_UA}}
+        except Exception:
+            return {'parse': 0, 'url': '', 'header': {}}
+
+    def liveContent(self, params):
+        return {'list': []}
+
+
+# ============================================================ 引擎 B：布布 (YunDuo)
+class sk4__BubuEngine(object):
+    """布布 —— JSON 接口 + /decode/url protobuf 解链"""
+
+    ONLY_4K = True
+    TIMEOUT = 15
+    sk4_UA = ('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 '
+          '(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36')
+
+    def __init__(self, cfg=None):
+        self.cfg = dict(sk4_BUBU_DEFAULT)
+        self.cfg.update(cfg or {})
+        self.host = self.cfg['host'].rstrip('/')
+        self.api = self.host + '/api.php/web'
+        self._det = {}
+        self._home = None
+
+    def setup(self, ext):
+        if not isinstance(ext, dict):
+            return
+        for k in sk4_BUBU_DEFAULT:
+            v = ext.get(k)
+            if v not in (None, ''):
+                self.cfg[k] = str(v)
+        self.host = self.cfg['host'].rstrip('/')
+        self.api = self.host + '/api.php/web'
+        if str(ext.get('only4k', '')).lower() in ('1', 'true', 'yes'):
+            self.ONLY_4K = True
+
+    # -------------------------------------------------- 网络
+    def _hdr(self, extra=None):
+        h = {'User-Agent': self.sk4_UA, 'Accept': 'application/json',
+             'X-Client': self.cfg['x_client'],
+             'web-sign': self.cfg['web_sign']}
+        if extra:
+            h.update(extra)
+        return h
+
+    def _raw(self, url, data=None, headers=None, timeout=None):
+        req = urllib.request.Request(url, data=data,
+                                     headers=headers or self._hdr())
+        ctx = ssl._create_unverified_context()
+        with urllib.request.urlopen(req, timeout=timeout or self.TIMEOUT,
+                                    context=ctx) as r:
+            return r.read()
+
+    def _json(self, url):
+        try:
+            return json.loads(self._raw(url).decode('utf-8', 'ignore')) or {}
+        except Exception:
+            return {}
+
+    def _get(self, path):
+        return self._json(self.api + path)
+
+    # -------------------------------------------------- 解链
+    def _decode(self, token, frm):
+        try:
+            ts = int(time.time() * 1000)
+            nonce = os.urandom(16).hex()
+            msg = ('finger=%s&id=%s&nonce=%s&sk=%s&time=%d&v=1'
+                   % (self.cfg['finger'], self.cfg['aid'], nonce,
+                      self.cfg['sk'], ts))
+            sign = hashlib.sha256(msg.encode()).hexdigest().upper()
+            body = (sk4__f(1, 2, token.encode()) + sk4__f(2, 2, frm.encode()) +
+                    sk4__f(3, 0, sk4__varint(ts)) + sk4__f(4, 2, nonce.encode()) +
+                    sk4__f(5, 2, sign.encode()) + sk4__f(6, 2, self.cfg['aid'].encode()) +
+                    sk4__f(7, 0, sk4__varint(1)))
+            h = {'User-Agent': self.sk4_UA,
+                 'Content-Type': 'application/x-protobuf',
+                 'Accept': 'application/x-protobuf',
+                 'X-Client': self.cfg['x_client'],
+                 'web-sign': self.cfg['web_sign']}
+            raw = self._raw(self.api + '/decode/url', body, h)
+            for fn, wt, v in sk4__pb(raw):
+                if fn == 3 and wt == 2:
+                    s = v.decode('utf-8', 'replace')
+                    if s.startswith('http'):
+                        return s
+            # 解不出时把服务端 msg 记下来，方便排查
+            for fn, wt, v in sk4__pb(raw):
+                if fn == 2 and wt == 2:
+                    self.last_err = v.decode('utf-8', 'replace')
+                    break
+        except Exception as e:
+            self.last_err = str(e)
+        return ''
+
+    # -------------------------------------------------- 首页 / 分类
+    def homeContent(self, filter):
+        try:
+            j = self._get('/index/home')
+            cats = ((j.get('data') or {}).get('categories') or [])
+            classes, vids, seen = [], [], set()
+            for c in cats:
+                name = c.get('type_name') or c.get('type_en') or ''
+                if not name:
+                    continue
+                classes.append({'type_id': name, 'type_name': name})
+                for v in (c.get('videos') or []):
+                    vid = str(v.get('vod_id') or '')
+                    if not vid or vid in seen:
+                        continue
+                    seen.add(vid)
+                    vids.append({'vod_id': vid,
+                                 'vod_name': v.get('vod_name', ''),
+                                 'vod_pic': v.get('vod_pic', '') or '',
+                                 'vod_remarks': v.get('vod_remarks', '') or ''})
+            return {'class': classes, 'list': vids,
+                    'filters': {name: [] for name in
+                                (c['type_name'] for c in classes)}}
+        except Exception:
+            return {'class': [], 'list': [], 'filters': {}}
+
+    def homeVideoContent(self):
+        if self._home and time.time() - self._home[0] < 60:
+            return {'list': self._home[1]}
+        try:
+            j = self._get('/index/home')
+            out, seen = [], set()
+            for c in ((j.get('data') or {}).get('categories') or []):
+                for v in (c.get('videos') or []):
+                    vid = str(v.get('vod_id') or '')
+                    if not vid or vid in seen:
+                        continue
+                    seen.add(vid)
+                    out.append({'vod_id': vid,
+                                'vod_name': v.get('vod_name', ''),
+                                'vod_pic': v.get('vod_pic', '') or '',
+                                'vod_remarks': v.get('vod_remarks', '') or ''})
+            self._home = (time.time(), out)
+            return {'list': out}
+        except Exception:
+            return {'list': []}
+
+    def categoryContent(self, tid, pg, filter, extend):
+        try:
+            page = int(pg or 1)
+            url = ('%s/filter/vod?type_name=%s&page=%d&sort=hits'
+                   % (self.api, urllib.parse.quote(str(tid)), page))
+            ext = extend if isinstance(extend, dict) else {}
+            for k, v in ext.items():
+                if v not in (None, '', '全部'):
+                    url += '&%s=%s' % (k, urllib.parse.quote(str(v)))
+            j = self._json(url)
+            lst = []
+            for v in (j.get('data') or []):
+                lst.append({'vod_id': str(v.get('vod_id') or ''),
+                            'vod_name': v.get('vod_name', ''),
+                            'vod_pic': v.get('vod_pic', '') or '',
+                            'vod_remarks': v.get('vod_remarks', '') or ''})
+            # 服务端 pageCount 常年写 1，不可信；按本页条数判断有没有下一页
+            return {'list': lst, 'page': page,
+                    'pagecount': page + 1 if len(lst) >= 20 else page,
+                    'limit': 24, 'total': len(lst)}
+        except Exception:
+            return {'list': []}
+
+    def searchContent(self, key, quick, pg="1"):
+        try:
+            j = self._json('%s/search/index?wd=%s&pg=%s'
+                           % (self.api, urllib.parse.quote(str(key)),
+                              str(pg or 1)))
+            out = []
+            low = str(key).lower()
+            for v in (j.get('data') or []):
+                vid = str(v.get('vod_id') or '')
+                nm = (v.get('vod_name') or '').strip()
+                if not vid or not nm or 'http' in nm or '.com' in nm:
+                    continue
+                if low not in nm.lower():
+                    continue
+                out.append({'vod_id': vid, 'vod_name': nm,
+                            'vod_pic': v.get('vod_pic', '') or '',
+                            'vod_remarks': v.get('vod_remarks', '') or ''})
+            return {'list': out}
+        except Exception:
+            return {'list': []}
+
+    # -------------------------------------------------- 详情
+    def _detail(self, vid):
+        if vid in self._det:
+            return self._det[vid]
+        j = self._get('/vod/get_detail?vod_id=' + str(vid))
+        d = j.get('data')
+        if isinstance(d, list):
+            d = d[0] if d else {}
+        d = d or {}
+        froms = (d.get('vod_play_from') or '').split('$$$')
+        urls = (d.get('vod_play_url') or '').split('$$$')
+        eps = collections.OrderedDict()
+        all_eps = collections.OrderedDict()
+        for fr, u in zip(froms, urls):
+            if not fr or not u:
+                continue
+            items = []
+            for seg in u.split('#'):
+                if '$' not in seg:
+                    continue
+                title, token = seg.split('$', 1)
+                if not token:
+                    continue
+                items.append((title.strip() or '正片', token.strip()))
+            if items:
+                all_eps[fr] = items
+                if (not self.ONLY_4K) or sk4__is4k(fr):
+                    eps[fr] = items
+        if not eps:
+            eps = collections.OrderedDict(all_eps)
+        rec = (d, eps, all_eps)
+        if len(self._det) > 64:
+            self._det.clear()
+        self._det[vid] = rec
+        return rec
+
+    def detailContent(self, ids):
+        try:
+            vid = str(ids[0] if isinstance(ids, (list, tuple)) and ids
+                      else ids).strip()
+            d, eps, _ = self._detail(vid)
+            if not d:
+                return {'list': []}
+            lines, urls = [], []
+            for fr, items in eps.items():
+                lines.append(fr)
+                urls.append('#'.join(
+                    '%s$token@%s@%s@%s@%s' % (t, tok, fr, vid,
+                                               urllib.parse.quote(t))
+                    for t, tok in items))
+            vod = {
+                'vod_id': vid,
+                'vod_name': d.get('vod_name', '') or '',
+                'vod_pic': d.get('vod_pic', '') or '',
+                'vod_remarks': d.get('vod_remarks', '') or '',
+                'vod_year': str(d.get('vod_year', '') or ''),
+                'vod_area': d.get('vod_area', '') or '',
+                'vod_actor': d.get('vod_actor', '') or '',
+                'vod_director': d.get('vod_director', '') or '',
+                'vod_content': re.sub(r'<[^>]+>', '',
+                                      d.get('vod_content', '') or '').strip(),
+                'vod_play_from': '$$$'.join(lines),
+                'vod_play_url': '$$$'.join(urls),
+            }
+            return {'list': [vod]}
+        except Exception:
+            return {'list': []}
+
+    # -------------------------------------------------- 播放
+    def playerContent(self, flag, id, vipFlags=None):
+        try:
+            pid = str(id)
+            if pid.startswith('http'):
+                return {'parse': 0, 'url': pid, 'header': {'User-Agent': self.sk4_UA}}
+            if not pid.startswith('token@'):
+                return {'parse': 0, 'url': '', 'header': {}}
+            p = pid.split('@', 4)
+            token = p[1] if len(p) > 1 else ''
+            frm = p[2] if len(p) > 2 else ''
+            vid = p[3] if len(p) > 3 else ''
+            title = urllib.parse.unquote(p[4]) if len(p) > 4 else ''
+            url = self._decode(token, frm)
+            if not url and vid:
+                # 该线路被平台锁死（布布 CO4K 会返回 PLATFORM_NOT_ALLOWED）
+                # → 先换同片的其它高清线路，避免直接黑屏。
+                url = self._fallback(vid, frm, title)
+            if not url and vid:
+                # 最后兜底：和官方 spider 一样交给 /play 网页，让播放器自己嗅探
+                return {'parse': 1,
+                        'url': '%s/play/%s#sid=%s' % (self.host, vid, frm),
+                        'header': {'User-Agent': self.sk4_UA,
+                                   'Referer': self.host + '/'}}
+            if not url:
+                return {'parse': 0, 'url': '', 'header': {}}
+            return {'parse': 0, 'url': url,
+                    'header': {'User-Agent': self.sk4_UA,
+                               'Referer': self.host + '/'}}
+        except Exception:
+            return {'parse': 0, 'url': '', 'header': {}}
+
+    # 实测画质：BBA 1920x804 > NBY ≈ PAN1 > zijianm3u8 / qsvip
+    _FB_ORDER = ('BBA', 'NBY', 'PAN1', 'zijianm3u8', 'qsvip')
+
+    def _fallback(self, vid, frm, title):
+        try:
+            _, _, all_eps = self._detail(vid)
+            order = [k for k in self._FB_ORDER if k in all_eps and k != frm]
+            order += [k for k in all_eps
+                      if k != frm and not sk4__is4k(k) and k not in order]
+            order += [k for k in all_eps if k != frm and sk4__is4k(k)]
+            for k in order:
+                items = all_eps.get(k) or []
+                tok = ''
+                for t, tk in items:
+                    if title and t == title:
+                        tok = tk
+                        break
+                if not tok and items:
+                    tok = items[0][1]
+                if tok:
+                    u = self._decode(tok, k)
+                    if u:
+                        return u
+        except Exception:
+            pass
+        return ''
+
+
+# ============================================================ 入口
+class SK4KRaw(_Base):
+    def __init__(self, *args, **kwargs):
+        try:
+            super().__init__(*args, **kwargs)
+        except Exception:
+            pass
+        self.src = '天堂'
+        self.eng = None
+        self._build('天堂', {})
+
+    # -------------------------------------------------- 生命周期
+    def _build(self, name, ext):
+        if name in sk4_APP_SOURCES:
+            eng = sk4__AppEngine(sk4_APP_SOURCES[name])
+        else:
+            eng = sk4__BubuEngine()
+        eng.setup(ext)
+        self.src = name
+        self.eng = eng
+
+    def init(self, extend=""):
+        # 不联网：导入阶段只解析配置
+        ext = {}
+        try:
+            if isinstance(extend, str):
+                s = extend.strip()
+                if s.startswith('{') and s.endswith('}'):
+                    ext = json.loads(s) or {}
+                elif s:
+                    ext = {'src': s}
+            elif isinstance(extend, dict):
+                ext = dict(extend)
+        except Exception:
+            ext = {}
+        name = str(ext.get('src') or ext.get('name') or '天堂').strip()
+        name = sk4_SRC_ALIAS.get(name, name)
+        if name not in sk4_SRC_ORDER:
+            name = '天堂'
+        rest = dict(ext)
+        rest.pop('src', None)
+        rest.pop('name', None)
+        self._build(name, rest)
+
+    def getName(self):
+        return self.src + '·4K'
+
+    def destroy(self):
+        try:
+            self.eng = None
+        except Exception:
+            pass
+
+    def _e(self):
+        if self.eng is None:
+            self._build('天堂', {})
+        return self.eng
+
+    # -------------------------------------------------- 标准接口
+    def homeContent(self, filter=False):
+        return self._e().homeContent(filter)
+
+    def homeVideoContent(self):
+        return self._e().homeVideoContent()
+
+    def categoryContent(self, tid, pg, filter, extend):
+        return self._e().categoryContent(tid, pg, filter, extend)
+
+    def searchContent(self, key, quick, pg="1"):
+        return self._e().searchContent(key, quick, pg)
+
+    def detailContent(self, ids):
+        return self._e().detailContent(ids)
+
+    def playerContent(self, flag, id, vipFlags=None):
+        return self._e().playerContent(flag, id, vipFlags)
+
+    def liveContent(self, params):
+        return {'list': []}
+
+# ---- 门面适配 sk：四源 4K 合并成一个一级源，不建独立站点 ----
+class SK4KSpider(_BaseSpider):
+    NAME = '四源4K专线'
+    SRCS = ('天堂', '布布', '华谊', '苹果')
+    SEARCH_WAIT = 2.6
+    DETAIL_WAIT = 3.6
+    PLAY_WAIT = 8.0
+
+    def __init__(self):
+        # init 绝不联网：四个引擎只解析配置；站点不通由各处限时兜住。
+        self.obs = {}
+        for n in self.SRCS:
+            try:
+                ob = SK4KRaw()
+                ob.init(json.dumps({'src': n}, ensure_ascii=False))
+                self.obs[n] = ob
+            except Exception:
+                pass
+        # 四源搜索偶发有子源超过门面 2.8s 预算。晚到的结果仍由后台线程
+        # 累加进这里，详情时按 (子源, vid) 回填，保证四源线路不缺。
+        self._key_ids = {}
+        self._vid_key = {}
+        self._lock = threading.Lock()
+
+    def init(self, extend=''):
+        return None
+
+    def destroy(self):
+        for ob in list(self.obs.values()):
+            try:
+                ob.destroy()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _b64(raw):
+        return base64.urlsafe_b64encode(
+            raw.encode('utf-8')).decode('ascii').rstrip('=')
+
+    @staticmethod
+    def _unb64(s):
+        s = str(s or '')
+        s += '=' * (-len(s) % 4)
+        return base64.urlsafe_b64decode(
+            s.encode('ascii')).decode('utf-8', 'replace')
+
+    def _enc_id(self, ids):
+        return 'sk4:' + self._b64(json.dumps(
+            ids, ensure_ascii=False, separators=(',', ':')))
+
+    def _dec_id(self, code):
+        s = str(code or '')
+        if not s.startswith('sk4:'):
+            return None
+        try:
+            v = json.loads(self._unb64(s[4:]))
+            return v if isinstance(v, dict) else None
+        except Exception:
+            return None
+
+    @classmethod
+    def _fan(cls, work, wait):
+        box, ths = {}, []
+
+        def run(k):
+            try:
+                box[k] = work(k)
+            except Exception:
+                pass
+
+        for k in cls.SRCS:
+            th = threading.Thread(target=run, args=(k,), daemon=True)
+            th.start()
+            ths.append(th)
+        deadline = time.time() + wait
+        for th in ths:
+            th.join(max(0.0, deadline - time.time()))
+        return box
+
+    def homeContent(self, filter=True):
+        return {'class': [], 'list': []}
+
+    def categoryContent(self, tid, pg='1', filter=True, extend=None):
+        return {'list': [], 'page': 1, 'pagecount': 1, 'total': 0}
+
+    @staticmethod
+    def _key(nm):
+        # 布布习惯把片名写成「庆余年 第一季」。只归并「第一季/第1季」这类
+        # 默认季后缀；第二季及衍生片一律不合并，防止把错片的线路挂进来。
+        k = re.sub(r'\s+', '', str(nm or '')).lower()
+        return re.sub(r'(第一季|第1季|season1|s01)$', '', k)
+
+    def _absorb(self, nm, vid, n):
+        k = self._key(nm)
+        with self._lock:
+            self._key_ids.setdefault(k, {}).setdefault(n, vid)
+            self._vid_key[(n, vid)] = k
+        return k
+
+    def searchContent(self, key, quick=False, pg='1'):
+        kw = str(key or '').strip()
+        if not kw:
+            return {'list': []}
+
+        def work(n):
+            lst = (self.obs[n].searchContent(
+                kw, quick, str(pg or '1')) or {}).get('list') or []
+            # 在线程内就累加：_fan 超时返回后，晚到的子源仍会写进来
+            for it in lst:
+                if isinstance(it, dict):
+                    nm = str(it.get('vod_name') or '').strip()
+                    vid = str(it.get('vod_id') or '').strip()
+                    if nm and vid:
+                        self._absorb(nm, vid, n)
+            return lst
+
+        box = self._fan(work, self.SEARCH_WAIT)
+        # 四源同名合并成一张卡，id 里带上目前已知的每个子源 vod_id。
+        merged, order = {}, []
+        for n in self.SRCS:
+            for it in (box.get(n) or []):
+                if not isinstance(it, dict):
+                    continue
+                nm = str(it.get('vod_name') or '').strip()
+                vid = str(it.get('vod_id') or '').strip()
+                if not nm or not vid:
+                    continue
+                k = self._key(nm)
+                if k not in merged:
+                    merged[k] = {
+                        'vod_name': nm,
+                        'vod_pic': it.get('vod_pic') or '',
+                        'vod_remarks': it.get('vod_remarks') or ''}
+                    order.append(k)
+                elif nm == kw:
+                    # 优先用与搜索词完全一致的片名，strict_match 才能命中
+                    merged[k]['vod_name'] = nm
+        with self._lock:
+            snap = dict((k, dict(v)) for k, v in self._key_ids.items())
+        return {'list': [
+            {'vod_id': self._enc_id(snap.get(k, {})),
+             'vod_name': merged[k]['vod_name'],
+             'vod_pic': merged[k]['vod_pic'],
+             'vod_remarks': merged[k]['vod_remarks']}
+            for k in order[:24] if snap.get(k)]}
+
+    def detailContent(self, ids):
+        raw = ids[0] if isinstance(ids, (list, tuple)) and ids else ids
+        code = str(raw or '')
+        idmap = dict(self._dec_id(code) or {})
+        # 用累加缓存回填：本次搜索里晚到、没编进卡片 id 的子源也补上
+        with self._lock:
+            snap = dict((k, dict(v)) for k, v in self._key_ids.items())
+            keys = [self._vid_key.get((n, v)) for n, v in idmap.items()]
+        for k in keys:
+            for n2, v2 in (snap.get(k) or {}).items():
+                idmap.setdefault(n2, v2)
+        if not idmap:
+            # 兜底：非本源编码的 id，四个子源拿同一个 id 各试一次
+            idmap = dict((n, code) for n in self.SRCS)
+
+        def work(n):
+            vid = idmap.get(n)
+            if not vid:
+                return None
+            v = (self.obs[n].detailContent([vid]) or {}).get('list') or []
+            return v[0] if v and isinstance(v[0], dict) else None
+
+        box = self._fan(work, self.DETAIL_WAIT)
+        froms, urls, meta = [], [], None
+        for n in self.SRCS:
+            v = box.get(n)
+            if not isinstance(v, dict):
+                continue
+            if meta is None:
+                meta = v
+            fr = str(v.get('vod_play_from') or '').split('$$$')
+            ur = str(v.get('vod_play_url') or '').split('$$$')
+            for i, f in enumerate(fr):
+                f = str(f or '').strip()
+                if not f:
+                    continue
+                seg = ur[i] if i < len(ur) else ''
+                eps = []
+                for part in str(seg).split('#'):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    nm, sep, pid = part.partition('$')
+                    if not sep:
+                        nm, pid = '正片', part
+                    eps.append('%s$sk4|%s|%s'
+                               % (nm.strip() or '正片', n, pid))
+                if eps:
+                    froms.append('%s·%s' % (n, f))
+                    urls.append('#'.join(eps))
+        if not froms:
+            return {'list': []}
+        vod = dict(meta or {})
+        vod['vod_id'] = code
+        vod['vod_play_from'] = '$$$'.join(froms)
+        vod['vod_play_url'] = '$$$'.join(urls)
+        return {'list': [vod]}
+
+    def playerContent(self, flag, id, vipFlags=None):
+        pid = str(id or '')
+        name, rest = '', pid
+        if pid.startswith('sk4|'):
+            p = pid[4:].split('|', 1)
+            if len(p) == 2:
+                name, rest = p[0], p[1]
+        f = str(flag or '')
+        if name not in self.obs:
+            for n in self.SRCS:
+                if f.startswith(n):
+                    name = n
+                    break
+        if name not in self.obs:
+            name = self.SRCS[0]
+        ob = self.obs.get(name)
+        if ob is None:
+            return {'parse': 0, 'url': '', 'header': {}}
+        for n in self.SRCS:
+            if f.startswith(n + '·'):
+                f = f[len(n) + 1:]
+                break
+        box = {}
+
+        def run():
+            try:
+                box['r'] = ob.playerContent(f, rest, vipFlags)
+            except Exception:
+                pass
+
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        th.join(self.PLAY_WAIT)
+        r = box.get('r')
+        return r if isinstance(r, dict) else {
+            'parse': 0, 'url': '', 'header': {}}
+# ==================== 四源4K专线线路源 sk END ====================
+
+
+# ==================== 找剧4K 一级源 zj BEGIN ====================
+class ZJSpider(_BaseSpider):
+    # 官方 4K/1080P 线路（游客会话）作为一级源挂进 Kishuto 聚合。
+    # init 绝不联网；站点不通时 _zj_quick 限时返回空，不拖慢搜索/详情。
+    NAME = '找剧4K'
+
+    def __init__(self):
+        self.ob = None
+        self.cfg = {}
+
+    def init(self, extend=''):
+        try:
+            cfg = (json.loads(extend) if isinstance(extend, str)
+                   and extend.strip().startswith('{') else {})
+        except Exception:
+            cfg = {}
+        self.cfg = cfg if isinstance(cfg, dict) else {}
+        ck = str(self.cfg.get('zj_cookie') or self.cfg.get('cookie') or '')
+        if self.ob is None:
+            self.ob = ZJSource(ck)
+        return None
+
+    def _ob(self):
+        if self.ob is None:
+            self.ob = ZJSource()
+        return self.ob
+
+    @staticmethod
+    def _zj_quick(fn, budget=2.6, fallback=None):
+        box = {}
+
+        def run():
+            try:
+                box['v'] = fn()
+            except Exception:
+                box['v'] = fallback
+
+        th = threading.Thread(target=run, daemon=True)
+        th.start()
+        th.join(budget)
+        return box.get('v', fallback)
+
+    def homeContent(self, filter=True):
+        return {'class': [], 'list': []}
+
+    def categoryContent(self, tid, pg='1', filter=True, extend=None):
+        return {'list': [], 'page': 1, 'pagecount': 1, 'total': 0}
+
+    def searchContent(self, key, quick=False, pg='1'):
+        kw = str(key or '')
+        if not kw.strip():
+            return {'list': []}
+        try:
+            page = int(str(pg or 1))
+        except Exception:
+            page = 1
+        got = self._zj_quick(lambda: self._ob().search(kw, page), 2.6, []) or []
+        return {'list': [x for x in as_list(got) if isinstance(x, dict)]}
+
+    def detailContent(self, ids):
+        vid = ids[0] if isinstance(ids, (list, tuple)) and ids else ids
+        d = self._zj_quick(lambda: self._ob().detail(text(vid)), 2.6, {}) or {}
+        vod = dict(as_dict(d.get('vod')))
+        froms, urls = [], []
+        for item in as_list(d.get('lines')):
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                froms.append(str(item[0]))
+                urls.append('#'.join(str(x) for x in as_list(item[1])))
+        vod['vod_play_from'] = '$$$'.join(froms)
+        vod['vod_play_url'] = '$$$'.join(urls)
+        if not vod.get('vod_id'):
+            vod['vod_id'] = vid
+        return {'list': [vod]}
+
+    def playerContent(self, flag, id, vipFlags=None):
+        got = self._zj_quick(lambda: self._ob().play(text(id)), 8.0,
+                             {'url': '', 'parse': 0})
+        return got if isinstance(got, dict) else {'url': '', 'parse': 0}
+# ==================== 找剧4K 一级源 zj END ====================
+
+
+# ==================== 剧下饭4K 一级源 jx BEGIN ====================
+import http.cookiejar as _jxf_cj
+import ssl as _jxf_ssl
+import urllib.request as _jxf_ur
+
+JXF_EXTRA_WAIT = 4.5      # 片帝/4KK 聚合线路的最长等待（秒），超时就只出原站 4K 线
+
+# -*- coding: utf-8 -*-
+# 剧下饭 4K 聚合版 TVBox Python 爬虫 - webhomeTV 适配版 (类式规范)
+# 站点: http://manian.juxiafan.com/  (内置 8 个备用域名自动轮换)
+# 剧下饭线路: 山东4K 2160P / 爱尔兰4K高码
+# 聚合线路: 片帝·专享4K-Y / 片帝·4K官方C / 4KK·磁力 / 4KK·夸克(有则显示)
+# 同名片自动匹配聚合; 没有匹配到的线路不会出现, 不影响原站播放
+
+import json
+import time
+import os
+import re
+import hmac
+import uuid
+import hashlib
+import threading
+from base64 import b64encode
+from urllib.parse import quote_plus, unquote
+
+try:
+    import requests
+except Exception:
+    requests = None
+
+
+jxf_BASE_URLS = [
+    "http://manian.juxiafan.com",
+    "http://195.225.24.128:6213",
+    "http://jugaoqing.com",
+    "http://jumianfei.com",
+    "http://juyongjiu.com",
+    "http://kuailezhuiju2.com",
+    "http://zhuiju666.com",
+    "http://194.147.100.155:7744",
+]
+jxf_AES_KEY = b"kZ6fT8oF6oM8eX6lF7eH2rJ3pW7gW0kC"
+jxf_UA = "okhttp/4.12.0"
+
+jxf_LIVE_TYPE_ID = 22023                 # 隐藏直播分类(服务端不下发, 手动补进分类栏)
+
+# ======================= 4K 线路筛选 =======================
+# 服务端线路名: 山东4K 2160P (sourceCode=CO4K) / 爱尔兰4K高码 (sourceCode=zijianm3u8)
+# 兼容服务端改名: 名字里同时含 4K 和 山东/爱尔兰 也算命中; 直播线路原样保留
+jxf_KEEP_4K_CODES = ("CO4K", "zijianm3u8")
+jxf_LIVE_CODES = ("zhibo", "difang", "huya")
+
+def jxf_is_keep_source(src):
+    code = str(src.get("sourceCode") or "")
+    name = str(src.get("sourceName") or "")
+    if code in jxf_LIVE_CODES or "直播" in name:
+        return True
+    if code in jxf_KEEP_4K_CODES:
+        return True
+    return "4K" in name.upper() and ("山东" in name or "爱尔兰" in name)
+
+def jxf_pick_sources(sources):
+    """只留两条 4K 线(山东在前), 一条都没有时退回全部线路保证能播"""
+    sources = sources or []
+    kept = [s for s in sources if jxf_is_keep_source(s)]
+    if not kept:
+        return list(sources)
+
+    def _rank(s):
+        name = str(s.get("sourceName") or "")
+        if "山东" in name:
+            return 0
+        if "爱尔兰" in name:
+            return 1
+        return 2
+
+    kept.sort(key=_rank)
+    return kept
+
+# ======================= 片帝 4K 线路 (dongpian17.com) =======================
+# 片帝接口下发的 4K 官方线路: 专享4K-Y / 4K海外-官方C (显示为 4K官方C)
+jxf_PD_HOST = "https://dongpian17.com"
+jxf_PD_SIGN_KEY = "8b9a908a05eac640e1ee06f52acaa741bfe4ba9e004eeffdbeb635e532e06666"
+jxf_PD_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
+jxf_PD_TIMEOUT = 10
+jxf_PD_SESSION = None
+jxf_PD_LOGGED_IN = False
+
+def jxf_pd_headers(method, path, search):
+    ts = str(int(time.time() * 1000))
+    nonce = os.urandom(16).hex()
+    msg = "{}\n{}{}\n{}\n{}".format(method, path, search, ts, nonce)
+    sign = hmac.new(jxf_PD_SIGN_KEY.encode(), msg.encode(), hashlib.sha256).hexdigest()
+    return {
+        "User-Agent": jxf_PD_UA,
+        "Accept": "application/json",
+        "x-ai-movie-client-name": "movie-search-frontend",
+        "x-ai-movie-client-version": "1.0.0",
+        "x-ai-movie-build-version": "dongpiandi-v2026.10.04.1-episode-resume-efd9a7f2e87e-web",
+        "x-ai-movie-protocol-version": "2026-07-05.library-v2.playback-v1",
+        "x-ai-movie-timestamp": ts,
+        "x-ai-movie-nonce": nonce,
+        "x-ai-movie-signature": sign,
+    }
+
+def jxf_pd_sess():
+    global jxf_PD_SESSION
+    if jxf_PD_SESSION is None:
+        ctx0 = _jxf_ssl.create_default_context()
+        ctx0.check_hostname = False
+        ctx0.verify_mode = _jxf_ssl.CERT_NONE
+        jxf_PD_SESSION = _jxf_ur.build_opener(
+            _jxf_ur.HTTPSHandler(context=ctx0),
+            _jxf_ur.HTTPCookieProcessor(_jxf_cj.CookieJar()))
+    return jxf_PD_SESSION
+def jxf_pd_get(path, search=""):
+    try:
+        req = _jxf_ur.Request(jxf_PD_HOST + path + search,
+                              headers=jxf_pd_headers("GET", path, search))
+        with jxf_pd_sess().open(req, timeout=jxf_PD_TIMEOUT) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+def jxf_pd_post(path, search, body):
+    try:
+        headers = jxf_pd_headers("POST", path, search)
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+        req = _jxf_ur.Request(jxf_PD_HOST + path + search, data=data,
+                              headers=headers, method="POST")
+        with jxf_pd_sess().open(req, timeout=jxf_PD_TIMEOUT) as r:
+            return json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return {}
+def jxf_pd_login_anon():
+    global jxf_PD_LOGGED_IN
+    if jxf_PD_LOGGED_IN:
+        return True
+    try:
+        jxf_pd_post("/v1/users/anonymous", "", {"anonymous_id": "web_" + uuid.uuid4().hex})
+        jxf_PD_LOGGED_IN = True
+        return True
+    except Exception:
+        return False
+
+def jxf_pd_resolve_line(ticket, retried=False):
+    data = jxf_pd_post("/v1/playback/resolve-line", "?view=compact", {"ticket": ticket})
+    if data.get("code") == "playback_user_session_required" and not retried:
+        if jxf_pd_login_anon():
+            data = jxf_pd_post("/v1/playback/resolve-line", "?view=compact", {"ticket": ticket})
+    return data.get("line", {}) or {}
+
+def jxf_norm_title(s):
+    s = str(s or "")
+    s = re.sub(r"[（(]\s*(?:19|20)\d{2}\s*[)）]", "", s)
+    s = s.replace(" ", "").replace("　", "")
+    s = re.sub(r"[《》〈〉\[\]【】()（）·•:：,，.。!！?？'\"“”‘’_\-—/\\|]", "", s)
+    s = re.sub(r"(?i)(4K|2160P|1080P|蓝光|原盘)", "", s)
+    return s.strip().lower()
+
+def jxf_year_match(a, b):
+    try:
+        return abs(int(str(a)[:4]) - int(str(b)[:4])) <= 1
+    except Exception:
+        return True
+
+def jxf_pd_pick_cards(cards, title, year):
+    want = jxf_norm_title(title)
+    if not want:
+        return []
+    exact = [c for c in cards if jxf_norm_title(c.get("title")) == want]
+    if year:
+        matched = [c for c in exact if jxf_year_match(year, c.get("year"))]
+        if matched:
+            exact = matched
+
+    def _pop(c):
+        try:
+            return int(c.get("playback_count") or 0)
+        except Exception:
+            return 0
+
+    exact.sort(key=_pop, reverse=True)
+    return exact
+
+def jxf_pd_short_name(label):
+    if "官方" in label:
+        base = label.split("·")[0].strip()
+        for seg in reversed(base.split("-")):
+            if "官方" in seg:
+                name = seg.strip()
+                if "4K" in base.upper() and not name.upper().startswith("4K"):
+                    name = "4K" + name
+                return name
+    return label
+
+def jxf_pd_keep_line(line):
+    label = str(line.get("label") or "")
+    if "专享4K" in label:
+        return True
+    return "4K" in label.upper() and "官方" in label
+
+def jxf_pd_fetch_episodes(vid, episodes):
+    eps = list(episodes)
+    try:
+        offset = len(eps)
+        while True:
+            data = jxf_pd_get("/v1/catalog/{}/episodes".format(vid),
+                           "?limit=48&offset={}".format(offset))
+            more = data.get("episodes") or []
+            if not more:
+                break
+            eps.extend(more)
+            if not (data.get("episode_pagination") or {}).get("has_more"):
+                break
+            offset += len(more)
+    except Exception:
+        pass
+    return eps
+
+def jxf_pd_lines(title, year=""):
+    """按片名匹配片帝, 返回 [(线路名, 剧集串)]"""
+    cards = (jxf_pd_get("/v1/browse/catalog",
+                     "?q={}&page=1&limit=20".format(quote_plus(title)))).get("cards") or []
+    # 同名卡片可能有多个(预告/正片), 逐个试, 取第一个带 4K 线路的
+    for card in jxf_pd_pick_cards(cards, title, year)[:2]:
+        vid = str(card.get("id") or "")
+        data = jxf_pd_get("/v1/catalog/" + vid)
+        eps = data.get("episodes") or []
+        if not eps:
+            continue
+        try:
+            count = int(data.get("episode_count") or len(eps))
+        except Exception:
+            count = len(eps)
+        if count > len(eps):
+            eps = jxf_pd_fetch_episodes(vid, eps)
+        first = str((eps[0] or {}).get("token") or "")
+        if not first:
+            continue
+        options = (jxf_pd_get("/v1/playback/resolve/" + first,
+                           "?view=compact")).get("line_options") or []
+        picked = [ln for ln in options if jxf_pd_keep_line(ln)]
+        if not picked:
+            continue
+        picked.sort(key=lambda ln: 0 if "专享" in str(ln.get("label") or "") else 1)
+        out = []
+        for ln in picked[:2]:
+            line_id = str(ln.get("id") or "")
+            if not line_id:
+                continue
+            name = "片帝·" + jxf_pd_short_name(str(ln.get("label") or "4K"))
+            segs = []
+            for ep in eps:
+                token = str((ep or {}).get("token") or "")
+                if not token:
+                    continue
+                ep_name = str(ep.get("title") or ("第{}集".format(ep.get("number", ""))))
+                ep_name = ep_name.replace("$", "_").replace("#", "_")
+                segs.append(ep_name + "$pd@" + token + "@@" + line_id)
+            if segs:
+                out.append((name, "#".join(segs)))
+        if out:
+            return out
+    return []
+
+def jxf_pd_play(pid):
+    token, _, line_id = pid[3:].partition("@@")
+    options = (jxf_pd_get("/v1/playback/resolve/" + token,
+                       "?view=compact")).get("line_options") or []
+    target = None
+    for ln in options:
+        if str(ln.get("id") or "") == line_id:
+            target = ln
+            break
+    candidates = ([target] if target else []) + \
+                 [ln for ln in options if ln is not target and jxf_pd_keep_line(ln)]
+    for ln in candidates:
+        if ln.get("url_kind") == "m3u8" and not ln.get("resolve_required") and ln.get("url"):
+            return {"parse": 0, "url": ln["url"], "header": {"User-Agent": jxf_PD_UA}}
+        ticket = str(ln.get("url") or "").replace("resolve://", "")
+        if not ticket:
+            continue
+        line = jxf_pd_resolve_line(ticket)
+        if line.get("url"):
+            return {"parse": 0, "url": line["url"], "header": {"User-Agent": jxf_PD_UA}}
+    return {"parse": 0, "url": "", "header": {"User-Agent": jxf_PD_UA}}
+
+# ======================= 4KK / Pomo 线路 (pomo.mom) =======================
+jxf_POMO_HOST = "https://pomo.mom"
+jxf_POMO_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36",
+    "Referer": "https://pomo.mom/",
+}
+jxf_POMO_TIMEOUT = 10
+
+def jxf_pomo_text(url):
+    try:
+        ctx0 = _jxf_ssl.create_default_context()
+        ctx0.check_hostname = False
+        ctx0.verify_mode = _jxf_ssl.CERT_NONE
+        req = _jxf_ur.Request(url, headers=jxf_POMO_HEADERS)
+        with _jxf_ur.urlopen(req, timeout=jxf_POMO_TIMEOUT, context=ctx0) as r:
+            return r.read().decode("utf-8", "replace")
+    except Exception:
+        return ""
+def jxf_pomo_list(text):
+    start = text.find("All 4K Movies")
+    if start == -1:
+        start = text.find("<main")
+    if start == -1:
+        start = 0
+    section = text[start:]
+    pattern = r'<img[^>]*src="([^"]*uploadfile[^"]*)"[^>]*alt="([^"]*)"[^>]*>'
+    videos = []
+    seen = set()
+    pos = 0
+    while True:
+        m = re.search(pattern, section[pos:])
+        if not m:
+            break
+        img_start = pos + m.start()
+        before = section[max(0, img_start - 2000):img_start]
+        links = list(re.finditer(r'<a\s+href="https://pomo\.mom/(\d+)(?:\.html)?"', before))
+        if links:
+            vid = links[-1].group(1)
+            if vid not in seen:
+                seen.add(vid)
+                videos.append({"id": vid, "name": m.group(2)})
+        pos = pos + m.end()
+    return videos
+
+def jxf_pomo_lines(title):
+    """按片名匹配 4KK, 返回 [(线路名, 剧集串)]"""
+    videos = jxf_pomo_list(jxf_pomo_text(jxf_POMO_HOST + "/?keyword=" + quote_plus(title)))
+    want = jxf_norm_title(title)
+    item = None
+    for v in videos:
+        if want and jxf_norm_title(v.get("name")) == want:
+            item = v
+            break
+    if not item:
+        return []
+    text = jxf_pomo_text("{}/{}.html".format(jxf_POMO_HOST, item["id"]))
+    if not text:
+        return []
+    h2 = re.search(r'<h2 class="x-dbjs-title">([^<]+)</h2>', text)
+    if h2 and jxf_norm_title(h2.group(1)) != want:
+        return []
+    magnets = re.findall(r'data-url="(magnet:\?xt=urn:btih:[^"]+)"', text)
+    unique = []
+    seen_mag = set()
+    for mag in magnets:
+        if mag not in seen_mag:
+            seen_mag.add(mag)
+            unique.append(mag)
+    segs = []
+    seen_items = set()
+    items = re.findall(r'<div class="download-item">(.*?)</div>\s*</div>', text, re.DOTALL)
+    for it in items:
+        mag_match = re.search(r'data-url="(magnet:\?xt=urn:btih:[^"]+)"', it)
+        if not mag_match:
+            continue
+        mag = mag_match.group(1).replace("#", "%23").replace("$", "%24")
+        if mag in seen_items:
+            continue
+        seen_items.add(mag)
+        name_match = re.search(r'class="x-dbjs-download-link[^"]*"[^>]*>([^<]+)</a>', it)
+        file_name = name_match.group(1).strip() if name_match else ""
+        size_match = re.search(r'<span class="file-size">\[([^\]]+)\]</span>', it)
+        size = size_match.group(1).strip() if size_match else ""
+        if file_name and size:
+            play_title = "{} [{}]".format(file_name, size)
+        elif file_name:
+            play_title = file_name
+        elif size:
+            play_title = "磁力 [{}]".format(size)
+        else:
+            play_title = "磁力{}".format(len(segs) + 1)
+        play_title = play_title[:80].replace("#", "").replace("$", "")
+        segs.append(play_title + "$pomo|m|" + mag)
+    if not segs:
+        for i, mag in enumerate(unique):
+            mag = mag.replace("#", "%23").replace("$", "%24")
+            segs.append("磁力{}$pomo|m|{}".format(i + 1, mag))
+    out = []
+    if segs:
+        out.append(("4KK·磁力", "#".join(segs)))
+    pans = []
+    seen_pan = set()
+    for u in re.findall(r'data-url="(https://pan\.quark\.cn/s/[^"]+)"', text):
+        if u not in seen_pan:
+            seen_pan.add(u)
+            pans.append(u)
+    if pans:
+        psegs = ["夸克网盘{}$pomo|q|{}".format(i + 1, u) for i, u in enumerate(pans)]
+        out.append(("4KK·夸克", "#".join(psegs)))
+    return out
+
+def jxf_pomo_play(pid):
+    kind, _, url = pid[5:].partition("|")
+    if kind == "q":
+        return {"parse": 1, "url": url, "header": {}}
+    return {"parse": 0, "jx": 1, "url": url, "header": {}}
+
+def jxf_extra_lines(title, year=""):
+    """并发查片帝与4KK, 按片名精确匹配后追加线路"""
+    result = {"pd": [], "4kk": []}
+
+    def _work(key, fn):
+        try:
+            result[key] = fn()
+        except Exception:
+            result[key] = []
+
+    threads = [
+        threading.Thread(target=_work, args=("pd", lambda: jxf_pd_lines(title, year))),
+        threading.Thread(target=_work, args=("4kk", lambda: jxf_pomo_lines(title))),
+    ]
+    for t in threads:
+        t.daemon = True
+        t.start()
+    for t in threads:
+        t.join(timeout=JXF_EXTRA_WAIT)
+    lines = list(result.get("pd") or [])
+    lines.extend(result.get("4kk") or [])
+    return lines
+
+# ======================= AES-256-ECB =======================
+
+def jxf_build_sbox():
+    sbox = [0] * 256
+    p = q = 1
+    while True:
+        p = p ^ ((p << 1) ^ (0x1B if p & 0x80 else 0)) & 0xFF
+        q ^= q << 1
+        q ^= q << 2
+        q ^= q << 4
+        q ^= 0x09 if (q & 0x80) else 0
+        q &= 0xFF
+        xformed = q ^ ((q << 1) | (q >> 7)) & 0xFF
+        xformed = (xformed ^ ((q << 2) | (q >> 6))) & 0xFF
+        xformed = (xformed ^ ((q << 3) | (q >> 5))) & 0xFF
+        xformed = (xformed ^ ((q << 4) | (q >> 4))) & 0xFF
+        sbox[p] = xformed ^ 0x63
+        if p == 1:
+            break
+    sbox[0] = 0x63
+    return sbox
+
+jxf_SBOX = jxf_build_sbox()
+jxf_RCON = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1B, 0x36, 0x6C, 0xD8, 0xAB, 0x4D]
+
+def jxf_xtime(a):
+    return ((a << 1) ^ (0x1B if a & 0x80 else 0)) & 0xFF
+
+jxf_COL2 = [jxf_xtime(i) for i in range(256)]
+jxf_COL3 = [jxf_xtime(i) ^ i for i in range(256)]
+
+def jxf_expand_key(key):
+    nk = len(key) // 4
+    nr = nk + 6
+    w = [list(key[4 * i:4 * i + 4]) for i in range(nk)]
+    for i in range(nk, 4 * (nr + 1)):
+        temp = list(w[i - 1])
+        if i % nk == 0:
+            temp = temp[1:] + temp[:1]
+            temp = [jxf_SBOX[b] for b in temp]
+            temp[0] ^= jxf_RCON[i // nk - 1]
+        elif nk > 6 and i % nk == 4:
+            temp = [jxf_SBOX[b] for b in temp]
+        w.append([w[i - nk][j] ^ temp[j] for j in range(4)])
+    return w, nr
+
+def jxf_encrypt_block(block, w, nr):
+    def _rk(r):
+        return [x for word in w[r * 4:(r * 4) + 4] for x in word]
+    s = list(block)
+    rk0 = _rk(0)
+    for j in range(16):
+        s[j] ^= rk0[j]
+    for r in range(1, nr):
+        s = [jxf_SBOX[b] for b in s]
+        s = [s[0], s[5], s[10], s[15],
+             s[4], s[9], s[14], s[3],
+             s[8], s[13], s[2], s[7],
+             s[12], s[1], s[6], s[11]]
+        t = [0] * 16
+        for c in range(4):
+            i = c * 4
+            a0, a1, a2, a3 = s[i], s[i + 1], s[i + 2], s[i + 3]
+            t[i] = jxf_COL2[a0] ^ jxf_COL3[a1] ^ a2 ^ a3
+            t[i + 1] = a0 ^ jxf_COL2[a1] ^ jxf_COL3[a2] ^ a3
+            t[i + 2] = a0 ^ a1 ^ jxf_COL2[a2] ^ jxf_COL3[a3]
+            t[i + 3] = jxf_COL3[a0] ^ a1 ^ a2 ^ jxf_COL2[a3]
+        s = t
+        rk = _rk(r)
+        s = [s[j] ^ rk[j] for j in range(16)]
+    s = [jxf_SBOX[b] for b in s]
+    s = [s[0], s[5], s[10], s[15],
+         s[4], s[9], s[14], s[3],
+         s[8], s[13], s[2], s[7],
+         s[12], s[1], s[6], s[11]]
+    rk = _rk(nr)
+    s = [s[j] ^ rk[j] for j in range(16)]
+    return bytes(s)
+
+def jxf_aes256_ecb_encrypt(plain, key):
+    w, nr = jxf_expand_key(key)
+    out = bytearray()
+    for i in range(0, len(plain), 16):
+        out += jxf_encrypt_block(bytes(plain[i:i + 16]), w, nr)
+    return bytes(out)
+
+def jxf_aes_encrypt(plaintext, key=jxf_AES_KEY):
+    """PKCS7 填充 + AES-256-ECB -> base64 (多后端, 输出一致)"""
+    data = plaintext.encode("utf-8") if isinstance(plaintext, str) else plaintext
+    pad = 16 - len(data) % 16
+    data = data + bytes([pad]) * pad
+    try:
+        from Crypto.Cipher import AES
+        return b64encode(AES.new(key, AES.MODE_ECB).encrypt(data)).decode()
+    except Exception:
+        try:
+            from cryptography.hazmat.primitives.ciphers import Cipher as _C
+            from cryptography.hazmat.primitives.ciphers.algorithms import AES as _AES
+            from cryptography.hazmat.primitives.ciphers.modes import ECB as _ECB
+            from cryptography.hazmat.backends import default_backend as _B
+            enc = _C(_AES(key), _ECB(), backend=_B()).encryptor()
+            return b64encode(enc.update(data) + enc.finalize()).decode()
+        except Exception:
+            return b64encode(jxf_aes256_ecb_encrypt(data, key)).decode()
+
+# ======================= HTTP / 签名 =======================
+
+def jxf_http(method, url, body=None, content_type=None, timeout=12):
+    headers = {"User-Agent": jxf_UA}
+    data = None
+    if body is not None:
+        data = body.encode("utf-8") if isinstance(body, str) else body
+        headers["Content-Length"] = str(len(data))
+    if content_type:
+        headers["Content-Type"] = content_type
+    req = _jxf_ur.Request(url, data=data, headers=headers, method=method)
+    with _jxf_ur.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", "replace")
+
+def jxf_sign(concat):
+    return jxf_aes_encrypt(concat)
+
+def jxf_fix_host(host):
+    if host is None or (isinstance(host, str) and host.strip() == ""):
+        host = jxf_BASE_URLS[0]
+    return str(host).rstrip("/")
+
+def jxf_post(host, path, body=None, content_type=None):
+    urls = []
+    h = jxf_fix_host(host)
+    if h not in urls:
+        urls.append(h)
+    for b in jxf_BASE_URLS:
+        if b not in urls:
+            urls.append(b)
+    last = "{}"
+    for u in urls:
+        try:
+            last = jxf_http("POST", u + path, body, content_type)
+            if '"code"' in last:
+                return last
+        except Exception:
+            continue
+    return last
+
+def jxf_get(url, timeout=12):
+    try:
+        return jxf_http("GET", url, timeout=timeout)
+    except Exception:
+        return "{}"
+
+def jxf_post_form(host, path, params):
+    ts = str(int(time.time()))
+    params["timestamp"] = ts
+    items = sorted(params.items())
+    concat = "&".join(k + "=" + quote_plus(str(v)) for k, v in items)
+    ds = jxf_sign(concat)
+    form = "&".join(k + "=" + quote_plus(str(v)) for k, v in items)
+    form += "&datasign=" + quote_plus(ds)
+    return jxf_post(host, path, form, "application/x-www-form-urlencoded")
+
+def jxf_post_json(host, path, params):
+    params["timestamp"] = str(int(time.time()))
+    items = sorted(params.items())
+    concat = "&".join(k + "=" + str(v) for k, v in items)
+    ds = jxf_sign(concat)
+    obj = dict(items)
+    obj["datasign"] = ds
+    body = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    return jxf_post(host, path, body, "application/json;charset=UTF-8")
+
+# ======================= 核心业务 (返回 dict) =======================
+
+def jxf_home(host):
+    resp = jxf_post(host, "/api/v1/video/classifies", None, None)
+    try:
+        data = json.loads(resp).get("data") or []
+    except Exception:
+        data = []
+    cls = [{"type_id": str(c.get("id")), "type_name": c.get("name") or ""}
+           for c in data if c.get("id") and c.get("name")]
+    # 按 type_id 升序: 电视剧(22016) 电影(22017) 动漫(22018) 综艺(22019)
+    # 短剧(22020) 少儿(22021) 纪录片(22022) AI漫剧(22024), 与 App 首页顺序一致
+    cls.sort(key=lambda x: int(x["type_id"]) if str(x["type_id"]).isdigit() else 10 ** 9)
+    # 服务端不下发隐藏直播分类(22023), 手动追加到分类栏末尾
+    if str(jxf_LIVE_TYPE_ID) not in [str(c.get("type_id")) for c in cls]:
+        cls.append({"type_id": str(jxf_LIVE_TYPE_ID), "type_name": "直播"})
+    return {"class": cls, "filters": {}}
+
+def jxf_build_list(resp, page=1, id_desc=False):
+    try:
+        data = json.loads(resp).get("data") or {}
+    except Exception:
+        data = {}
+    lst = []
+    for v in data.get("list") or []:
+        if not v.get("id"):
+            continue
+        lst.append({
+            "vod_id": str(v.get("id")),
+            "vod_name": v.get("name") or "",
+            "vod_pic": v.get("videoPic") or "",
+            "vod_remarks": v.get("remarks") or "",
+        })
+    # 本地按 id 降序: 搜索时 id 大=收录晚=越新, 最新的排在头部
+    if id_desc and lst:
+        try:
+            lst.sort(key=lambda v: int(v.get("vod_id") or 0), reverse=True)
+        except Exception:
+            pass
+    try:
+        pg = int(page) or 1
+    except (ValueError, TypeError):
+        pg = 1
+    try:
+        pagecount = int(data.get("totalPage") or 1)
+    except (ValueError, TypeError):
+        pagecount = 1
+    if pagecount < pg:
+        pagecount = pg
+    return {
+        "page": pg,
+        "pagecount": pagecount,
+        "limit": data.get("limit") or 20,
+        "total": data.get("totalCount") or 0,
+        "list": lst,
+    }
+
+def jxf_category(host, tid, pg):
+    page = 1
+    try:
+        page = int(pg or 1)
+    except Exception:
+        pass
+    try:
+        type_id = int(tid)
+    except Exception:
+        type_id = 0
+    # ---- 直播分类 22023: 服务端不下发, 走 liveVideo 接口返回直播分组 ----
+    if type_id == jxf_LIVE_TYPE_ID:
+        lst = []
+        try:
+            r = jxf_get(jxf_fix_host(host) + "/api/v1/video/liveVideo")
+            data = (json.loads(r).get("data") or {})
+            for v in data.get("list") or []:
+                if not v.get("id"):
+                    continue
+                lst.append({
+                    "vod_id": str(v.get("id")),
+                    "vod_name": v.get("name") or "",
+                    "vod_pic": v.get("videoPic") or "",
+                    "vod_remarks": v.get("remarks") or ("直播" if v.get("typeId") else ""),
+                })
+        except Exception:
+            pass
+        return {"page": 1, "pagecount": 1, "limit": len(lst), "total": len(lst), "list": lst}
+    # 默认走 /video/index(与前面版本一致, 保留服务端原始顺序)。
+    # 注意: 服务端忽略 page 参数, 必须用 pageNum 才能真正翻页(否则滑到底内容不变/跳动)。
+    resp = jxf_post_json(host, "/api/v1/video/index", {"pageNum": page, "typeId": type_id})
+    res = jxf_build_list(resp, page, False)
+    # 服务端把部分分类(如电视剧22016)降级为只返回2条(limit=2),
+    # 此时自动改用 /video/search 空关键词+typeId 兜底, 拿完整列表(40条/页, 最新在前)。
+    if len(res.get("list") or []) < 10:
+        resp2 = jxf_post_json(host, "/api/v1/video/search", {"keyword": "", "typeId": type_id, "pageNum": page})
+        res = jxf_build_list(resp2, page, True)
+    return res
+
+def jxf_search(host, key, pg="1"):
+    key = (key or "").strip().strip('"').strip("'")
+    if not key:
+        return {"page": 1, "pagecount": 0, "limit": 20, "total": 0, "list": []}
+    # 兼容播放器传入 URL 编码关键词 (如 %E6%96%97%E7%BD%97...)
+    # 服务端 % 会当作通配符, 编码形态会搜出大量无关结果, 必须先解码回原文
+    if "%" in key:
+        try:
+            dec = unquote(key)
+            if dec and dec != key:
+                key = dec.strip()
+        except Exception:
+            pass
+    # 兼容 \uXXXX 转义形态的关键词 (如备份 \u6597\u7f57...)
+    if key and "\\u" in key and all(ord(ch) < 128 for ch in key):
+        try:
+            dec = key.encode("ascii").decode("unicode_escape")
+            if dec and dec != key:
+                key = dec
+        except Exception:
+            pass
+    try:
+        page = int(pg or 1)
+    except (ValueError, TypeError):
+        page = 1
+    if page < 1:
+        page = 1
+    resp = jxf_post_json(host, "/api/v1/video/search", {"keyword": key, "pageNum": page})
+    return jxf_build_list(resp, page, True)
+
+def jxf_reco(host):
+    """首页推荐: 电视剧分类第一页, 失败返回空"""
+    try:
+        c = jxf_category(host, "22016", "1")
+        return (c or {}).get("list") or []
+    except Exception:
+        return []
+
+def jxf_fetch_detail(host, vid):
+    resp = jxf_post_form(host, "/api/v1/video/videoDetails", {"id": str(vid)})
+    try:
+        return json.loads(resp).get("data") or {}
+    except Exception:
+        return {}
+
+def jxf_detail(host, vid):
+    data = jxf_fetch_detail(host, vid)
+    if not data:
+        return {"list": []}
+    sources = jxf_pick_sources(data.get("playerSource") or [])
+    from_names, from_urllists = [], []
+    seen = {}
+    for src in sources:
+        eps = src.get("episodes") or []
+        if not eps:
+            continue
+        name = src.get("sourceName") or "剧下饭"
+        if name in seen:          # 同名线路加序号区分
+            seen[name] += 1
+            name = name + str(seen[name])
+        else:
+            seen[name] = 1
+        segs = []
+        for i, ep in enumerate(eps, 1):
+            ep_name = (ep.get("episodeName") or "") or ("第" + str(i) + "集")
+            ep_name = ep_name.replace("$", "_").replace("#", "_")
+            segs.append(ep_name + "$" + str(vid) + "_" + str(i))
+        from_names.append(name)
+        from_urllists.append("#".join(segs))
+    # 直播频道不做外部聚合, 点播才按片名匹配片帝/4KK 追加线路
+    live_only = bool(sources) and all(
+        (str(s.get("sourceCode") or "") in jxf_LIVE_CODES or "直播" in str(s.get("sourceName") or ""))
+        for s in sources)
+    if not live_only:
+        for extra_name, extra_urls in jxf_extra_lines(data.get("name") or "", data.get("year") or ""):
+            if extra_name in seen:
+                continue
+            seen[extra_name] = 1
+            from_names.append(extra_name)
+            from_urllists.append(extra_urls)
+    if not from_urllists:
+        return {"list": []}
+    play_from = "$$$".join(from_names)     # 多线路: 名字用 $$$ 分隔
+    play_url = "$$$".join(from_urllists)   # 线路内集数用 # 分隔
+    return {"list": [{
+        "vod_id": str(data.get("id") or vid),
+        "vod_name": data.get("name") or "",
+        "vod_pic": data.get("videoPic") or "",
+        "vod_actor": data.get("actor") or "",
+        "vod_director": data.get("director") or "",
+        "vod_remarks": data.get("remarks") or "",
+        "vod_content": data.get("content") or "",
+        "vod_year": data.get("year") or "",
+        "vod_area": data.get("area") or "",
+        "vod_play_from": play_from,
+        "vod_play_url": play_url,
+    }]}
+
+def jxf_analysis_url(host, source_code, pc):
+    """调用服务端 /api/v1/player/analysisUrl 把加密 playerCode 解析成真实播放地址。
+    直播(sourceCode=zhibo/difang/huya)与点播加密码(co_xxx)均由此返回秒播地址。
+    返回解析成功后的 URL 字符串, 失败返回空串。"""
+    if not source_code or not pc:
+        return ""
+    try:
+        r = jxf_post_form(host, "/api/v1/player/analysisUrl", {"from": source_code, "code": pc})
+        u = (json.loads(r).get("data") or "")
+        if str(u).startswith("http"):
+            return str(u)
+    except Exception:
+        pass
+    return ""
+
+def jxf_play(host, flag, pid):
+    pid = str(pid or "")
+    if pid.startswith("pd@"):
+        return jxf_pd_play(pid)
+    if pid.startswith("pomo|"):
+        return jxf_pomo_play(pid)
+    try:
+        vid, ep = pid.rsplit("_", 1)
+        ep = int(ep)
+    except Exception:
+        return {"parse": 0, "url": pid, "header": {"User-Agent": jxf_UA}}
+    data = jxf_fetch_detail(host, vid)
+    sources = jxf_pick_sources(data.get("playerSource") or [])
+    flag_s = str(flag or "").strip()
+    # 优先用户当前选中的线路, 另一条 4K 线作为备份
+    ordered = [src for src in sources if str(src.get("sourceName") or "").strip() == flag_s]
+    for src in sources:
+        if src not in ordered:
+            ordered.append(src)
+    raw_fallback = ""
+    for src in ordered:
+        eps = src.get("episodes") or []
+        if not eps or ep > len(eps):
+            continue
+        pc = (eps[ep - 1] or {}).get("playerCode") or ""
+        if not pc:
+            continue
+        parse_url = src.get("parseUrl") or ""
+        source_code = src.get("sourceCode") or ""
+        if parse_url:
+            j = jxf_get(parse_url + pc)
+            try:
+                u = json.loads(j).get("url") or ""
+            except Exception:
+                u = ""
+            if u:
+                return {"parse": 0, "url": u, "header": {"User-Agent": jxf_UA}}
+            # 本条 4K 线解析失败: 再走服务端解析, 仍失败就换另一条 4K 线
+            u = jxf_analysis_url(host, source_code, pc)
+            if u:
+                return {"parse": 0, "url": u, "header": {"User-Agent": jxf_UA}}
+            if not raw_fallback:
+                raw_fallback = pc
+            continue
+        # 直播/加密码: 优先走服务端 analysisUrl 秒播解析 (zb-xxx / 数字房间号 / co_xxx)
+        if not str(pc).startswith("http"):
+            u = jxf_analysis_url(host, source_code, pc)
+            if u:
+                headers = {"User-Agent": jxf_UA}
+                if source_code == "huya":
+                    headers["Referer"] = "https://www.huya.com/"
+                return {"parse": 0, "url": u, "header": headers}
+            # 解析失败: 记下原始 code, 交由播放器自行尝试
+            if not raw_fallback:
+                raw_fallback = pc
+            continue
+        # 直链
+        return {"parse": 0, "url": pc, "header": {"User-Agent": jxf_UA}}
+    return {"parse": 0, "url": raw_fallback, "header": {"User-Agent": jxf_UA}}
+
+# ======================= 类式接口 (class Spider) =======================
+
+class JuxiafanSpider(object):
+    """webhomeTV 类式规范: 各方法返回 dict, searchContent 三参数。
+    与咕噜咕噜可搜索版(样板) 结构一致。"""
+
+    def __init__(self, *args, **kwargs):
+        self._host = jxf_BASE_URLS[0]
+        if kwargs.get("host"):
+            self._host = jxf_fix_host(kwargs["host"])
+        if kwargs.get("extend") is not None:
+            self.init(kwargs["extend"])
+
+    def init(self, extend=None):
+        if extend:
+            s = str(extend).strip()
+            if s.startswith("http"):
+                self._host = jxf_fix_host(s)
+            elif s.startswith("base="):
+                self._host = jxf_fix_host(s[5:])
+
+    def getName(self):
+        return "剧下饭4K聚合版"
+
+    def homeContent(self, filter=False):
+        result = jxf_home(self._host)
+        # 去掉推荐: 只返回纯分类列表, 各分类(含电视剧)均以分类页展示
+        result["list"] = []
+        return result
+
+    def homeVideoContent(self):
+        # 去掉推荐: 分类页保持纯分类列表, 不再渲染"精选/推荐"卡
+        return {"list": []}
+
+    def categoryContent(self, tid, pg="1", filter=None, extend=None):
+        return jxf_category(self._host, tid, pg)
+
+    def detailContent(self, ids):
+        if not ids:
+            return {"list": []}
+        return jxf_detail(self._host, ids[0])
+
+    # ---------- 搜索 (关键: 三参数签名, 兼容 webhomeTV) ----
+    def searchContent(self, key, quick, pg="1"):
+        """webhomeTV 搜索入口 - key 关键词, quick 快速标记, pg 页码"""
+        return self.searchContentPage(key, quick, pg)
+
+    def searchContentPage(self, key, quick, pg="1"):
+        """分页搜索 - 支持真正翻页、异常兜底"""
+        try:
+            return jxf_search(self._host, key, pg)
+        except Exception:
+            return {"page": 1, "pagecount": 1, "limit": 0, "total": 0, "list": []}
+
+    def playerContent(self, flag, id, vipFlags=""):
+        return jxf_play(self._host, flag, id)
+
+    def manualVideoCheck(self):
+        return False
+
+    def isVideoFormat(self, url):
+        return False
+
+    def localProxy(self, param):
+        return {"list": [], "parse": 0, "url": ""}
+
+    def liveContent(self, url):
+        return {"list": []}
+
+def kish_play_ok(r):
+    """播放结果是否可用：http / magnet 直链，或明确交给播放器处理（jx=1）。
+
+    Kishuto 原来的判定只认 http，剧下饭的 4KK·磁力 线返回 magnet: 会被当成
+    「取流失败」，进而换源成片帝的地址——线路名字对不上内容。这里放行。
+    """
+    if not isinstance(r, dict):
+        return False
+    u = str(r.get('url') or '')
+    if u.startswith('http') or u.startswith('magnet:'):
+        return True
+    try:
+        return bool(int(r.get('jx') or 0)) and bool(u)
+    except Exception:
+        return False
+
+# ==================== 剧下饭4K 一级源 jx END ====================
+
+
+class Spider(_BaseSpider):
+    """五源合一：影探 / 稀饭 / 小鸡看看 / FoFo / 小山。
+
+    分类与搜索按 '<tag>|' 前缀派发；详情页拿到主源数据后，再并发去其余源按
+    标题模糊匹配，把匹配到的线路追加在后面。播放时按线路 id 里编码的 tag 派发回原源。
+    """
+
+    NAME = 'Kishuto'
+    ORDER = ('yt', 'sz', 'xj', 'jx', 'jn', 'sk', 'gg', 'fq', 'ff', 'xf', 'zj')
+    LABELS = {'gg': '咕噜', 'yt': '影探', 'xf': '稀饭', 'xj': '小鸡',
+              'ff': 'FoFo', 'sz': '小山', 'fq': '枫奇', 'zj': '找剧',
+              'jn': '橘汁新', 'sk': '四源4K', 'jx': '剧下饭'}
+    DETAIL_BUDGET = 5.5    # 兼容旧配置，_fill 已改成下面的三段式
+    FILL_BUDGET = 2.2      # 首屏凑线路的最长等待（秒）
+    TAIL_WAIT = 0.9        # 攒够 5 条后再收尾这么久，把已回源的线路都带上
+    PLAY_TRY = 4           # 播放失败时最多换 4 条线路重试
+    PLAY_HEAD = 2.5        # 本线路超过这么久没出地址才换源
+    # 注意：坏线路一般 0.3~0.5s 就返回空，不会等满；2.5s 是为了不误杀
+    # 「咕噜·新咕噜4K」这类要 2s 才出地址的正常线路（实测被 1.5s 切走过）
+    PLAY_EACH = 3.0        # 换源时每条线路自己最多等这么久
+    PLAY_BUDGET = 7.0      # 换源重试的总时长上限（秒）
+    PLAY_SPEED = {'sz': 0, 'jn': 1, 'xj': 2, 'jx': 3, 'sk': 4, 'xf': 5,
+                  'gg': 6, 'ff': 7, 'fq': 8, 'zj': 9, 'yt': 10}   # 换源顺序：出流快的排前
+    FILL_ENOUGH = 5        # 攒够 5 条线路就渲染首屏，不再干等
+    TOPUP_BUDGET = 12.0    # 后台补齐的最长等待
+    SEARCH_BUDGET = 2.8      # 影探 2.1s 就回来，其余源最多再等 0.7s
+    HOME_BUDGET = 8.0
+    CACHE_TTL = 300
+    HOME_SOURCE = 'yt'     # 首页数据源：yt=影探 / gg=咕噜 / pd=片单已移除
+    HOME_CLASS_MAX = 12    # 首页最多挂几个分类（壳会逐个预取，太多拖慢）
+    HOME_TTL = 90          # 首页结果缓存（秒）—— 壳会连着调 homeContent/homeVideoContent
+    CAT_TTL = 60           # 分类首页缓存（秒）
+
+    def __init__(self):
+        self.cfg = {}
+        self._ready = {}
+        self._srcs = {}
+        self._home = (0.0, None)   # (时间戳, 首页结果) —— 壳会连着调 home/homeVideo
+        self._cat = {}             # 分类首页缓存，防止来回切页重复打接口
+        self._diag = None          # 非 None 时进入诊断中心模式
+        try:
+            self._build({})
+        except Exception:
+            pass
+
+    # ---------------- 生命周期 ----------------
+    def getName(self):
+        return self.NAME
+
+    def version(self):
+        return CODE_VERSION
+
+    def init(self, extend=''):
+        cfg = {}
+        try:
+            if isinstance(extend, dict):
+                cfg = dict(extend)
+            elif isinstance(extend, str) and extend.strip().startswith('{'):
+                cfg = json.loads(extend)
+        except Exception:
+            cfg = {}
+        self.cfg = cfg if isinstance(cfg, dict) else {}
+        # 影探那层自己也是四源聚合，首屏预算压到 3.2s：超时的源它会后台补完
+        self.cfg.setdefault('detail_budget', 1.2)
+        if str(self.cfg.get('mode') or '').lower() in ('settings', 'diag'):
+            self._diag = KishDiag(self)
+        try:
+            self._build(self.cfg)
+        except Exception:
+            pass
+        try:
+            _kish_update_async()
+        except Exception:
+            pass
+        return None
+
+    def _build(self, cfg):
+        makers = (('gg', GuluSpider), ('yt', YtAggSpider),
+                  ('xf', XifanAggSpider),
+                  ('xj', XiaojiSpider), ('ff', FofoSpider),
+                  ('sz', ShanZhaSpider), ('fq', FengqiSpider), ('zj', ZJSpider),
+                  ('jn', JZNewSpider), ('sk', SK4KSpider),
+                  ('jx', JuxiafanSpider))
+        for tag, cls in makers:
+            if tag in self._srcs:
+                continue
+            try:
+                self._srcs[tag] = cls()
+            except Exception:
+                pass
+
+    def _src(self, tag):
+        ob = self._srcs.get(tag)
+        if ob is None:
+            return None
+        if not self._ready.get(tag):
+            self._ready[tag] = True
+            try:
+                ext = json.dumps(self.cfg, ensure_ascii=False) if self.cfg else ''
+                ob.init(ext)
+            except Exception:
+                pass
+        return ob
+
+    def destroy(self):
+        for ob in list(self._srcs.values()):
+            try:
+                ob.destroy()
+            except Exception:
+                pass
+        self._srcs.clear()
+        self._ready.clear()
+
+    def isVideoFormat(self, url):
+        try:
+            return bool(is_stream_url(url) or is_media_url(url))
+        except Exception:
+            return False
+
+    def manualVideoCheck(self):
+        return False
+
+    def localProxy(self, param):
+        return None
+
+    # ---------------- id 编解码 ----------------
+    @staticmethod
+    def _b64(raw):
+        return base64.urlsafe_b64encode(raw.encode('utf-8')).decode('ascii').rstrip('=')
+
+    @staticmethod
+    def _unb64(s):
+        s = str(s or '')
+        s += '=' * (-len(s) % 4)
+        return base64.urlsafe_b64decode(s.encode('ascii')).decode('utf-8', 'replace')
+
+    def _enc_vid(self, tag, vid):
+        return 'k1' + self._b64('%s\x1f%s' % (tag, vid))
+
+    def _dec_vid(self, code):
+        s = str(code or '')
+        if s.startswith('k1'):
+            try:
+                tag, _, vid = self._unb64(s[2:]).partition('\x1f')
+                if tag in self.ORDER:
+                    return tag, vid
+            except Exception:
+                pass
+        return 'yt', s
+
+    def _enc_play(self, tag, flag, pid, cid='', ep=''):
+        # cid=详情 id、ep=集名：取流失败时要靠它们回查同片其它线路
+        return 'k2' + self._b64('%s\x1f%s\x1f%s\x1f%s\x1f%s'
+                                % (tag, flag, pid, cid, ep))
+
+    def _dec_play(self, code):
+        s = str(code or '')
+        if s.startswith('k2'):
+            try:
+                parts = self._unb64(s[2:]).split('\x1f', 4)
+                if len(parts) >= 3 and parts[0] in self.ORDER:
+                    while len(parts) < 5:
+                        parts.append('')
+                    return parts[0], parts[1], parts[2], parts[3], parts[4]
+            except Exception:
+                pass
+        return 'yt', '', s, '', ''
+
+    # ---------------- 并发小工具 ----------------
+    def _fan(self, work, budget):
+        box = {}
+        ths = []
+        for tag in self.ORDER:
+            def run(t=tag):
+                try:
+                    work(t, box)
+                except Exception:
+                    box.setdefault(t, None)
+            th = threading.Thread(target=run)
+            th.daemon = True
+            th.start()
+            ths.append(th)
+        deadline = time.time() + budget
+        for th in ths:
+            try:
+                th.join(max(0.02, deadline - time.time()))
+            except Exception:
+                pass
+        return box
+
+    # ---------------- 首页 ----------------
+    def _home_one(self, tag, filter=True):
+        """首页分类 / 筛选 / 推荐取自指定源（默认影探，咕噜作备选）。"""
+        ob = self._src(tag)
+        if ob is None:
+            return None
+        try:
+            data = ob.homeContent(filter) or {}
+        except Exception:
+            return None
+        label = self.LABELS.get(tag) or tag
+        classes = []
+        for c in (data.get('class') or []):
+            if not isinstance(c, dict):
+                continue
+            tid = str(c.get('type_id') or '').strip()
+            if not tid:
+                continue
+            if self.HOME_CLASS_MAX and len(classes) >= self.HOME_CLASS_MAX:
+                break
+            classes.append({'type_id': '%s|%s' % (tag, tid),
+                            'type_name': '%s·%s' % (label,
+                                                    c.get('type_name') or tid)})
+        if not classes:
+            return None
+        keep = set(c['type_id'].split('|', 1)[1] for c in classes)
+        filters = {}
+        for k, v in (data.get('filters') or {}).items():
+            if str(k) in keep:
+                filters['%s|%s' % (tag, k)] = v
+        cards = []
+        for it in (data.get('list') or [])[:30]:
+            if not isinstance(it, dict):
+                continue
+            it = dict(it)
+            it['vod_id'] = self._enc_vid(tag, it.get('vod_id'))
+            _memo_title(it['vod_id'], it.get('vod_name'))
+            cards.append(it)
+        return {'class': classes, 'filters': filters, 'list': cards}
+
+    def homeContent(self, filter=True):
+        if self._diag is not None:
+            return self._diag.homeContent(filter)
+        now = time.time()
+        if self._home[1] and now - self._home[0] < self.HOME_TTL:
+            return self._home[1]
+        got = (self._home_one('yt', filter) or
+               self._home_one('gg', filter) or
+               self._home_all(filter))
+        if got:
+            self._home = (now, got)
+        return got
+
+    def _home_all(self, filter=True):
+        def work(tag, box):
+            ob = self._src(tag)
+            got = ob.homeContent(True) if ob else None
+            box[tag] = (got or {}).get('class') or []
+        box = self._fan(work, self.HOME_BUDGET)
+        classes = []
+        for tag in self.ORDER:
+            for c in box.get(tag) or []:
+                if not isinstance(c, dict):
+                    continue
+                tid = c.get('type_id')
+                if tid in (None, ''):
+                    continue
+                classes.append({
+                    'type_id': '%s|%s' % (tag, tid),
+                    'type_name': '%s·%s' % (self.LABELS[tag],
+                                            c.get('type_name') or tid)})
+        if not classes:
+            classes = [{'type_id': 'yt|电影', 'type_name': '影探·电影'}]
+        return {'class': classes, 'filters': {}}
+
+    def homeVideoContent(self):
+        if self._diag is not None:
+            return self._diag.homeVideoContent()
+        if self._home[1] and time.time() - self._home[0] < self.HOME_TTL:
+            cached = self._home[1].get('list')
+            if cached:
+                return {'list': cached}
+        got = self._home_one('yt') or self._home_one('gg')
+        if got and got.get('list'):
+            return {'list': got['list']}
+
+        def work(tag, box):
+            ob = self._src(tag)
+            got = ob.homeVideoContent() if ob else None
+            box[tag] = (got or {}).get('list') or []
+        box = self._fan(work, self.HOME_BUDGET)
+        out = []
+        for tag in self.ORDER:
+            for it in (box.get(tag) or [])[:12]:
+                if not isinstance(it, dict):
+                    continue
+                it = dict(it)
+                it['vod_id'] = self._enc_vid(tag, it.get('vod_id'))
+                _memo_title(it['vod_id'], it.get('vod_name'))
+                out.append(it)
+        return {'list': out[:40]}
+
+    # ---------------- 分类 ----------------
+    def categoryContent(self, tid, pg='1', filter=True, extend=None):
+        if self._diag is not None:
+            return self._diag.categoryContent(tid, pg, filter, extend)
+        ck = None
+        try:
+            if str(pg) in ('1', '1.0'):
+                ck = '%s|%s' % (tid, json.dumps(extend or {}, sort_keys=True,
+                                                ensure_ascii=False))
+                hit = self._cat.get(ck)
+                if hit and time.time() - hit[0] < self.CAT_TTL:
+                    return hit[1]
+        except Exception:
+            ck = None
+        tag, _, real = str(tid or '').partition('|')
+        if tag not in self.ORDER or not real:
+            tag, real = 'yt', str(tid or '')
+        ob = self._src(tag)
+        got = None
+        if ob is not None:
+            try:
+                got = ob.categoryContent(real, pg, filter,
+                                         extend if isinstance(extend, dict) else {})
+            except Exception:
+                got = None
+        got = got if isinstance(got, dict) else {'list': []}
+        for it in (got.get('list') or []):
+            try:
+                it['vod_id'] = self._enc_vid(tag, it.get('vod_id'))
+                _memo_title(it['vod_id'], it.get('vod_name'))
+            except Exception:
+                pass
+        if ck and got.get('list'):
+            if len(self._cat) > 40:
+                self._cat.clear()
+            self._cat[ck] = (time.time(), got)
+        return got
+
+    # ---------------- 搜索 ----------------
+    NAME_NOISE = ('手语版', '字幕助听版', '字幕版', '助听版', '无字幕',
+                  '国语版', '粤语版', '日语版', '英语版', '普通话版', '双语版',
+                  '中配版', '台配版', '国配版', '日配版', '粤配版', '原声版',
+                  '中配', '台配', '国配', '普通话', '国语', '粤语', '日语',
+                  '英语', '韩语', '原声',
+                  '真人版', '动画版', '重制版', '剧版', '电影版', '电视版',
+                  '完整版', '未删减', '无删减', '高清版', '蓝光版', '合集', '正片',
+                  '特别篇', '特别版', '解析', '解说', '精彩分享', '剧情揭秘',
+                  '揭秘', '预告', '花絮', '片段', '番剧', '在线观看', '正版',
+                  '抢先版', '枪版', '修复版', '加长版', '导演剪辑版')
+
+    # 出现在片名中间就说明后面都是衍生内容，直接切断
+    NAME_CUT = ('剧情揭秘', '深度解读', '解说', '预告', '花絮', '片段', '特辑',
+                '精彩', '分集', '速看', '混剪', '盘点', '年番')
+
+    @classmethod
+    def _base_name(cls, name):
+        """把「凡人修仙传手语版」「凡人修仙传2025」这类变体归一成主片名。"""
+        raw = str(name or '')
+        # 站点常把副标题/来源拼进片名，先掐掉「-」「｜」「_」之后的部分
+        for sep in ('-', '－', '｜', '|', '_'):
+            if sep in raw[1:]:
+                raw = raw.split(sep)[0]
+        t = norm_title(raw)
+        if not t:
+            return ''
+        t = re.sub(r'[（(][^）)]*[）)]', '', t)
+        for _ in range(3):
+            for w in cls.NAME_NOISE:
+                if t.endswith(w) and len(t) > len(w):
+                    t = t[:-len(w)]
+                elif t.startswith(w) and len(t) > len(w):
+                    t = t[len(w):]
+        for w in cls.NAME_CUT:          # 中间出现就切
+            i = t.find(w, 1)
+            if i > 0:
+                t = t[:i]
+                break
+        if t.endswith('版') and len(t) >= 4:   # 沙丘2版 / 葬送的芙莉莲版
+            t = t[:-1]
+        t = re.sub(r'第[一二三四五六七八九十\d]+[季部篇]$', '', t)
+        t = re.sub(r'(19|20)\d{2}$', '', t)
+        t = t.rstrip('之').strip()
+        return t or norm_title(raw)
+
+    def _fan_search(self, work, budget, grace=0.8, fq_wait=0.0):
+        """并发搜；影探回来且另有 2 个源到齐就收工，最多等 grace 秒。
+
+        fq_wait 是「从搜索开始算」的绝对上限：枫奇4K 首次过验证码约
+        3.9s，比主预算慢，不给它单独留时间就永远出不了 [枫奇] 卡片。
+        """
+        box = {}
+        ths = {}
+        for tag in self.ORDER:
+            def run(t=tag):
+                try:
+                    work(t, box)
+                except Exception:
+                    box.setdefault(t, [])
+            th = threading.Thread(target=run)
+            th.daemon = True
+            th.start()
+            ths[tag] = th
+        start = time.time()
+        deadline = start + budget
+        hard = max(deadline, start + max(0.0, fq_wait))
+        yt_at = None
+        while True:
+            now = time.time()
+            if now >= hard:
+                break
+            done = False
+            if now < deadline:
+                if 'yt' in box:
+                    ready = sum(1 for t in box if t != 'yt')
+                    if ready >= 2:      # 影探 + 另外两个源，够拼卡了
+                        done = True
+                    elif yt_at is None:
+                        yt_at = now
+                    elif now - yt_at >= grace:
+                        done = True
+                elif not any(t.is_alive() for t in ths.values()):
+                    done = True
+            else:
+                done = True
+            if done:
+                fq = ths.get('fq')
+                if (fq_wait > 0 and 'fq' not in box and fq is not None
+                        and fq.is_alive() and now < hard):
+                    time.sleep(0.03)
+                    continue
+                break
+            time.sleep(0.03)
+        return box
+
+    # 出卡时优先用哪个源的元数据（影探有海报且分类准）
+    CARD_PRI = {'yt': 0, 'gg': 1, 'sz': 2, 'xf': 3, 'xj': 4, 'ff': 5,
+                'fq': 6, 'zj': 7, 'jn': 8, 'sk': 9}
+    SEARCH_TTL = 600
+
+    def searchContent(self, key, quick=False, pg='1'):
+        """搜索退回最初版：六个源各出各的，按源顺序原样列前 12 条。
+
+        不做同名合并、不做相关性过滤、不重排出卡优先级 —— 壳里看到什么
+        就是各站点搜索接口返回的什么。并发与短缓存只用于提速，不改结果。
+        详情页跨源补线路的匹配另见 strict_match（不再把衍生电影挂进来）。
+        """
+        if self._diag is not None:
+            return self._diag.searchContent(key, quick, pg)
+        kw = str(key or '')
+        if not kw.strip():
+            return {'list': []}
+        try:
+            page = int(str(pg or 1))
+        except Exception:
+            page = 1
+        if page < 1:
+            page = 1
+
+        ck = 'ks:%s:%s' % (norm_title(kw), page)
+        hit = cache_get(ck)
+        if hit:
+            try:
+                return json.loads(hit)
+            except Exception:
+                pass
+
+        def work(tag, box):
+            ob = self._src(tag)
+            got = ob.searchContent(kw, quick, pg) if ob else None
+            box[tag] = (got or {}).get('list') or []
+
+        box = self._fan_search(work, self.SEARCH_BUDGET, fq_wait=4.6)
+        out = []
+        for tag in self.ORDER:
+            for it in (box.get(tag) or [])[:12]:
+                if not isinstance(it, dict):
+                    continue
+                it = dict(it)
+                it['vod_id'] = self._enc_vid(tag, it.get('vod_id'))
+                _memo_title(it['vod_id'], it.get('vod_name'))
+                note = str(it.get('vod_remarks') or '')
+                it['vod_remarks'] = ('[%s] %s'
+                                     % (self.LABELS.get(tag, tag), note)).strip()
+                out.append(it)
+
+        res = {'list': out, 'page': page, 'pagecount': page, 'total': len(out)}
+        try:
+            cache_put(ck, json.dumps(res, ensure_ascii=False), self.SEARCH_TTL)
+        except Exception:
+            pass
+        return res
+
+    # ---------------- 详情 ----------------
+    def _digest(self, tag, vod, cid=''):
+        """把某个源 detailContent 返回的线路拆开并按本文件格式重新编码。"""
+        froms = str(vod.get('vod_play_from') or '').split('$$$')
+        urls = str(vod.get('vod_play_url') or '').split('$$$')
+        out = []
+        for i, f in enumerate(froms):
+            f = str(f or '').strip()
+            if not f:
+                continue
+            seg = urls[i] if i < len(urls) else ''
+            eps = []
+            idx = 0
+            for part in str(seg).split('#'):
+                part = part.strip()
+                if not part:
+                    continue
+                nm, sep, pid = part.partition('$')
+                if not sep:
+                    nm, pid = '正片', part
+                idx += 1
+                # 播放码里存「集序号\x1e集名」：换源时靠它对齐同一集
+                # （影探叫「第01集」、小山叫「01」，光比名字对不上）
+                eps.append((nm.strip() or '正片',
+                            self._enc_play(tag, f, pid, cid,
+                                           '%d\x1e%s'
+                                           % (idx, nm.strip() or '正片'))))
+            if eps:
+                out.append((self._line_name(tag, f), eps))
+        return out
+
+    def _line_name(self, tag, flag):
+        label = self.LABELS.get(tag) or tag
+        f = str(flag or '').strip()
+        if tag == 'yt':
+            return clean_name(f) or label        # 影探内部本来就带源名
+        return clean_name('%s·%s' % (label, f)) or label
+
+    @staticmethod
+    def _variants(title):
+        """片名变体：全角/半角、季数后缀、括号注释、语种后缀都试一遍。
+
+        实测「葬送的芙莉莲第二季」在稀饭搜不到，去掉「第二季」才行；
+        而「庆余年第二季」在影视站带季数反而更准，所以原样排第一。
+        """
+        t = str(title or '').strip()
+        out = [t] if t else []
+        if not t:
+            return out
+        pats = (r'第[一二三四五六七八九十百千万0-9]+[季部篇]',
+                r'[（(\[][^）)\]）]*[）)\]]',
+                r'(国语|粤语|日语|英语|普通话|中字|双语|原声)版?$',
+                r'(19|20)\d{2}$')
+        for pat in pats:
+            v = re.sub(pat, '', t).strip(' -·:：')
+            if len(v) >= 2 and v not in out:
+                out.append(v)
+        for sep in ('：', ':', '·'):
+            if sep in t:
+                v = t.split(sep)[0].strip()
+                if len(v) >= 2 and v not in out:
+                    out.append(v)
+        return out[:2]
+
+    def _fill_start(self, tag, title):
+        """其余源并发去「搜片名 → 取详情」，返回 (box, threads)。
+
+        box 会被线程陆续塞数据，所以主流程可以只等一小会儿就先渲染。
+        """
+        box, ths = {}, []
+        if not title:
+            return box, ths
+        variants = self._variants(title)
+
+        def work(tt):
+            try:
+                ob = self._src(tt)
+                if ob is None:
+                    return
+                pick = None
+                for kw in variants:
+                    try:
+                        got = ob.searchContent(kw, False, '1') or {}
+                    except Exception:
+                        continue
+                    pick = strict_match(title, got.get('list') or [])
+                    if pick:
+                        break
+                if not pick:
+                    return
+                vv = (ob.detailContent([pick.get('vod_id')]) or {}).get('list') or []
+                if vv and isinstance(vv[0], dict):
+                    box[tt] = vv[0]
+            except Exception:
+                pass
+
+        for tt in self.ORDER:
+            if tt == tag:
+                continue
+            th = threading.Thread(target=work, args=(tt,))
+            th.daemon = True
+            th.start()
+            ths.append(th)
+        return box, ths
+
+    @staticmethod
+    def _count_lines(box):
+        n = 0
+        for v in list(box.values()):
+            try:
+                n += len([x for x in str(v.get('vod_play_from') or '').split('$$$') if x])
+            except Exception:
+                pass
+        return n
+
+    def _wait_lines(self, box, ths, budget, enough):
+        """攒够 enough 条线路、或线程都结束就提前收工（不等满预算）。"""
+        deadline = time.time() + budget
+        while time.time() < deadline:
+            if self._count_lines(box) >= enough:
+                return True
+            if not any(t.is_alive() for t in ths):
+                return True
+            time.sleep(0.04)
+        return False
+
+    def _wait_yield(self, box, ths, base_lines, budget, yt_ok=False):
+        """首屏策略：攒够 FILL_ENOUGH 条就开始收工，再收 TAIL_WAIT 秒给足。
+
+        壳拿到 detailContent 后不会原地追加线路，所以「先给 5 条、后面慢慢
+        加载」在壳侧不成立 —— 达到 5 条后仍要在预算内把已回源的线路全带上，
+        一次给足；预算内没回来的源由 _topup 后台补完写回缓存（重进即全量）。
+        """
+        start = time.time()
+        deadline = start + budget
+        have = len(base_lines)
+        enough_at = None
+        while time.time() < deadline:
+            if have + self._count_lines(box) >= self.FILL_ENOUGH:
+                if enough_at is None:
+                    enough_at = time.time()
+                elif time.time() - enough_at >= self.TAIL_WAIT:
+                    return True              # 够了，再多收一小会儿就出
+            if not any(t.is_alive() for t in ths):
+                return True                  # 所有源都跑完了
+            time.sleep(0.04)
+        return False
+
+    def _digest_box(self, tag, box, cid=''):
+        out = []
+        for t in self.ORDER:
+            v = box.get(t)
+            if isinstance(v, dict):
+                try:
+                    out.extend(self._digest(t, v, cid))
+                except Exception:
+                    pass
+        return out
+
+    REAL4K = frozenset(['影探·联通云', '影探·移动云', '影探·天翼云', '影探·腾讯', '小山·蓝光4K【推荐】', '小山·4K', '橘汁·新咕噜4K', '橘汁·鲸宝4K', '橘汁新·自建4K-4', '橘汁新·自建4K-3', '橘汁新·VIP4K', '橘汁新·JD4K-可下载', '小鸡·JD4K', '小鸡·ZJ4K', '小鸡·CO4K', '四源4K·天堂·高清蓝光4K', '四源4K·布布·zijianm3u8', '四源4K·华谊·蓝光4K', '四源4K·苹果·高清蓝光4K', '咕噜·新咕噜4K', '咕噜·鲸宝4K', '枫奇·至臻4K', '找剧·4K海外-官方C'])
+    BAD_LINES = frozenset(['咕噜·iyf4k', '咕噜·小熊', '影探·优酷', '影探·爱奇艺', '影探·腾讯', '找剧·1080P-官方Z', '稀饭·次元城·CYC_Main(需登录)'])
+    LINE_FIRST = ('影探', '山楂', '小山', '橘汁', '小鸡', '剧下饭', '四源',
+                  '咕噜', '枫奇', 'FoFo', '稀饭', '找剧')   # 线路优先级（用户指定）
+
+    @classmethod
+    def _r4(cls, name):
+        """真 4K 实测名单整体前置；组内保持 LINE_FIRST 原序，坏线路不提前。"""
+        nm = str(name or '')
+        bad = nm in cls.BAD_LINES
+        return (0 if (nm in cls.REAL4K and not bad) else 1,
+                cls._line_rank(nm),
+                1 if bad else 0,
+                0 if '4k' in nm.lower() else 1)
+
+
+    @classmethod
+    def _line_rank(cls, name):
+        nm = str(name or '')
+        for i, key in enumerate(cls.LINE_FIRST):
+            if key in nm:
+                return i
+        return len(cls.LINE_FIRST)
+
+    # --- KISH_LINE_TRIM BEGIN ---
+    KEEP_FAST_NON4K = (
+        '橘汁新·自营蓝光-1', '咕噜·神话', '橘汁新·神话蓝光',
+        'FoFo·天堂', '小鸡·TM蓝光', '咕噜·VIP', '咕噜·VIP蓝光',
+        'FoFo·优质', '橘汁·VIP蓝光', '橘汁·神话',
+    )
+
+    @classmethod
+    def _keep_line(cls, name):
+        nm = str(name or '')
+        if '4k' in nm.lower():
+            return True
+        if nm.startswith('影探'):
+            return True
+        return nm in cls.KEEP_FAST_NON4K
+
+    TOP3 = ('影探·移动云', '影探·天翼云', '影探·联通云')
+
+    def _trim_lines(self, lines):
+        """影探移动/天翼/联通置顶 → 4K 组 → 其余非 4K 组（FoFo 置末）。
+        各组内部保持 _r4 原本相对顺序，只做分组与抽取，不重排。"""
+        try:
+            kept = [x for x in lines if self._keep_line(x[0])]
+            top = []
+            for n in self.TOP3:
+                for x in kept:
+                    if str(x[0] or '') == n:
+                        top.append(x)
+                        break
+            body = [x for x in kept
+                    if str(x[0] or '') not in self.TOP3]
+            four = [x for x in body if '4k' in str(x[0] or '').lower()]
+            rest = [x for x in body if '4k' not in str(x[0] or '').lower()]
+            fofo = [x for x in rest
+                    if str(x[0] or '').startswith('FoFo')]
+            if fofo:
+                rest = [x for x in rest
+                        if not str(x[0] or '').startswith('FoFo')] + fofo
+            return top + four + rest
+        except Exception:
+            return lines
+    # --- KISH_LINE_TRIM END ---
+
+    def _pack(self, vod, lines):
+        """按源优先级排序 + 去重 + 唯一化线路名 + 写回 vod_play_from/url。"""
+        try:
+            lines = sorted(lines, key=lambda x: self._r4(x[0]))
+        except Exception:
+            pass
+        lines = self._trim_lines(lines)
+        froms, urls, used, seen_sig = [], [], {}, set()
+        for name, eps in lines:
+            if not eps:
+                continue
+            nm = clean_name(name) or '线路'
+            sig = (nm, len(eps))
+            if sig in seen_sig:      # 跨源同名同集数 = 重复线路，丢掉
+                continue
+            seen_sig.add(sig)
+            if nm in used:
+                used[nm] += 1
+                nm = '%s·%d' % (nm, used[nm])
+            else:
+                used[nm] = 1
+            froms.append(nm)
+            urls.append('#'.join('%s$%s' % (e[0] or '正片', e[1]) for e in eps))
+        vod['vod_play_from'] = '$$$'.join(froms)
+        vod['vod_play_url'] = '$$$'.join(urls)
+        return vod
+
+    def detailContent(self, ids):
+        if self._diag is not None:
+            return self._diag.detailContent(ids)
+        raw = ids[0] if isinstance(ids, (list, tuple)) and ids else ids
+        tag, vid = self._dec_vid(raw)
+        ck = 'kish:%s:%s' % (tag, vid)
+        hit = cache_get(ck)
+        if hit is not None:
+            try:
+                return json.loads(hit)
+            except Exception:
+                pass
+
+        ob = self._src(tag)
+        if ob is None:
+            return {'list': []}
+        try:
+            got = ob.detailContent([vid]) or {}
+        except Exception:
+            got = {}
+        vod = (got.get('list') or [None])[0]
+        if not isinstance(vod, dict):
+            return {'list': []}
+
+        title = str(vod.get('vod_name') or '')
+        # 个别源（FoFo）详情只回数字 id 当片名，跨源补线路会全部匹配失败；
+        # 用列表/搜索时记下的真实片名兜底，并修正壳里显示的名字。
+        if len(title.strip()) < 2 or title.strip().isdigit():
+            alt = _TITLE_MEMO.get(str(raw)) or ''
+            if alt:
+                title = alt
+                vod['vod_name'] = alt
+        vod['vod_id'] = self._enc_vid(tag, vod.get('vod_id') or vid)
+
+        cid = str(vod.get('vod_id') or '')
+        base_lines = []
+        try:
+            base_lines.extend(self._digest(tag, vod, cid))
+        except Exception:
+            pass
+
+        # 其余源并发跑；首屏只等「够用」（FILL_BUDGET / FILL_ENOUGH），
+        # 没赶上的源继续在后台补，补完直接刷新缓存。
+        box, ths = self._fill_start(tag, title)
+        self._wait_yield(box, ths, base_lines, self.FILL_BUDGET,
+                         yt_ok=(tag == 'yt'))
+
+        lines = list(base_lines) + self._digest_box(tag, box, cid)
+        fresh = self._pack(dict(vod), lines)
+        # 记 _pack 之后的顺序：换源时第一条就是最快的（小山·蓝光4K）
+        _memo_detail(cid, _unpack_lines(fresh))
+        result = {'list': [fresh]}
+        try:
+            cache_put(ck, json.dumps(result, ensure_ascii=False), self.CACHE_TTL)
+        except Exception:
+            pass
+
+        if any(t.is_alive() for t in ths):
+            try:
+                threading.Thread(target=self._topup, daemon=True,
+                                 args=(ck, vod, tag, base_lines, box, ths,
+                                       cid)).start()
+            except Exception:
+                pass
+        return result
+
+    def _topup(self, ck, vod, tag, base_lines, box, ths, cid=''):
+        """后台把没赶上的源等回来，再按全量线路重写一次缓存。"""
+        try:
+            deadline = time.time() + self.TOPUP_BUDGET
+            for th in ths:
+                th.join(max(0.05, deadline - time.time()))
+            if not box:
+                return
+            lines = list(base_lines) + self._digest_box(tag, box, cid)
+            if not lines:
+                return
+            out = self._pack(dict(vod), lines)
+            _memo_detail(cid, _unpack_lines(out))
+            _n_new = len([x for x in str(out.get('vod_play_from') or '')
+                          .split('$$$') if x])
+            _old = cache_get(ck)
+            if _old:
+                try:
+                    _ov = (json.loads(_old).get('list') or [{}])[0]
+                    _n_old = len([x for x in str(_ov.get('vod_play_from') or '')
+                                  .split('$$$') if x])
+                except Exception:
+                    _n_old = 0
+                if _n_old > _n_new:
+                    return               # 已有缓存更全，别缩水
+            cache_put(ck, json.dumps({'list': [out]}, ensure_ascii=False),
+                      self.CACHE_TTL + 120)
+        except Exception:
+            pass
+
+    # ---------------- 播放 ----------------
+    def playerContent(self, flag, id, vipFlags=None):
+        if self._diag is not None:
+            return self._diag.playerContent(flag, id, vipFlags)
+        tag, oflag, pid, cid, ep = self._dec_play(id)
+        empty = {'parse': 0, 'jx': 0, 'url': ''}
+        ob = self._src(tag)
+        box = {}
+
+        def work():
+            try:
+                box['r'] = ob.playerContent(oflag or flag, pid, vipFlags)
+            except Exception:
+                pass
+
+        th = None
+        if ob is not None:
+            th = threading.Thread(target=work)
+            th.daemon = True
+            th.start()
+            th.join(self.PLAY_HEAD)      # 本线路 PLAY_HEAD 秒不回就直接换源
+        got = box.get('r')
+        if kish_play_ok(got):
+            return got
+        # 取流失败或太慢（影探/VIP 线路经常这样）→ 立刻改用同集其它线路
+        alt = self._play_other(cid, ep, tag, pid)
+        if alt:
+            return alt
+        if th is not None and th.is_alive():
+            th.join(max(0.1, self.PLAY_BUDGET - self.PLAY_HEAD))
+            got = box.get('r')
+        return got if isinstance(got, dict) else empty
+
+    def _call(self, fn, wait):
+        """带超时调用：超时就先当失败，线程自己跑完就丢。"""
+        box = {}
+        def w():
+            try:
+                box['r'] = fn()
+            except Exception:
+                pass
+        th = threading.Thread(target=w)
+        th.daemon = True
+        th.start()
+        th.join(wait)
+        return box.get('r'), th
+
+    def _play_other(self, cid, ep, skip_tag='', skip_pid=''):
+        """同集换源重试：先试别的源（失效常是整源坏），本源其它线路垫后。"""
+        rec = _DETAIL_MEMO.get(cid)
+        if not rec:
+            return None
+        deadline = time.time() + self.PLAY_BUDGET
+        wi, _, wn = str(ep or '').partition('\x1e')
+        cand = []
+        for _name, eps in rec[1]:
+            for e_name, code in eps:
+                t, f, p, _c, _e = self._dec_play(code)
+                if ep:
+                    hi, _, hn = str(_e or '').partition('\x1e')
+                    # 集名一致、或集序号一致，都算同一集
+                    if not ((wn and wn == hn) or (wi and wi == hi)):
+                        continue
+                if t == skip_tag and p == skip_pid:
+                    continue
+                cand.append((1 if t == skip_tag else 0, t, f, p))
+        cand.sort(key=lambda x: (x[0], self.PLAY_SPEED.get(x[1], 9)))
+        tried = 0
+        for _pri, t, f, p in cand:
+            if time.time() > deadline or tried >= self.PLAY_TRY:
+                return None
+            tried += 1
+            ob = self._src(t)
+            if ob is None:
+                continue
+            r, _th = self._call(lambda: ob.playerContent(f, p, []),
+                                min(self.PLAY_EACH,
+                                    max(0.3, deadline - time.time())))
+            if kish_play_ok(r):
+                return r
+        return None
+
+
+# 部分内核按小写 spider 取类
+spider = Spider
 
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
 _TVBOX_DROP_LINES = []
-_TVBOX_LINE_ORDER = ["咕噜·VIP", "小山·4K", "影探·爱奇艺", "咕噜·新咕噜4K", "咕噜·神话", "咕噜·鲸宝4K", "小山·蓝光4K【推荐】", "影探·移动云", "影探·联通云"]
+_TVBOX_LINE_ORDER = ["橘汁新·自营蓝光-1", "咕噜·VIP", "橘汁·VIP蓝光", "咕噜·VIP蓝光", "影探·爱奇艺"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

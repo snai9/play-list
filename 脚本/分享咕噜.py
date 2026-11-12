@@ -893,7 +893,7 @@ class Spider(_BaseSpider):
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
 _TVBOX_DROP_LINES = []
-_TVBOX_LINE_ORDER = ["旋风VIP", "暴风资源", "非凡资源", "电影天堂", "量子资源", "蚂蚁资源", "咕噜4K", "玫瑰4K"]
+_TVBOX_LINE_ORDER = ["量子资源", "暴风资源", "电影天堂", "非凡资源", "玫瑰4K", "蚂蚁资源"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

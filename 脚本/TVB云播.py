@@ -1060,8 +1060,8 @@ if __name__ == '__main__':
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = []
-_TVBOX_LINE_ORDER = ["国内高速", "国内线路", "海外线路④", "海外线路②", "海外线路①", "极速主力", "国内新线路"]
+_TVBOX_DROP_LINES = ["国内新线路", "海外线路①", "海外线路②"]
+_TVBOX_LINE_ORDER = ["海外线路④", "海外线路①", "海外线路②", "国内新线路", "国内线路"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

@@ -855,8 +855,8 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["C线"]
-_TVBOX_LINE_ORDER = ["C线", "E线", "F线", "G线", "D线", "B线", "A线", "http下载"]
+_TVBOX_DROP_LINES = ["E线"]
+_TVBOX_LINE_ORDER = ["A线", "G线", "D线", "E线"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

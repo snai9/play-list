@@ -786,8 +786,8 @@ class Spider(_Base):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["F蓝光"]
-_TVBOX_LINE_ORDER = ["K蓝光", "蓝光4K", "B超高清", "F蓝光", "QY蓝光", "Z蓝光"]
+_TVBOX_DROP_LINES = ["QY蓝光"]
+_TVBOX_LINE_ORDER = ["B超高清", "QY蓝光"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []
