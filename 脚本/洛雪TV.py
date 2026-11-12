@@ -1861,7 +1861,7 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = []
+_TVBOX_DROP_LINES = ["360资源", "ikun", "电影天堂", "魔都"]
 _TVBOX_LINE_ORDER = ["自营·线路 1", "360资源", "ikun", "魔都", "电影天堂"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []

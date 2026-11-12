@@ -2,6 +2,12 @@
     "wallpaper": "https://gh-proxy.com/https://raw.githubusercontent.com/snai9/play-list/main/bg2s.png",
     "sites": [
         {
+            "key": "1",
+            "name": "豆瓣",
+            "type": 3,
+            "api": "./脚本/豆瓣.py"
+        },
+        {
             "key": "wzxxcz_f56e0b17ca7a",
             "name": "西饭短剧",
             "type": 3,

@@ -166,7 +166,7 @@ class Spider(BaseSpider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = []
+_TVBOX_DROP_LINES = ["HH", "HN", "JS", "JY", "UK", "XL", "YZ"]
 _TVBOX_LINE_ORDER = ["BF", "一起看APP", "FF", "LZ", "UK", "JS", "YZ", "JY", "XL", "HN", "HH"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []

@@ -758,7 +758,7 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = []
+_TVBOX_DROP_LINES = ["1080zyk", "bfzy", "js", "modu"]
 _TVBOX_LINE_ORDER = ["xigua", "lz", "dytt", "modu", "bfzy", "1080zyk", "js"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []

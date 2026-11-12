@@ -1103,7 +1103,7 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = []
+_TVBOX_DROP_LINES = ["1080资源", "暴风资源"]
 _TVBOX_LINE_ORDER = ["西瓜M3U8", "电影天堂", "非凡M3U8", "暴风资源", "1080资源"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
