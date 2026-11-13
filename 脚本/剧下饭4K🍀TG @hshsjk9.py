@@ -579,8 +579,8 @@ if __name__ == "__main__":
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["魔都直连(有广告可投屏)"]
-_TVBOX_LINE_ORDER = ["360直连(有广告可投屏)", "暴风直连(有广告 可投屏)", "量子直连(有广告可投屏)", "魔都直连(有广告可投屏)", "山东蓝光主线", "爱奇艺", "成都超清专线"]
+_TVBOX_DROP_LINES = ["山东蓝光主线"]
+_TVBOX_LINE_ORDER = ["山东蓝光主线"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

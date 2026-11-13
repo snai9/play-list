@@ -750,8 +750,8 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["ikm3u8", "jisu高清", "modum3u8"]
-_TVBOX_LINE_ORDER = ["xiguam3u8", "z360m3u8", "电影天堂", "lz高清", "ffzy高清", "ikm3u8", "modum3u8", "jisu高清"]
+_TVBOX_DROP_LINES = ["wsy高清"]
+_TVBOX_LINE_ORDER = ["xiguam3u8", "ffzy高清", "电影天堂", "wsy高清", "snm3u8"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

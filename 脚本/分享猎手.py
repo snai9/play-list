@@ -281,8 +281,8 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["新浪线路", "爱奇艺", "速播线路", "魔都线路"]
-_TVBOX_LINE_ORDER = ["1080P-官方线路R", "暴风线路", "量子线路", "天堂线路", "极速线路", "非凡线路", "魔都线路", "新浪线路", "速播线路", "爱奇艺", "如意线路"]
+_TVBOX_DROP_LINES = ["天堂线路", "无水印线路"]
+_TVBOX_LINE_ORDER = ["非凡线路", "无水印线路", "天堂线路", "索尼线路"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

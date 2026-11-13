@@ -996,8 +996,8 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["暴风", "爱坤"]
-_TVBOX_LINE_ORDER = ["云播", "爱坤", "暴风"]
+_TVBOX_DROP_LINES = ["ACE", "极速"]
+_TVBOX_LINE_ORDER = ["爱坤", "暴风", "ACE", "极速"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

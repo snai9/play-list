@@ -608,8 +608,8 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["主选三"]
-_TVBOX_LINE_ORDER = ["备选一", "主选四", "主选二", "主选三"]
+_TVBOX_DROP_LINES = []
+_TVBOX_LINE_ORDER = ["主选四", "主选三"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

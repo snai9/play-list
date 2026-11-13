@@ -413,8 +413,8 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["专线·宇宙", "专线·极速", "专线·飞速"]
-_TVBOX_LINE_ORDER = ["追剧1", "专线·宇宙", "专线·极速", "专线·飞速"]
+_TVBOX_DROP_LINES = []
+_TVBOX_LINE_ORDER = ["专线·飞速", "专线·宇宙", "专线·最大"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

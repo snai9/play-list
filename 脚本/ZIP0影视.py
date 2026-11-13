@@ -697,8 +697,8 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["360", "ikun", "极速"]
-_TVBOX_LINE_ORDER = ["量子", "天堂", "木偶", "非凡", "ikun", "暴风", "360", "极速", "如意"]
+_TVBOX_DROP_LINES = []
+_TVBOX_LINE_ORDER = ["非凡", "天堂", "最大"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

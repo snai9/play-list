@@ -877,8 +877,8 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["站外-ikun", "站外-光速", "站外-极速", "站外-红牛", "站外-速播", "站外-魔都"]
-_TVBOX_LINE_ORDER = ["站外-量子", "站外-暴风", "站外-ikun", "站外-魔都", "站外-极速", "站外-红牛", "站外-速播", "站外-光速", "站外-如意", "NBY"]
+_TVBOX_DROP_LINES = ["站外-光速", "站外-极速", "站外-红牛", "站外-速播", "站外-魔都"]
+_TVBOX_LINE_ORDER = ["站外-ikun", "站外-暴风", "站外-极速", "站外-魔都", "站外-光速", "站外-红牛", "站外-速播", "CO蓝光", "PAN1"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

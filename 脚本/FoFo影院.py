@@ -484,8 +484,8 @@ class Spider(Spider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["优质(16)", "新浪(16)", "金鹰(16)"]
-_TVBOX_LINE_ORDER = ["天堂(16)", "量子(16)", "优质(16)", "金鹰(16)", "新浪(16)"]
+_TVBOX_DROP_LINES = []
+_TVBOX_LINE_ORDER = ["优质(42)", "天堂(42)", "百度(43)", "卧龙(42)", "索尼(43)"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []
