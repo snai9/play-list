@@ -234,5 +234,3 @@ class Spider(Spider):
             'vod_year': j.get('vodYear', ''),
             'vod_content': j.get('vodBlurb', '')
         } for j in arr]
-
-# ---- TVBox 本地线路过滤（自动生成，勿改） ----

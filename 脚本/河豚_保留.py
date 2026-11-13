@@ -690,6 +690,7 @@ _TVBOX_LINE_ORDER = []
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = ["K蓝光", "Z蓝光"]
 _TVBOX_SINK_SUB = ["蓝光4K"]
+_TVBOX_LINE_CAP = 0
 
 def _tvbox_filter_lines(result, drop):
     if not isinstance(result, dict):
@@ -761,6 +762,8 @@ def _tvbox_sort_item(item, order):
     # sink 命中的差线（4K 等）沉到最后但不删除。
     pairs = list(zip(parts_from, parts_url))
     pairs.sort(key=lambda p: _tvbox_rank(p[0]))
+    if _TVBOX_LINE_CAP > 0 and len(pairs) > _TVBOX_LINE_CAP:
+        pairs = pairs[: _TVBOX_LINE_CAP]
     item['vod_play_from'] = '$$$'.join(f for f, _ in pairs)
     item['vod_play_url'] = '$$$'.join(u for _, u in pairs)
 
