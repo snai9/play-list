@@ -8,40 +8,10 @@
             "api": "./脚本/豆瓣.py"
         },
         {
-            "key": "wzxxcz_8f85174e51cb",
-            "name": "豆花电影网",
+            "key": "wzxxcz_bbed5965d583",
+            "name": "多多影视",
             "type": 3,
-            "api": "./脚本/豆花电影网.py"
-        },
-        {
-            "key": "wzxxcz_d68ac251a6fc",
-            "name": "影视大全",
-            "type": 3,
-            "api": "./脚本/影视大全.py"
-        },
-        {
-            "key": "wzxxcz_f7638274cd66",
-            "name": "豆花影视",
-            "type": 3,
-            "api": "./脚本/豆花影视.py"
-        },
-        {
-            "key": "wzxxcz_2b79c02cc400",
-            "name": "咸鱼影视",
-            "type": 3,
-            "api": "./脚本/咸鱼影视.py"
-        },
-        {
-            "key": "wzxxcz_9c107b1c2ba4",
-            "name": "小鸡看看",
-            "type": 3,
-            "api": "./脚本/小鸡看看.py"
-        },
-        {
-            "key": "wzxxcz_a7e07c2876fc",
-            "name": "开端影视",
-            "type": 3,
-            "api": "./脚本/开端影视.py"
+            "api": "./脚本/多多影视.py"
         },
         {
             "key": "wzxxcz_be50d9b607f5",
@@ -50,16 +20,16 @@
             "api": "./脚本/分享者华谊.py"
         },
         {
-            "key": "wzxxcz_58a8da623293",
-            "name": "华谊影视",
-            "type": 3,
-            "api": "./脚本/华谊影视.py"
-        },
-        {
             "key": "wzxxcz_1701585ea278",
             "name": "河豚",
             "type": 3,
             "api": "./脚本/河豚.py"
+        },
+        {
+            "key": "wzxxcz_58a8da623293",
+            "name": "华谊影视",
+            "type": 3,
+            "api": "./脚本/华谊影视.py"
         },
         {
             "key": "wzxxcz_fdf9a3930b9b",
@@ -68,28 +38,10 @@
             "api": "./脚本/分享者小苹果.py"
         },
         {
-            "key": "wzxxcz_f83f6c0139a3",
-            "name": "片帝4K",
+            "key": "wzxxcz_8f85174e51cb",
+            "name": "豆花电影网",
             "type": 3,
-            "api": "./脚本/片帝4K.py"
-        },
-        {
-            "key": "wzxxcz_b8e9eee764e4",
-            "name": "看剧AI19",
-            "type": 3,
-            "api": "./脚本/看剧AI19.py"
-        },
-        {
-            "key": "wzxxcz_4cb04cb64ffd",
-            "name": "看剧AIxcz",
-            "type": 3,
-            "api": "./脚本/看剧AIxcz.py"
-        },
-        {
-            "key": "wzxxcz_50309bd7a97a",
-            "name": "美剧侠",
-            "type": 3,
-            "api": "./脚本/美剧侠.py"
+            "api": "./脚本/豆花电影网.py"
         },
         {
             "key": "wzxxcz_4e850e9d91ee",
@@ -102,6 +54,24 @@
             "name": "高清点播",
             "type": 3,
             "api": "./脚本/高清点播.py"
+        },
+        {
+            "key": "wzxxcz_b3ca09b39432",
+            "name": "千千影视",
+            "type": 3,
+            "api": "./脚本/千千影视.py"
+        },
+        {
+            "key": "wzxxcz_7f8aa687b404",
+            "name": "看看鸭",
+            "type": 3,
+            "api": "./脚本/看看鸭.py"
+        },
+        {
+            "key": "wzxxcz_5ecc8d816dff",
+            "name": "橘汁",
+            "type": 3,
+            "api": "./脚本/橘汁.py"
         },
         {
             "key": "wzxxcz_217794c4c451",
