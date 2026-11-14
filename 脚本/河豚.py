@@ -684,13 +684,14 @@ def _opt(name, values):
             [{"n": v, "v": v} for v in values]}
 
 
+
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = []
-_TVBOX_LINE_ORDER = []
+_TVBOX_DROP_LINES = ["QQ蓝光 (qq)"]
+_TVBOX_LINE_ORDER = ["K蓝光 (Ksvideo)", "QQ蓝光 (qq)"]
 _TVBOX_DROP_SUB = []
-_TVBOX_ORDER_SUB = ["K蓝光", "Z蓝光"]
-_TVBOX_SINK_SUB = ["蓝光4K"]
-_TVBOX_LINE_CAP = 0
+_TVBOX_ORDER_SUB = []
+_TVBOX_SINK_SUB = []
+_TVBOX_LINE_CAP = 4
 
 def _tvbox_filter_lines(result, drop):
     if not isinstance(result, dict):
