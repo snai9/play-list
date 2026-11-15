@@ -628,8 +628,8 @@ class Spider(BaseSpider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["BF线路", "FF线路", "JS线路", "LZ线路"]
-_TVBOX_LINE_ORDER = ["MY线路", "BF线路", "JS线路", "LZ线路", "FF线路"]
+_TVBOX_DROP_LINES = ["BF线路", "FF线路", "LZ线路"]
+_TVBOX_LINE_ORDER = ["LZ线路", "BF线路", "FF线路"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

@@ -582,7 +582,7 @@ _TVBOX_DROP_LINES = []
 _TVBOX_LINE_ORDER = []
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = ["极速专线", "山东蓝光", "成都超清"]
-_TVBOX_SINK_SUB = ["4K"]
+_TVBOX_SINK_SUB = ["4K", "江苏2K极速专线"]
 _TVBOX_LINE_CAP = 0
 
 def _tvbox_filter_lines(result, drop):
