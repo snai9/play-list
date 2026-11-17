@@ -809,14 +809,13 @@ class Spider(Spider):
         self.destroy()
 
 
-
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["1080资源", "rym3u8", "暴风资源", "电影天堂", "量子M3U8", "非凡M3U8"]
-_TVBOX_LINE_ORDER = ["量子M3U8", "非凡M3U8", "暴风资源", "1080资源", "电影天堂", "rym3u8"]
+_TVBOX_DROP_LINES = []
+_TVBOX_LINE_ORDER = []
 _TVBOX_DROP_SUB = []
-_TVBOX_ORDER_SUB = []
+_TVBOX_ORDER_SUB = ["VIP线路", "王者TV"]
 _TVBOX_SINK_SUB = []
-_TVBOX_LINE_CAP = 4
+_TVBOX_LINE_CAP = 0
 
 def _tvbox_filter_lines(result, drop):
     if not isinstance(result, dict):

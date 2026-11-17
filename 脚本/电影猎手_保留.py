@@ -279,14 +279,13 @@ class Spider(Spider):
         return json.loads(pt)
 
 
-
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["天堂线路", "如意线路", "暴风线路", "索尼线路", "量子线路", "非凡线路"]
-_TVBOX_LINE_ORDER = ["1080P-官方线路R", "量子线路", "天堂线路", "非凡线路", "如意线路", "暴风线路", "索尼线路"]
+_TVBOX_DROP_LINES = []
+_TVBOX_LINE_ORDER = []
 _TVBOX_DROP_SUB = []
-_TVBOX_ORDER_SUB = []
+_TVBOX_ORDER_SUB = ["1080P-官方线路R"]
 _TVBOX_SINK_SUB = []
-_TVBOX_LINE_CAP = 4
+_TVBOX_LINE_CAP = 0
 
 def _tvbox_filter_lines(result, drop):
     if not isinstance(result, dict):

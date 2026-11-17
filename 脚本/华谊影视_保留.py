@@ -784,14 +784,13 @@ class Spider(_Base):
         self._rsa2 = None
 
 
-
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["B超高清"]
-_TVBOX_LINE_ORDER = ["B超高清"]
+_TVBOX_DROP_LINES = []
+_TVBOX_LINE_ORDER = []
 _TVBOX_DROP_SUB = []
-_TVBOX_ORDER_SUB = []
+_TVBOX_ORDER_SUB = ["F蓝光", "QQ蓝光", "Z蓝光"]
 _TVBOX_SINK_SUB = []
-_TVBOX_LINE_CAP = 4
+_TVBOX_LINE_CAP = 0
 
 def _tvbox_filter_lines(result, drop):
     if not isinstance(result, dict):
