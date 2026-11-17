@@ -764,7 +764,7 @@ class Spider(BaseSpider):
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
 _TVBOX_DROP_LINES = ["专享4K-Y", "优酷", "官方R", "官方V"]
-_TVBOX_LINE_ORDER = ["1080P-专享U", "官方R", "4K官方C", "官方S", "官方Z", "官方B", "官方C", "优酷", "专享4K-Y", "官方V"]
+_TVBOX_LINE_ORDER = ["1080P-专享U", "官方R", "官方S", "官方Z", "官方B", "官方C", "优酷", "4K官方C", "专享4K-Y", "官方V"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []
