@@ -1,0 +1,80 @@
+name: sync-from-gitee
+
+# 目的：Gitee 云端跑数产出落在 gitee.com/snai9/play-list，GitHub 侧设备通道
+# （jsDelivr 读本仓）需要一份镜像。Gitee 机房连不上 github.com，反向由 GitHub
+# 主动去 Gitee 拉取（GitHub 出网不受限），因此把搬运放在本仓执行。
+# 触发：手动 + 每天北京时间 03:30（UTC 19:30 前一天）。
+# 安全：拉到的 list.json 站点数 < 5 或文件缺失时直接失败退出，绝不覆盖本仓。
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '30 19 * * *'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-from-gitee
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Clone Gitee mirror
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in 1 2 3; do
+            rm -rf /tmp/gitee
+            if git clone --depth 1 https://gitee.com/snai9/play-list.git /tmp/gitee; then ok=1; break; fi
+            echo "clone failed (attempt $i), retrying in 15s"
+            sleep 15
+          done
+          if [ "$ok" != "1" ]; then echo "::error::Gitee clone failed after 3 attempts"; exit 1; fi
+          ls -la /tmp/gitee | head -20
+
+      - name: Validate payload
+        run: |
+          set -euo pipefail
+          test -f /tmp/gitee/list.json || { echo "::error::list.json missing"; exit 1; }
+          test -d /tmp/gitee/脚本 || { echo "::error::脚本 dir missing"; exit 1; }
+          python3 - <<'PY'
+          import json
+          with open('/tmp/gitee/list.json', encoding='utf-8-sig') as fh:
+              data = json.load(fh)
+          sites = data.get('sites') or []
+          print('sites:', len(sites))
+          if len(sites) < 5:
+              raise SystemExit('::error::payload too small (%d sites), abort' % len(sites))
+          PY
+
+      - name: Sync into this repo
+        run: |
+          set -euo pipefail
+          # 保留本仓的 .git / .github / README.md，其余与 Gitee 镜像一致
+          rsync -a --delete \
+            --exclude '.git' --exclude '.github' --exclude 'README.md' \
+            /tmp/gitee/ ./
+          echo "--- changed files ---"
+          git status --short
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          if git diff --quiet && git diff --cached --quiet; then
+            echo "no changes, nothing to push"
+            exit 0
+          fi
+          git config user.name "snai9"
+          git config user.email "snai9@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: sync from gitee $(date -u +%Y-%m-%dT%H:%MZ)"
+          git push
