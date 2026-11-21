@@ -361,8 +361,8 @@ class Spider(_BaseSpider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["dyttm3u8", "ffm3u8", "wsym3u8"]
-_TVBOX_LINE_ORDER = ["jjm3u8", "iqym3u8", "xiguam3u8", "ffm3u8", "wsym3u8", "dyttm3u8"]
+_TVBOX_DROP_LINES = ["dyttm3u8", "ffm3u8", "jjm3u8", "wsym3u8", "xiguam3u8"]
+_TVBOX_LINE_ORDER = ["iqym3u8", "ffm3u8", "wsym3u8", "xiguam3u8", "jjm3u8", "dyttm3u8"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

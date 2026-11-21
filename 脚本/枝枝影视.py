@@ -542,8 +542,8 @@ class Spider(BaseSpider):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["DY", "FF", "MT", "YZ"]
-_TVBOX_LINE_ORDER = ["IQ", "DY", "YZ", "FF", "MT"]
+_TVBOX_DROP_LINES = ["DB", "DY", "MT", "YZ"]
+_TVBOX_LINE_ORDER = ["YZ", "DY", "MT", "DB"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

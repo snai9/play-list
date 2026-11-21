@@ -875,8 +875,8 @@ class Spider(_Base):
 
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
-_TVBOX_DROP_LINES = ["B蓝光", "QQ", "VIP蓝光", "自建4K-4"]
-_TVBOX_LINE_ORDER = ["自营蓝光-1", "B蓝光", "NN蓝光", "NS蓝光-1", "OO蓝光", "神话蓝光", "自建蓝光", "自建4K-3", "自建4K-4", "QQ", "VIP蓝光"]
+_TVBOX_DROP_LINES = []
+_TVBOX_LINE_ORDER = ["自营蓝光-1", "NS蓝光-1", "QY", "VIP蓝光", "自建4K-3"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

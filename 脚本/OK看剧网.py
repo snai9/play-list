@@ -528,7 +528,7 @@ class Spider(Spider):
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
 _TVBOX_DROP_LINES = ["TT", "量子", "非凡"]
-_TVBOX_LINE_ORDER = ["乐看", "量子", "TT", "非凡", "腾讯"]
+_TVBOX_LINE_ORDER = ["非凡", "量子", "TT"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []

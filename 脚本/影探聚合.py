@@ -13759,7 +13759,7 @@ spider = Spider
 
 # ---- TVBox 本地线路过滤（自动生成，勿改） ----
 _TVBOX_DROP_LINES = []
-_TVBOX_LINE_ORDER = ["橘汁·菲乐4K", "影探·腾讯", "咕噜·VIP蓝光", "橘汁·VIP蓝光", "影探·移动云", "影探·天翼云", "影探·联通云", "橘汁·神话", "橘汁·新咕噜4K", "咕噜·新咕噜4K", "咕噜·菲乐4K"]
+_TVBOX_LINE_ORDER = ["橘汁·VIP蓝光", "咕噜·VIP蓝光", "咕噜·VIP", "影探·移动云", "影探·爱奇艺", "橘汁·新咕噜4K", "咕噜·新咕噜4K", "橘汁·菲乐4K", "咕噜·菲乐4K"]
 _TVBOX_DROP_SUB = []
 _TVBOX_ORDER_SUB = []
 _TVBOX_SINK_SUB = []
