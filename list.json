@@ -209,8 +209,8 @@
             ]
         }
     ],
-    "rules": "./list-external.json",
-    "ads": "./list-external.json",
+    "rules": [],
+    "ads": [],
     "hosts": [
         "cache.ott.ystenlive.itv.cmvideo.cn=base-v4-free-mghy.e.cdn.chinamobile.com",
         "cache.ott.bestlive.itv.cmvideo.cn=base-v4-free-mghy.e.cdn.chinamobile.com",
